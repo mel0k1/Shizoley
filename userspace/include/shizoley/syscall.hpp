@@ -7,9 +7,22 @@ namespace shz {
 enum class Sys : u64 {
     putc = 0,
     exit = 1,
+    spawn = 2,          // (name, name_len) -> pid
+    thread_create = 3,  // (entry, stack_top, arg) -> tid
+    ipc_send = 4,       // (dest_pid, buf, len) -> 0 | -1
+    ipc_recv = 5,       // (src_pid /*0 = any*/, buf, max) -> sender pid
+    getpid = 6,
+    gettid = 7,
 };
 
 [[noreturn]] void exit(long code);
+
+long spawn(const char* name, u64 len);
+long thread_create(void (*fn)(u64), void* stack_top, u64 arg);
+long send(u64 pid, const void* buf, u64 len);
+long recv(u64 src, void* buf, u64 max);
+long getpid();
+long gettid();
 
 inline long syscall(Sys nr) {
     u64 ret = static_cast<u64>(nr);
@@ -26,6 +39,12 @@ inline long syscall(Sys nr, u64 a1) {
 inline long syscall(Sys nr, u64 a1, u64 a2) {
     u64 ret = static_cast<u64>(nr);
     asm volatile("syscall" : "+a"(ret) : "D"(a1), "S"(a2) : "rcx", "r11", "memory");
+    return static_cast<long>(ret);
+}
+
+inline long syscall(Sys nr, u64 a1, u64 a2, u64 a3) {
+    u64 ret = static_cast<u64>(nr);
+    asm volatile("syscall" : "+a"(ret) : "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
     return static_cast<long>(ret);
 }
 

@@ -18,8 +18,6 @@ add_compile_options(
     -Werror
 )
 
-find_program(OBJCOPY objcopy REQUIRED)
-
 add_library(shz STATIC src/syscall.cpp src/io.cpp)
 target_include_directories(shz PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -27,8 +25,6 @@ add_executable(init programs/init/main.cpp src/start.cpp)
 target_link_libraries(init PRIVATE shz)
 target_link_options(init PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)
 
-add_custom_command(
-    TARGET init POST_BUILD
-    COMMAND ${OBJCOPY} -O binary $<TARGET_FILE:init> ${CMAKE_CURRENT_BINARY_DIR}/init.bin
-    COMMENT "objcopy init -> init.bin"
-)
+add_executable(hello programs/hello/main.cpp src/start.cpp)
+target_link_libraries(hello PRIVATE shz)
+target_link_options(hello PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)
