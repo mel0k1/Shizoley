@@ -17,10 +17,7 @@ pub const USER_CODE: u16 = 0x20;
 // static mut: these must land in .bss (writable) — const statics go to rodata
 #[repr(align(16))]
 struct IstStack([u8; 16384]);
-#[repr(align(16))]
-struct Rsp0Stack([u8; 32768]);
 static mut IST_STACK: IstStack = IstStack([0; 16384]);
-static mut RSP0_STACK: Rsp0Stack = Rsp0Stack([0; 32768]);
 
 static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
     let mut tss = TaskStateSegment::new();
@@ -28,11 +25,7 @@ static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
         let top = unsafe { addr_of!(IST_STACK.0).cast::<u8>().add(16384) };
         VirtAddr::from_ptr(top)
     };
-    // interrupts from ring 3 land here
-    tss.privilege_stack_table[0] = {
-        let top = unsafe { addr_of!(RSP0_STACK.0).cast::<u8>().add(32768) };
-        VirtAddr::from_ptr(top)
-    };
+    // interrupts from ring 3 land here; the scheduler retargets it per task
     tss
 });
 
@@ -51,5 +44,14 @@ pub fn init() {
     unsafe {
         CS::set_reg(GDT.1[0]);
         load_tss(GDT.1[4]);
+    }
+}
+
+// per-task RSP0: IRQs from ring 3 must land on the running task's kernel stack
+// the TSS lives at a fixed static address, so in-place mutation is safe here
+pub fn set_rsp0(top: VirtAddr) {
+    unsafe {
+        let tss = core::ptr::addr_of!(*TSS) as *mut TaskStateSegment;
+        (*tss).privilege_stack_table[0] = top;
     }
 }

@@ -1,9 +1,9 @@
 use core::fmt;
-use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::memory;
+use crate::task::AddressSpace;
 
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
@@ -70,14 +70,9 @@ fn u64_at(buf: &[u8], off: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b))
 }
 
-// maps every PT_LOAD of a static ELF64 into the active address space
+// maps every PT_LOAD of a static ELF64 into the given address space
 // with user pages (R/W/X derived from p_flags), zero-fills BSS
-pub fn load(
-    image: &[u8],
-    mapper: &mut impl Mapper<Size4KiB>,
-    frames: &mut impl FrameAllocator<Size4KiB>,
-    phys_offset: VirtAddr,
-) -> Result<VirtAddr, ElfError> {
+pub fn load(image: &[u8], aspace: &mut AddressSpace) -> Result<VirtAddr, ElfError> {
     if image.len() < 64 {
         return Err(ElfError::Truncated);
     }
@@ -144,24 +139,12 @@ pub fn load(
             flags |= PageTableFlags::NO_EXECUTE;
         }
 
-        map_segment(
-            image,
-            p_offset,
-            p_vaddr,
-            p_filesz,
-            p_memsz,
-            flags,
-            mapper,
-            frames,
-            phys_offset,
-        )?;
-        unsafe { memory::mark_user_range(phys_offset, p_vaddr, mem_end) };
+        map_segment(image, p_offset, p_vaddr, p_filesz, p_memsz, flags, aspace)?;
     }
 
     Ok(VirtAddr::new(entry))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn map_segment(
     image: &[u8],
     p_offset: u64,
@@ -169,33 +152,22 @@ fn map_segment(
     p_filesz: u64,
     p_memsz: u64,
     flags: PageTableFlags,
-    mapper: &mut impl Mapper<Size4KiB>,
-    frames: &mut impl FrameAllocator<Size4KiB>,
-    phys_offset: VirtAddr,
+    aspace: &mut AddressSpace,
 ) -> Result<(), ElfError> {
     let first = Page::containing_address(VirtAddr::new(p_vaddr));
     let last = Page::containing_address(VirtAddr::new(p_vaddr + p_memsz - 1));
 
     for page in Page::range_inclusive(first, last) {
-        let frame = frames.allocate_frame().ok_or(ElfError::OutOfMemory)?;
+        let frame: PhysFrame<Size4KiB> = memory::alloc_frame().ok_or(ElfError::OutOfMemory)?;
         let page_start = page.start_address().as_u64();
         let page_end = page_start + 4096;
-        let fresh = match unsafe { mapper.map_to(page, frame, flags, frames) } {
-            Ok(flush) => {
-                flush.flush();
-                true
-            }
-            // segments may share a page: reuse the frame, keep flags
-            Err(MapToError::PageAlreadyMapped(_)) => false,
-            Err(_) => return Err(ElfError::Mapping),
-        };
+        let fresh = aspace.map_user_page(page, frame, flags).map_err(|e| {
+            let _ = e;
+            ElfError::Mapping
+        })?;
 
-        let phys = mapper
-            .translate_page(page)
-            .map_err(|_| ElfError::Mapping)?
-            .start_address()
-            .as_u64();
-        let dst = (phys_offset + phys).as_mut_ptr::<u8>();
+        let frame = aspace.translate_page(page).ok_or(ElfError::Mapping)?;
+        let dst = memory::phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
         unsafe {
             if fresh {
                 core::ptr::write_bytes(dst, 0, 4096);

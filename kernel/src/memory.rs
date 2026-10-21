@@ -1,40 +1,57 @@
 use bootloader::bootinfo::{BootInfo, MemoryMap, MemoryRegionType};
-use x86_64::structures::paging::{
-    FrameAllocator, OffsetPageTable, PageTable, PageTableFlags, PhysFrame, Size4KiB,
-};
+use spin::{Mutex, Once};
+use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
-pub fn init(boot_info: &'static BootInfo) -> (OffsetPageTable<'static>, BootInfoFrameAllocator) {
-    let phys_offset = VirtAddr::new(boot_info.physical_memory_offset);
-    let mapper = unsafe { OffsetPageTable::new(active_pml4(phys_offset), phys_offset) };
+pub static PHYS_OFFSET: Once<u64> = Once::new();
+pub static KERNEL_PML4: Once<PhysFrame<Size4KiB>> = Once::new();
+
+static FRAMES: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
+
+pub fn init(boot_info: &'static BootInfo) -> OffsetPageTable<'static> {
+    let phys_offset = boot_info.physical_memory_offset;
+    PHYS_OFFSET.call_once(|| phys_offset);
+    KERNEL_PML4.call_once(|| Cr3::read().0);
+
+    let mapper = unsafe {
+        OffsetPageTable::new(
+            active_pml4(VirtAddr::new(phys_offset)),
+            VirtAddr::new(phys_offset),
+        )
+    };
     let frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
-    (mapper, frame_allocator)
+    *FRAMES.lock() = Some(frame_allocator);
+    mapper
 }
 
 pub unsafe fn active_pml4(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
-    use x86_64::registers::control::Cr3;
-
     let (level_4_table_frame, _) = Cr3::read();
     let phys = level_4_table_frame.start_address();
     let virt = physical_memory_offset + phys.as_u64();
     unsafe { &mut *(virt.as_mut_ptr()) }
 }
 
-// every ancestor of [start, end) must carry the user bit or ring 3 faults
-pub unsafe fn mark_user_range(phys_offset: VirtAddr, start: u64, end: u64) {
-    let pml4 = active_pml4(phys_offset);
-    let mut base = start & !0x1F_FFFF;
-    while base < end {
-        let pml4e = &mut pml4[((base >> 39) & 0x1FF) as usize];
-        pml4e.set_flags(pml4e.flags() | PageTableFlags::USER_ACCESSIBLE);
-        let pdpt = &mut *((phys_offset + pml4e.addr().as_u64()).as_mut_ptr::<PageTable>());
-        let pdpte = &mut pdpt[((base >> 30) & 0x1FF) as usize];
-        pdpte.set_flags(pdpte.flags() | PageTableFlags::USER_ACCESSIBLE);
-        let pd = &mut *((phys_offset + pdpte.addr().as_u64()).as_mut_ptr::<PageTable>());
-        let pde = &mut pd[((base >> 21) & 0x1FF) as usize];
-        pde.set_flags(pde.flags() | PageTableFlags::USER_ACCESSIBLE);
-        base += 0x20_0000;
+pub fn phys_offset() -> VirtAddr {
+    VirtAddr::new(*PHYS_OFFSET.get().expect("phys offset not set"))
+}
+
+pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
+    phys_offset() + phys.as_u64()
+}
+
+// global frame pool: usable from any address space via the physmap
+pub struct GlobalFrames;
+
+unsafe impl FrameAllocator<Size4KiB> for GlobalFrames {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        alloc_frame()
     }
+}
+
+pub fn alloc_frame() -> Option<PhysFrame<Size4KiB>> {
+    let mut guard = FRAMES.lock();
+    guard.as_mut()?.allocate_frame()
 }
 
 pub struct BootInfoFrameAllocator {

@@ -1,10 +1,12 @@
 use crate::gdt;
+use crate::sched;
 use crate::{println, serial_print, serial_println};
 use core::sync::atomic::{AtomicU64, Ordering};
 use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::PrivilegeLevel;
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -41,9 +43,20 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt
 });
 
+fn pit_init() {
+    // channel 0, lo/hi, square wave: ~100 Hz
+    const DIVISOR: u16 = 11_932;
+    unsafe {
+        Port::new(0x43).write(0x36u8);
+        Port::new(0x40).write((DIVISOR & 0xFF) as u8);
+        Port::new(0x40).write((DIVISOR >> 8) as u8);
+    }
+}
+
 pub fn init() {
     IDT.load();
     unsafe { PICS.lock().initialize() };
+    pit_init();
     x86_64::instructions::interrupts::enable();
 }
 
@@ -64,15 +77,21 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     use x86_64::registers::control::Cr2;
     let fault_addr = x86_64::VirtAddr::new(Cr2::read_raw());
+    let from_user = stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3;
     println!(
         "[paparaci] page fault at {:?} ({:?})",
         fault_addr, error_code
     );
     serial_println!(
-        "[paparaci] page fault at {:#?} ({:?})",
-        stack_frame,
+        "[paparaci] page fault at {:#x} from ring {} ({:?})",
+        fault_addr,
+        stack_frame.code_segment.rpl() as u8,
         error_code
     );
+    if from_user {
+        // buggy userspace dies, the kernel lives on
+        sched::exit_current(-2);
+    }
     loop {
         x86_64::instructions::hlt();
     }
@@ -80,13 +99,15 @@ extern "x86-interrupt" fn page_fault_handler(
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
-    if ticks % 128 == 0 {
+    if ticks % 512 == 0 {
         serial_print!(".");
     }
+    // EOI before switching: the next task runs with the PIC ready
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8())
     };
+    sched::on_tick();
 }
 
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {

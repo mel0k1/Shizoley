@@ -1,19 +1,22 @@
 use core::arch::global_asm;
+use core::ptr::addr_of_mut;
 use x86_64::registers::model_specific::Msr;
 
 use crate::gdt;
 use crate::serial;
 use crate::vga;
-use crate::{println, serial_println};
+use crate::{println, sched, serial_println};
 
 // rcx = user rip, r11 = user rflags, rax = nr, rdi/rsi/rdx = args
+// the scheduler points SYSCALL_KSTACK_TOP at the current task's kernel stack,
+// so every task gets its own syscall/irq depth instead of one shared stack
 global_asm!(
     r#"
     .section .text.syscall_entry, "ax"
     .p2align 4
     paparaci_syscall_entry:
-        movq %rsp, saved_user_rsp(%rip)
-        movabs $syscall_kstack_top, %rsp
+        movq %rsp, SAVED_USER_RSP(%rip)
+        movq SYSCALL_KSTACK_TOP(%rip), %rsp
         pushq %r11
         pushq %rcx
         pushq %rbp
@@ -41,16 +44,15 @@ global_asm!(
         addq $8, %rsp
         popq %rcx
         popq %r11
-        movq saved_user_rsp(%rip), %rsp
+        movq SAVED_USER_RSP(%rip), %rsp
         sysretq
 
     .section .bss, "aw", @nobits
     .p2align 4
-    saved_user_rsp:
+    SAVED_USER_RSP:
         .quad 0
-    syscall_kstack:
-        .space 65536
-    syscall_kstack_top:
+    SYSCALL_KSTACK_TOP:
+        .quad 0
     "#,
     dispatch = sym syscall_dispatch,
     options(att_syntax)
@@ -58,6 +60,20 @@ global_asm!(
 
 unsafe extern "C" {
     fn paparaci_syscall_entry();
+    static mut SAVED_USER_RSP: u64;
+    static mut SYSCALL_KSTACK_TOP: u64;
+}
+
+// called by the scheduler with interrupts off
+pub fn enter_task(kstack_top: u64, user_rsp: u64) {
+    unsafe {
+        addr_of_mut!(SYSCALL_KSTACK_TOP).write_volatile(kstack_top);
+        addr_of_mut!(SAVED_USER_RSP).write_volatile(user_rsp);
+    }
+}
+
+pub fn saved_user_rsp() -> u64 {
+    unsafe { addr_of_mut!(SAVED_USER_RSP).read_volatile() }
 }
 
 const EFER: u32 = 0xC000_0080;
@@ -90,18 +106,12 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, _a2: u64, _a3: u64) -> u64 {
             let code = a1 as i64;
             println!("[init] exit({})", code);
             serial_println!("[init] exit({})", code);
-            user_halt()
+            sched::exit_current(code)
         }
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);
-            user_halt()
+            sched::exit_current(-1)
         }
-    }
-}
-
-fn user_halt() -> ! {
-    loop {
-        x86_64::instructions::hlt();
     }
 }

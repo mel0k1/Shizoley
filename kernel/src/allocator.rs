@@ -1,8 +1,10 @@
 use alloc::alloc::{GlobalAlloc, Layout};
 use spin::Mutex;
 use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
+use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
+
+use crate::memory;
 
 pub const HEAP_START: u64 = 0o_5555_5555_0000;
 pub const HEAP_SIZE: u64 = 1024 * 1024;
@@ -85,20 +87,19 @@ unsafe impl GlobalAlloc for Locked<BumpAllocator> {
 #[global_allocator]
 static ALLOCATOR: Locked<BumpAllocator> = Locked::new(BumpAllocator::new());
 
-pub fn init(
-    mapper: &mut impl Mapper<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> Result<(), MapToError<Size4KiB>> {
+pub fn init(mapper: &mut impl Mapper<Size4KiB>) -> Result<(), MapToError<Size4KiB>> {
     let start = VirtAddr::new(HEAP_START);
     let first_page = Page::containing_address(start);
     let last_page = Page::containing_address(start + HEAP_SIZE - 1u64);
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
 
     for page in Page::range_inclusive(first_page, last_page) {
-        let frame = frame_allocator
-            .allocate_frame()
-            .ok_or(MapToError::FrameAllocationFailed)?;
-        unsafe { mapper.map_to(page, frame, flags, frame_allocator)?.flush() };
+        let frame = memory::alloc_frame().ok_or(MapToError::FrameAllocationFailed)?;
+        unsafe {
+            mapper
+                .map_to(page, frame, flags, &mut memory::GlobalFrames)?
+                .flush()
+        };
     }
 
     unsafe {

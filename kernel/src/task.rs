@@ -1,0 +1,383 @@
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::arch::{asm, global_asm};
+use core::cell::UnsafeCell;
+use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::page_table::PageTableEntry;
+use x86_64::structures::paging::{
+    Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+};
+use x86_64::VirtAddr;
+
+use crate::memory;
+
+const KSTACK_SIZE: usize = 32 * 1024;
+
+// ---------------------------------------------------------------- address spaces
+
+// one CR3 root per task; kernel (higher half + physmap) is shared, the
+// lower half is a private deep copy with shared leaf frames
+pub struct AddressSpace {
+    pml4: PhysFrame<Size4KiB>,
+}
+
+impl AddressSpace {
+    // address space of the running kernel (boot CR3), shared by kernel tasks
+    pub fn kernel() -> Self {
+        AddressSpace {
+            pml4: *memory::KERNEL_PML4.get().expect("kernel pml4 not set"),
+        }
+    }
+
+    // fresh root: zero frame, kernel upper half shared, lower half deep-copied
+    pub fn new_user() -> Result<Self, &'static str> {
+        let root = memory::alloc_frame().ok_or("no frames for user pml4")?;
+        unsafe { zero_frame(root) };
+
+        let kernel_root = unsafe {
+            &*(memory::phys_to_virt(Self::kernel().pml4.start_address()).as_ptr::<PageTable>())
+        };
+        let new_root: &mut PageTable =
+            unsafe { &mut *(memory::phys_to_virt(root.start_address()).as_mut_ptr()) };
+
+        for i in 0..512 {
+            let entry = kernel_root[i].clone();
+            if !entry.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            // upper half (physmap etc.) is shared verbatim, lower half is copied
+            new_root[i] = if i >= 256 {
+                entry
+            } else {
+                copy_level2(&entry)?
+            };
+        }
+        // ring 3 may walk the lower half path; leaf grants stay supervisor-only
+        for i in 0..256 {
+            let e = &mut new_root[i];
+            if e.flags().contains(PageTableFlags::PRESENT) {
+                e.set_flags(e.flags() | PageTableFlags::USER_ACCESSIBLE);
+            }
+        }
+        Ok(AddressSpace { pml4: root })
+    }
+
+    pub fn switch(&self) {
+        unsafe { Cr3::write(self.pml4, Cr3Flags::empty()) };
+    }
+
+    // mapper over this root; table frames are reached through the physmap,
+    // so this works while another CR3 is active
+    fn mapper(&mut self) -> OffsetPageTable<'_> {
+        let virt = memory::phys_to_virt(self.pml4.start_address());
+        unsafe { OffsetPageTable::new(&mut *(virt.as_mut_ptr()), memory::phys_offset()) }
+    }
+
+    // mark every existing ancestor of the page user-walkable
+    fn mark_user_ancestors(&mut self, page: Page<Size4KiB>) {
+        let root: &mut PageTable =
+            unsafe { &mut *(memory::phys_to_virt(self.pml4.start_address()).as_mut_ptr()) };
+        let pml4e = &mut root[page.p4_index()];
+        pml4e.set_flags(pml4e.flags() | PageTableFlags::USER_ACCESSIBLE);
+        if !pml4e.flags().contains(PageTableFlags::PRESENT) {
+            return;
+        }
+        let pdpt: &mut PageTable =
+            unsafe { &mut *(memory::phys_to_virt(pml4e.addr()).as_mut_ptr()) };
+        let pdpte = &mut pdpt[page.p3_index()];
+        pdpte.set_flags(pdpte.flags() | PageTableFlags::USER_ACCESSIBLE);
+    }
+
+    // map one user page; returns true when the frame was freshly inserted
+    pub fn map_user_page(
+        &mut self,
+        page: Page<Size4KiB>,
+        frame: PhysFrame<Size4KiB>,
+        flags: PageTableFlags,
+    ) -> Result<bool, x86_64::structures::paging::mapper::MapToError<Size4KiB>> {
+        self.mark_user_ancestors(page);
+        let mut mapper = self.mapper();
+        let parent_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        match unsafe {
+            mapper.map_to_with_table_flags(
+                page,
+                frame,
+                flags,
+                parent_flags,
+                &mut memory::GlobalFrames,
+            )
+        } {
+            Ok(flush) => {
+                flush.flush();
+                Ok(true)
+            }
+            Err(x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn translate_page(&mut self, page: Page<Size4KiB>) -> Option<PhysFrame<Size4KiB>> {
+        self.mapper().translate_page(page).ok()
+    }
+}
+
+// pdpt level: children are page directories, copied one level down
+fn copy_level2(entry: &PageTableEntry) -> Result<PageTableEntry, &'static str> {
+    if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Ok(entry.clone());
+    }
+    let src: &PageTable = unsafe { &*(memory::phys_to_virt(entry.addr()).as_ptr()) };
+    let frame = memory::alloc_frame().ok_or("no frames for page tables")?;
+    unsafe { zero_frame(frame) };
+    let dst: &mut PageTable =
+        unsafe { &mut *(memory::phys_to_virt(frame.start_address()).as_mut_ptr()) };
+    for i in 0..512 {
+        let child = src[i].clone();
+        if child.flags().contains(PageTableFlags::PRESENT) {
+            dst[i] = copy_level1(&child)?;
+        }
+    }
+    let mut new_entry = entry.clone();
+    let flags = new_entry.flags();
+    new_entry.set_addr(frame.start_address(), flags);
+    Ok(new_entry)
+}
+
+// pd level: children are page tables whose entries share data frames
+fn copy_level1(entry: &PageTableEntry) -> Result<PageTableEntry, &'static str> {
+    if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Ok(entry.clone());
+    }
+    let src: &PageTable = unsafe { &*(memory::phys_to_virt(entry.addr()).as_ptr()) };
+    let frame = memory::alloc_frame().ok_or("no frames for page tables")?;
+    unsafe { zero_frame(frame) };
+    let dst: &mut PageTable =
+        unsafe { &mut *(memory::phys_to_virt(frame.start_address()).as_mut_ptr()) };
+    for i in 0..512 {
+        let child = src[i].clone();
+        if child.flags().contains(PageTableFlags::PRESENT) {
+            dst[i] = child;
+        }
+    }
+    let mut new_entry = entry.clone();
+    let flags = new_entry.flags();
+    new_entry.set_addr(frame.start_address(), flags);
+    Ok(new_entry)
+}
+
+unsafe fn zero_frame(frame: PhysFrame<Size4KiB>) {
+    let virt = memory::phys_to_virt(frame.start_address());
+    core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 4096);
+}
+
+// ---------------------------------------------------------------- context switch
+
+// fxsave area first so it sits 16-aligned; rsp saved at +512
+#[repr(C, align(16))]
+pub struct SwitchFrame {
+    pub fx: [u8; 512],
+    pub rsp: u64,
+}
+
+// rdi = &prev frame, rsi = &next frame; callee-saved regs + fx state ride the
+// per-task kernel stack, so a task interrupted mid-handler resumes cleanly
+global_asm!(
+    ".section .text.__paparaci_switch, \"ax\"",
+    ".p2align 4",
+    ".globl __paparaci_switch",
+    "__paparaci_switch:",
+    "    fxsave64 [rdi]",
+    "    push rbp",
+    "    push rbx",
+    "    push r12",
+    "    push r13",
+    "    push r14",
+    "    push r15",
+    "    mov [rdi + 512], rsp",
+    "    mov rsp, [rsi + 512]",
+    "    pop r15",
+    "    pop r14",
+    "    pop r13",
+    "    pop r12",
+    "    pop rbx",
+    "    pop rbp",
+    "    fxrstor64 [rsi]",
+    "    ret",
+);
+
+unsafe extern "C" {
+    fn __paparaci_switch(prev: *mut SwitchFrame, next: *const SwitchFrame);
+}
+
+unsafe fn fxsave_current(area: &mut [u8; 512]) {
+    asm!("fxsave64 [{}]", in(reg) area.as_mut_ptr(), options(nostack));
+}
+
+// ---------------------------------------------------------------- tasks
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Ready,
+    Running,
+    Finished,
+}
+
+type Payload = Box<dyn FnOnce() + Send>;
+
+struct KStack {
+    ptr: *mut u8,
+}
+
+unsafe impl Send for KStack {}
+
+impl KStack {
+    fn new() -> Option<Self> {
+        let layout = alloc::alloc::Layout::from_size_align(KSTACK_SIZE, 16).ok()?;
+        let ptr = unsafe { alloc::alloc::alloc(layout) };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(KStack { ptr })
+    }
+
+    fn top(&self) -> VirtAddr {
+        VirtAddr::new(self.ptr as u64 + KSTACK_SIZE as u64)
+    }
+}
+
+impl Drop for KStack {
+    fn drop(&mut self) {
+        let layout = alloc::alloc::Layout::from_size_align(KSTACK_SIZE, 16).unwrap();
+        unsafe { alloc::alloc::dealloc(self.ptr, layout) };
+    }
+}
+
+// scheduler-mutated part; guarded by irq-off scheduler discipline
+pub struct TaskInner {
+    pub ctx: SwitchFrame,
+    pub state: TaskState,
+    pub exit_code: i64,
+    pub user_rsp_saved: u64,
+    payload: Option<Payload>,
+}
+
+pub struct Task {
+    pub id: u64,
+    pub name: &'static str,
+    pub aspace: Arc<AddressSpace>,
+    pub user_entry: u64,
+    pub user_rsp0: u64,
+    kstack: KStack,
+    inner: UnsafeCell<TaskInner>,
+}
+
+unsafe impl Send for Task {}
+unsafe impl Sync for Task {}
+
+impl Task {
+    fn new(name: &'static str, aspace: Arc<AddressSpace>) -> Option<Self> {
+        let kstack = KStack::new()?;
+        Some(Task {
+            id: 0,
+            name,
+            aspace,
+            user_entry: 0,
+            user_rsp0: 0,
+            kstack,
+            inner: UnsafeCell::new(TaskInner {
+                ctx: SwitchFrame {
+                    fx: [0; 512],
+                    rsp: 0,
+                },
+                state: TaskState::Ready,
+                exit_code: 0,
+                user_rsp_saved: 0,
+                payload: None,
+            }),
+        })
+    }
+
+    // scheduler-only view of the mutable half; single core, irq-off paths
+    // UnsafeCell-backed: the Sync impl plus scheduler discipline make it sound
+    #[allow(clippy::mut_from_ref)]
+    pub fn inner(&self) -> &mut TaskInner {
+        unsafe { &mut *self.inner.get() }
+    }
+
+    pub fn kstack_top(&self) -> VirtAddr {
+        self.kstack.top()
+    }
+
+    fn arm(&mut self, entry: usize) {
+        unsafe { fxsave_current(&mut self.inner.get_mut().ctx.fx) };
+        // leave rsp at top-8 on entry so fresh tasks look call-entered
+        let base = self.kstack.top().as_u64() - 8 * 8;
+        let slots = base as *mut u64;
+        unsafe {
+            for i in 0..6 {
+                slots.add(i).write_volatile(0);
+            }
+            slots.add(6).write_volatile(entry as u64);
+        }
+        self.inner.get_mut().ctx.rsp = base;
+    }
+
+    pub fn boot_current(name: &'static str, aspace: Arc<AddressSpace>) -> Self {
+        let mut task = Task::new(name, aspace).expect("task alloc failed");
+        unsafe { fxsave_current(&mut task.inner.get_mut().ctx.fx) };
+        task
+    }
+
+    pub fn kernel_thread(name: &'static str, aspace: Arc<AddressSpace>, f: Payload) -> Self {
+        let mut task = Task::new(name, aspace).expect("task alloc failed");
+        task.arm(kernel_task_entry as unsafe extern "C" fn() -> ! as usize);
+        task.inner.get_mut().payload = Some(f);
+        task
+    }
+
+    pub fn user_process(
+        name: &'static str,
+        aspace: Arc<AddressSpace>,
+        entry: VirtAddr,
+        stack_top: VirtAddr,
+    ) -> Self {
+        let mut task = Task::new(name, aspace).expect("task alloc failed");
+        task.arm(user_task_entry as unsafe extern "C" fn() -> ! as usize);
+        task.user_entry = entry.as_u64();
+        task.user_rsp0 = stack_top.as_u64();
+        task
+    }
+
+    pub(crate) fn take_payload(&self) -> Option<Payload> {
+        self.inner().payload.take()
+    }
+
+    pub(crate) fn switch_from(&self, next: &Task) {
+        unsafe { __paparaci_switch(&mut (*self.inner.get()).ctx, &(*next.inner.get()).ctx) };
+    }
+
+    // entry for a task whose predecessor is already gone (task exit)
+    pub(crate) fn switch_into(&self) {
+        static mut DUMMY: SwitchFrame = SwitchFrame {
+            fx: [0; 512],
+            rsp: 0,
+        };
+        unsafe { __paparaci_switch(core::ptr::addr_of_mut!(DUMMY), &(*self.inner.get()).ctx) };
+    }
+}
+
+pub extern "C" fn kernel_task_entry() -> ! {
+    x86_64::instructions::interrupts::enable();
+    let task = crate::sched::current().expect("kernel entry without current");
+    let payload = task.take_payload().expect("kernel task without payload");
+    payload();
+    crate::sched::exit_current(0);
+}
+
+pub extern "C" fn user_task_entry() -> ! {
+    let task = crate::sched::current().expect("user entry without current");
+    let entry = task.user_entry;
+    let rsp = task.user_rsp0;
+    unsafe { crate::user::enter_ring3(VirtAddr::new(entry), VirtAddr::new(rsp)) };
+}
