@@ -226,6 +226,14 @@ pub fn post(qid: u64, opcode: u32, buf: u64, len: u64) -> i64 {
         let chunk_idx = (prod.seq % eq.nchunks as u64) as u32;
         let chunk = eq.base + EQ_HDR + chunk_idx as u64 * eq.chunk_size as u64;
         let data_cap = eq.chunk_size - 8;
+        if prod.woff == 0 {
+            // fresh lap over this chunk: clear the previous FULL marker
+            // BEFORE writing elements, so the consumer cannot re-read the
+            // old flag and double-count the whole chunk
+            if !wr32(&eq.owner, eq.base, chunk - eq.base + 4, 0) {
+                return -1;
+            }
+        }
         if prod.woff + elem_len as u32 <= data_cap {
             let dst = chunk + 8 + prod.woff as u64;
             if !eq.owner.aspace.lock().write_bytes(dst, &elem) {
