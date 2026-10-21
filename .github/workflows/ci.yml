@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  kernel:
+    name: kernel (rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview, clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kernel
+
+      - name: install bootimage
+        run: cargo install bootimage
+
+      - name: build boot image
+        working-directory: kernel
+        run: cargo bootimage
+
+      - name: clippy
+        working-directory: kernel
+        run: cargo clippy -- -D warnings
+
+      - name: fmt
+        working-directory: kernel
+        run: cargo fmt --check
+
+  userspace:
+    name: userspace (c++)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+
+      - name: build
+        run: |
+          cmake -S userspace -B userspace/build
+          cmake --build userspace/build
+
+      - name: cppcheck
+        run: cppcheck --enable=warning --error-exitcode=1 --std=c++20 userspace/src userspace/programs
