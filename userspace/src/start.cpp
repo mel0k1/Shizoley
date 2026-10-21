@@ -10,6 +10,6 @@ int main();
 
 }
 
-extern "C" [[noreturn]] void _start() {
+extern "C" [[noreturn]] __attribute__((section(".text._start"))) void _start() {
     shz::start();
 }
