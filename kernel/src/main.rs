@@ -7,7 +7,9 @@ extern crate alloc;
 mod allocator;
 mod elf;
 mod gdt;
+mod initrd;
 mod interrupts;
+mod ipc;
 mod memory;
 mod sched;
 mod serial;
@@ -29,28 +31,32 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     allocator::init(&mut mapper).expect("heap init failed");
     serial_println!("[paparaci] heap up");
 
-    println!("shizoley / paparaci v0.4.0 (tasks, address spaces, threads)");
+    println!("shizoley / paparaci v0.5.0 (ipc, initrd, user threads)");
 
     syscall::init();
 
-    sched::init_current(task::Task::boot_current("main", sched::kernel_aspace()));
+    sched::init_current(task::Task::boot_current("main", sched::kernel_process()));
 
     // all spawns atomic vs the timer so the schedule is deterministic
     x86_64::instructions::interrupts::without_interrupts(|| {
-        sched::spawn_kernel("alpha", || {
-            for i in 0..5 {
-                serial_println!("[alpha] tick {}", i);
-                sched::yield_now();
+        // kernel thread: proves preemption keeps running while init blocks
+        sched::spawn_kernel("heartbeat", || {
+            for i in 0..3 {
+                for _ in 0..80 {
+                    sched::yield_now();
+                }
+                serial_println!("[heartbeat] {}", i);
             }
         });
-        sched::spawn_kernel("beta", || {
-            for i in 0..5 {
-                serial_println!("[beta] tick {}", i);
-                sched::yield_now();
+        match user::spawn_process("init") {
+            Some(pid) => {
+                serial_println!("[paparaci] init queued (pid {}), scheduler loop", pid);
             }
-        });
-        user::spawn_init();
-        serial_println!("[paparaci] tasks ready, scheduler loop");
+            None => {
+                serial_println!("[paparaci] initrd: 'init' not found or broken");
+                println!("[paparaci] initrd: 'init' not found or broken");
+            }
+        }
     });
 
     loop {

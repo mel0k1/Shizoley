@@ -1,7 +1,12 @@
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
+use core::sync::atomic::AtomicUsize;
+use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{
@@ -9,16 +14,20 @@ use x86_64::structures::paging::{
 };
 use x86_64::VirtAddr;
 
+use crate::ipc::Message;
 use crate::memory;
 
 const KSTACK_SIZE: usize = 32 * 1024;
 
+// lower half of the address space belongs to user processes
+pub const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+
 // ---------------------------------------------------------------- address spaces
 
-// one CR3 root per task; kernel (higher half + physmap) is shared, the
+// one CR3 root per process; kernel (higher half + physmap) is shared, the
 // lower half is a private deep copy with shared leaf frames
 pub struct AddressSpace {
-    pml4: PhysFrame<Size4KiB>,
+    pub(crate) pml4: PhysFrame<Size4KiB>,
 }
 
 impl AddressSpace {
@@ -60,10 +69,6 @@ impl AddressSpace {
             }
         }
         Ok(AddressSpace { pml4: root })
-    }
-
-    pub fn switch(&self) {
-        unsafe { Cr3::write(self.pml4, Cr3Flags::empty()) };
     }
 
     // mapper over this root; table frames are reached through the physmap,
@@ -120,6 +125,49 @@ impl AddressSpace {
     pub fn translate_page(&mut self, page: Page<Size4KiB>) -> Option<PhysFrame<Size4KiB>> {
         self.mapper().translate_page(page).ok()
     }
+
+    // byte-wise access into this address space via the physmap; works no
+    // matter which CR3 is active, used for ipc copies between processes
+    pub fn write_bytes(&mut self, mut addr: u64, mut data: &[u8]) -> bool {
+        while !data.is_empty() {
+            if addr >= USER_LIMIT {
+                return false;
+            }
+            let page = Page::containing_address(VirtAddr::new(addr));
+            let Some(frame) = self.translate_page(page) else {
+                return false;
+            };
+            let off = (addr & 0xFFF) as usize;
+            let n = core::cmp::min(4096 - off, data.len());
+            let dst = memory::phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(off), n) };
+            addr += n as u64;
+            data = &data[n..];
+        }
+        true
+    }
+
+    pub fn read_bytes(&mut self, mut addr: u64, buf: &mut [u8]) -> bool {
+        let mut off = 0usize;
+        while off < buf.len() {
+            if addr >= USER_LIMIT {
+                return false;
+            }
+            let page = Page::containing_address(VirtAddr::new(addr));
+            let Some(frame) = self.translate_page(page) else {
+                return false;
+            };
+            let page_off = (addr & 0xFFF) as usize;
+            let n = core::cmp::min(4096 - page_off, buf.len() - off);
+            let src = memory::phys_to_virt(frame.start_address()).as_ptr::<u8>();
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.add(page_off), buf.as_mut_ptr().add(off), n)
+            };
+            addr += n as u64;
+            off += n;
+        }
+        true
+    }
 }
 
 // pdpt level: children are page directories, copied one level down
@@ -171,6 +219,41 @@ unsafe fn zero_frame(frame: PhysFrame<Size4KiB>) {
     core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 4096);
 }
 
+// ---------------------------------------------------------------- processes
+
+// a process owns one address space, a mailbox and a set of threads; threads
+// (tasks) hold an Arc to it, so it lives while at least one thread exists
+pub struct Process {
+    pub id: u64,
+    pub name: String,
+    // immutable after creation: the switch path reads it without a lock
+    pub pml4: PhysFrame<Size4KiB>,
+    // page-table mutations (elf load, ipc copies) go through this lock
+    pub aspace: Mutex<AddressSpace>,
+    pub mailbox: Mutex<VecDeque<Message>>,
+    // threads parked in ipc_recv, woken by ipc_send handoff
+    pub waiters: Mutex<Vec<Arc<Task>>>,
+    pub alive: AtomicUsize,
+}
+
+impl Process {
+    pub fn new(id: u64, name: &str, aspace: AddressSpace) -> Self {
+        Process {
+            id,
+            name: String::from(name),
+            pml4: aspace.pml4,
+            aspace: Mutex::new(aspace),
+            mailbox: Mutex::new(VecDeque::new()),
+            waiters: Mutex::new(Vec::new()),
+            alive: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn switch(&self) {
+        unsafe { Cr3::write(self.pml4, Cr3Flags::empty()) };
+    }
+}
+
 // ---------------------------------------------------------------- context switch
 
 // fxsave area first so it sits 16-aligned; rsp saved at +512
@@ -220,7 +303,17 @@ unsafe fn fxsave_current(area: &mut [u8; 512]) {
 pub enum TaskState {
     Ready,
     Running,
+    Blocked,
     Finished,
+}
+
+// what a task parked in ipc_recv waits for; the waker copies the message
+// straight into (buf, buf+max) of the parked task's address space
+#[derive(Debug, Clone, Copy)]
+pub struct BlockedRecv {
+    pub src: u64,
+    pub buf: u64,
+    pub max: u64,
 }
 
 type Payload = Box<dyn FnOnce() + Send>;
@@ -259,15 +352,18 @@ pub struct TaskInner {
     pub state: TaskState,
     pub exit_code: i64,
     pub user_rsp_saved: u64,
+    pub wake_ret: u64,
+    pub blocked: Option<BlockedRecv>,
     payload: Option<Payload>,
 }
 
 pub struct Task {
     pub id: u64,
     pub name: &'static str,
-    pub aspace: Arc<AddressSpace>,
+    pub proc: Arc<Process>,
     pub user_entry: u64,
     pub user_rsp0: u64,
+    pub user_arg: u64,
     kstack: KStack,
     inner: UnsafeCell<TaskInner>,
 }
@@ -276,14 +372,15 @@ unsafe impl Send for Task {}
 unsafe impl Sync for Task {}
 
 impl Task {
-    fn new(name: &'static str, aspace: Arc<AddressSpace>) -> Option<Self> {
+    fn new(name: &'static str, proc: Arc<Process>) -> Option<Self> {
         let kstack = KStack::new()?;
         Some(Task {
             id: 0,
             name,
-            aspace,
+            proc,
             user_entry: 0,
             user_rsp0: 0,
+            user_arg: 0,
             kstack,
             inner: UnsafeCell::new(TaskInner {
                 ctx: SwitchFrame {
@@ -293,6 +390,8 @@ impl Task {
                 state: TaskState::Ready,
                 exit_code: 0,
                 user_rsp_saved: 0,
+                wake_ret: 0,
+                blocked: None,
                 payload: None,
             }),
         })
@@ -323,14 +422,14 @@ impl Task {
         self.inner.get_mut().ctx.rsp = base;
     }
 
-    pub fn boot_current(name: &'static str, aspace: Arc<AddressSpace>) -> Self {
-        let mut task = Task::new(name, aspace).expect("task alloc failed");
+    pub fn boot_current(name: &'static str, proc: Arc<Process>) -> Self {
+        let mut task = Task::new(name, proc).expect("task alloc failed");
         unsafe { fxsave_current(&mut task.inner.get_mut().ctx.fx) };
         task
     }
 
-    pub fn kernel_thread(name: &'static str, aspace: Arc<AddressSpace>, f: Payload) -> Self {
-        let mut task = Task::new(name, aspace).expect("task alloc failed");
+    pub fn kernel_thread(name: &'static str, proc: Arc<Process>, f: Payload) -> Self {
+        let mut task = Task::new(name, proc).expect("task alloc failed");
         task.arm(kernel_task_entry as unsafe extern "C" fn() -> ! as usize);
         task.inner.get_mut().payload = Some(f);
         task
@@ -338,14 +437,16 @@ impl Task {
 
     pub fn user_process(
         name: &'static str,
-        aspace: Arc<AddressSpace>,
+        proc: Arc<Process>,
         entry: VirtAddr,
         stack_top: VirtAddr,
+        arg: u64,
     ) -> Self {
-        let mut task = Task::new(name, aspace).expect("task alloc failed");
+        let mut task = Task::new(name, proc).expect("task alloc failed");
         task.arm(user_task_entry as unsafe extern "C" fn() -> ! as usize);
         task.user_entry = entry.as_u64();
         task.user_rsp0 = stack_top.as_u64();
+        task.user_arg = arg;
         task
     }
 
@@ -379,5 +480,6 @@ pub extern "C" fn user_task_entry() -> ! {
     let task = crate::sched::current().expect("user entry without current");
     let entry = task.user_entry;
     let rsp = task.user_rsp0;
-    unsafe { crate::user::enter_ring3(VirtAddr::new(entry), VirtAddr::new(rsp)) };
+    let arg = task.user_arg;
+    unsafe { crate::user::enter_ring3(VirtAddr::new(entry), VirtAddr::new(rsp), arg) };
 }

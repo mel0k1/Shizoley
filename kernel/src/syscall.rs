@@ -1,11 +1,13 @@
 use core::arch::global_asm;
 use core::ptr::addr_of_mut;
 use x86_64::registers::model_specific::Msr;
+use x86_64::VirtAddr;
 
 use crate::gdt;
+use crate::ipc;
 use crate::serial;
 use crate::vga;
-use crate::{println, sched, serial_println};
+use crate::{println, sched, serial_println, task};
 
 // rcx = user rip, r11 = user rflags, rax = nr, rdi/rsi/rdx = args
 // the scheduler points SYSCALL_KSTACK_TOP at the current task's kernel stack,
@@ -40,8 +42,8 @@ global_asm!(
         popq %rdx
         popq %rsi
         popq %rdi
-        popq %rbp
         addq $8, %rsp
+        popq %rbp
         popq %rcx
         popq %r11
         movq SAVED_USER_RSP(%rip), %rsp
@@ -94,20 +96,66 @@ pub fn init() {
     serial_println!("[paparaci] syscall msr up");
 }
 
-extern "C" fn syscall_dispatch(nr: u64, a1: u64, _a2: u64, _a3: u64) -> u64 {
+const ERR: u64 = (-1i64) as u64;
+
+extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let cur = match sched::current() {
+        Some(c) => c,
+        None => {
+            serial_println!("[paparaci] syscall without task");
+            return ERR;
+        }
+    };
     match nr {
+        // 0: putc(char)
         0 => {
-            let b = a1 as u8;
-            vga::put_byte(b);
-            serial::put_byte(b);
+            vga::put_byte(a1 as u8);
+            serial::put_byte(a1 as u8);
             0
         }
+        // 1: exit(code) — ends the thread; process dies with its last thread
         1 => {
             let code = a1 as i64;
-            println!("[init] exit({})", code);
-            serial_println!("[init] exit({})", code);
+            if cur.proc.id != 0 {
+                serial_println!(
+                    "[sched] thread {} of '{}' ({}) exit({})",
+                    cur.id,
+                    cur.proc.name,
+                    cur.proc.id,
+                    code
+                );
+            }
             sched::exit_current(code)
         }
+        // 2: spawn(name, name_len) -> pid; elf comes from the initrd
+        2 => {
+            let len = a2.min(32) as usize;
+            let mut namebuf = [0u8; 32];
+            if len == 0 || !cur.proc.aspace.lock().read_bytes(a1, &mut namebuf[..len]) {
+                return ERR;
+            }
+            match core::str::from_utf8(&namebuf[..len]) {
+                Ok(name) => crate::user::spawn_process(name).unwrap_or(ERR),
+                Err(_) => ERR,
+            }
+        }
+        // 3: thread_create(entry, stack_top, arg) -> tid; same address space
+        3 => {
+            let valid = |x: u64| (0x1000..task::USER_LIMIT).contains(&x);
+            if !valid(a1) || !valid(a2) {
+                return ERR;
+            }
+            let proc = cur.proc.clone();
+            sched::spawn_user("thread", proc, VirtAddr::new(a1), VirtAddr::new(a2), a3)
+        }
+        // 4: ipc_send(dest_pid, buf, len) -> 0 | -1
+        4 => ipc::send(&cur, a1, a2, a3) as u64,
+        // 5: ipc_recv(src_pid /*0 = any*/, buf, max) -> sender pid | -1
+        5 => sched::recv_or_block(a1, a2, a3),
+        // 6: getpid() -> pid
+        6 => cur.proc.id,
+        // 7: gettid() -> tid
+        7 => cur.id,
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);
