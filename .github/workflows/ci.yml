@@ -35,6 +35,19 @@ jobs:
         working-directory: kernel
         run: cargo fmt --check
 
+      - name: smoke test in qemu
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-system-x86
+          set +e
+          timeout 120 qemu-system-x86_64 \
+            -drive format=raw,file=kernel/target/x86_64-paparaci/debug/bootimage-paparaci.bin \
+            -display none -serial stdio -no-reboot -no-shutdown \
+            > serial.log 2>&1
+          set -e
+          cat serial.log
+          grep -q "3\^10 = 59049" serial.log
+          grep -q "exit(0)" serial.log
+
   userspace:
     name: userspace (c++)
     runs-on: ubuntu-latest
