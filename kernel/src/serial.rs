@@ -16,6 +16,13 @@ pub fn _print(args: fmt::Arguments) {
     });
 }
 
+pub fn put_byte(b: u8) {
+    interrupts::without_interrupts(|| {
+        let bytes: &[u8] = if b == b'\n' { b"\r\n" } else { &[b] };
+        SERIAL1.lock().inner_mut().send_bytes_exact(bytes);
+    });
+}
+
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {

@@ -126,6 +126,10 @@ pub fn _print(args: fmt::Arguments) {
     });
 }
 
+pub fn put_byte(b: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| WRITER.lock().write_byte(b));
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {

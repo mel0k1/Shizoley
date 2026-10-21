@@ -9,10 +9,13 @@ mod gdt;
 mod interrupts;
 mod memory;
 mod serial;
+mod syscall;
+mod user;
 mod vga;
 
 use alloc::vec::Vec;
 use bootloader::{entry_point, BootInfo};
+use x86_64::VirtAddr;
 
 entry_point!(kernel_main);
 
@@ -25,21 +28,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     allocator::init(&mut mapper, &mut frames).expect("heap init failed");
     serial_println!("[paparaci] heap up");
 
-    println!("shizoley / paparaci v0.1.0");
-
     let mut squares = Vec::new();
     for i in 0..16u64 {
         squares.push(i * i);
     }
     println!(
-        "heap check: sum of squares 0..16 = {}",
+        "shizoley / paparaci v0.2.0 (heap: sum 0..16 = {})",
         squares.iter().sum::<u64>()
     );
 
-    serial_println!("[paparaci] ok");
-    loop {
-        x86_64::instructions::hlt();
-    }
+    syscall::init();
+
+    let phys_offset = VirtAddr::new(boot_info.physical_memory_offset);
+    let (entry, stack) = user::load(&mut mapper, &mut frames, phys_offset);
+    serial_println!("[paparaci] entering ring 3");
+    unsafe { user::enter(entry, stack) };
 }
 
 #[panic_handler]

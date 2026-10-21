@@ -4,13 +4,12 @@ use x86_64::{PhysAddr, VirtAddr};
 
 pub fn init(boot_info: &'static BootInfo) -> (OffsetPageTable<'static>, BootInfoFrameAllocator) {
     let phys_offset = VirtAddr::new(boot_info.physical_memory_offset);
-    let level_4_table = unsafe { active_level_4_table(phys_offset) };
-    let mapper = unsafe { OffsetPageTable::new(level_4_table, phys_offset) };
+    let mapper = unsafe { OffsetPageTable::new(active_pml4(phys_offset), phys_offset) };
     let frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
     (mapper, frame_allocator)
 }
 
-unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
+pub unsafe fn active_pml4(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
     use x86_64::registers::control::Cr3;
 
     let (level_4_table_frame, _) = Cr3::read();
