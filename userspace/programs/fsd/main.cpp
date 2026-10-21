@@ -23,7 +23,7 @@ const u8* lookup(const char* name, u64* out_len) {
         if (img[off] == 0) {
             break; // archive tail
         }
-        char namebuf[100];
+        char namebuf[101];
         u32 nl = 0;
         while (nl < 100 && img[off + nl] != 0) {
             namebuf[nl] = static_cast<char>(img[off + nl]);
