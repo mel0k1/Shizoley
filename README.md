@@ -46,8 +46,8 @@
 - [x] heap: bump-аллокатор + `alloc` API (`Vec`, `Box`, ...)
 - [x] syscall-интерфейс (`syscall`/`sysret`, MSR STAR/LSTAR/SFMASK)
 - [x] переход в ring 3: init исполняется в user mode
+- [x] ELF-загрузчик: парсинг ELF64 (PT_LOAD, флаги R/W/X, BSS)
 - [ ] планировщик задач
-- [ ] ELF-загрузчик (сейчас init вшивается в ядро сырым образом)
 - [ ] драйверы, файловая система
 
 ## Структура
@@ -55,7 +55,7 @@
 ```
 Shizoley/
 ├── kernel/                  # Paparaci — микроядро на Rust
-│   ├── build.rs             # сборка init (g++) и вшивание в ядро
+│   ├── build.rs             # сборка init (g++) и вшивание статического ELF в ядро
 │   ├── src/
 │   │   ├── main.rs          # точка входа, panic handler
 │   │   ├── vga.rs           # VGA-текстовый буфер 80x25
@@ -64,8 +64,9 @@ Shizoley/
 │   │   ├── interrupts.rs    # IDT, PIC, таймер, клавиатура
 │   │   ├── memory.rs        # таблицы страниц, frame-аллокатор
 │   │   ├── allocator.rs     # heap (bump-аллокатор), GlobalAlloc
+│   │   ├── elf.rs           # ELF64-загрузчик: PT_LOAD, флаги R/W/X, BSS
 │   │   ├── syscall.rs       # MSR + asm-трамплин syscall/sysret + диспетчер
-│   │   └── user.rs          # загрузка init в 0x400000 и вход в ring 3
+│   │   └── user.rs          # маппинг стека init и вход в ring 3
 │   ├── x86_64-paparaci.json # кастомный target (без red zone)
 │   └── .cargo/config.toml
 ├── userspace/               # окружение на C++20 (freestanding)
@@ -107,7 +108,7 @@ cd kernel && cargo run
 qemu-system-x86_64 -drive format=raw,file=target/x86_64-paparaci/debug/bootimage-paparaci.bin -serial stdio
 ```
 
-Ядро пишет баннер в VGA и serial, проверяет heap через `alloc::Vec`, затем мапит образ `init` на `0x400000`, настраивает MSR и уходит в ring 3 через `iretq`. Дальше работает userspace: `init` печатает баннер и `3^10`, делая syscall `putc`; на `exit` ядро печатает код выхода и засыпает в `hlt`. Клавиатура по-прежнему жива — нажатия печатаются на экран из обработчика прерывания.
+Ядро пишет баннер в VGA и serial, проверяет heap через `alloc::Vec`, затем парсит вшитый статический ELF `init`: `elf.rs` валидирует заголовок, раскладывает `PT_LOAD`-сегменты по их `p_vaddr` с флагами из `p_flags` (W → writable, не-X → NX), затирает BSS, мапит стек и уходит в ring 3 через `iretq`. Дальше работает userspace: `init` печатает баннер и `3^10`, делая syscall `putc`; на `exit` ядро печатает код выхода и засыпает в `hlt`. Клавиатура по-прежнему жива — нажатия печатаются на экран из обработчика прерывания.
 
 ## Syscall ABI
 
@@ -121,14 +122,13 @@ qemu-system-x86_64 -drive format=raw,file=target/x86_64-paparaci/debug/bootimage
 Как это устроено:
 
 - userspace вызывает инструкцию `syscall`; ядро заранее настраивает MSR: `EFER.SCE`, `STAR` (kernel `0x08`/`0x10`, sysret попадает на user `0x20`/`0x18` через смещения +16/+8), `LSTAR` → трамплин, `SFMASK` сбрасывает TF/IF/DF/IOPL/NT;
-- трамплин на asm переключается на отдельный syscall-стек, сохраняет GPR, вызывает диспетчер на Rust, восстанавливает состояние и возвращается `sysretq`;
+- трамплин на asm переключается на отдельный syscall-стек, сохраняет GPR и пользовательский RSP, вызывает диспетчер на Rust, восстанавливает состояние и возвращается `sysretq`;
 - прерывания из ring 3 обслуживаются через `TSS.RSP0`; страницы пользователя замаплены с `USER_ACCESSIBLE`, user-бит проставлен и на таблицах-предках.
 
 ## Дорожная карта
 
-1. Планировщик и потоки в Paparaci (адресные пространства на процесс).
-2. ELF-загрузчик: полноценный парсинг ELF вместо сырого образа, загрузка из initrd.
-3. Драйверы и ФС в user space — как и положено микроядру.
+1. Планировщик и потоки в Paparaci (адресные пространства на процесс, загрузка ELF из initrd/ФС).
+2. Драйверы и ФС в user space — как и положено микроядру.
 
 ## Лицензия
 
@@ -193,8 +193,8 @@ The kernel is named after paparazzi for a reason: Paparaci watches everything ha
 - [x] Heap: bump allocator + `alloc` API (`Vec`, `Box`, ...)
 - [x] Syscall interface (`syscall`/`sysret`, MSR STAR/LSTAR/SFMASK)
 - [x] Ring 3: init runs in user mode
+- [x] ELF loader: ELF64 parsing (PT_LOAD, R/W/X flags, BSS)
 - [ ] Task scheduler
-- [ ] ELF loader (init is currently embedded as a raw image)
 - [ ] Drivers, file system
 
 ### Build & run
@@ -212,7 +212,7 @@ cmake --build userspace/build
 cd kernel && cargo run   # boot in QEMU
 ```
 
-The kernel prints a banner to VGA and serial, sanity-checks the heap with `alloc::Vec`, then maps the `init` image at `0x400000`, sets up the MSRs and drops into ring 3 via `iretq`. From that point userspace is in charge: `init` prints a banner and `3^10` through the `putc` syscall; on `exit` the kernel prints the exit code and sleeps in `hlt`. The keyboard still works — keypresses are echoed from the interrupt handler.
+The kernel prints a banner to VGA and serial, sanity-checks the heap with `alloc::Vec`, then parses the embedded static ELF of `init`: `elf.rs` validates the header, lays out `PT_LOAD` segments at their `p_vaddr` with flags derived from `p_flags` (W → writable, non-X → NX), zero-fills BSS, maps the stack and drops into ring 3 via `iretq`. From that point userspace is in charge: `init` prints a banner and `3^10` through the `putc` syscall; on `exit` the kernel prints the exit code and sleeps in `hlt`. The keyboard still works — keypresses are echoed from the interrupt handler.
 
 ### Syscall ABI
 
@@ -226,7 +226,7 @@ Convention: number in `rax`, args in `rdi`, `rsi`, `rdx`, result in `rax`.
 How it works:
 
 - userspace issues the `syscall` instruction; the kernel pre-configures the MSRs: `EFER.SCE`, `STAR` (kernel `0x08`/`0x10`, sysret lands on user `0x20`/`0x18` via the +16/+8 offsets), `LSTAR` → trampoline, `SFMASK` clears TF/IF/DF/IOPL/NT;
-- the asm trampoline switches to a dedicated syscall stack, saves GPRs, calls the Rust dispatcher, restores state and returns with `sysretq`;
+- the asm trampoline switches to a dedicated syscall stack, saves GPRs and the user RSP, calls the Rust dispatcher, restores state and returns with `sysretq`;
 - interrupts from ring 3 are served through `TSS.RSP0`; user pages are mapped with `USER_ACCESSIBLE`, and the user bit is also set on ancestor tables.
 
 ### License

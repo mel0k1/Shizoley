@@ -2,7 +2,8 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-// builds userspace/init with host g++ and embeds it as raw binary
+// builds userspace/init with host g++ and embeds the static ELF
+// (parsed by the kernel's elf loader at boot)
 fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -75,16 +76,5 @@ fn main() {
         .unwrap_or_else(|e| panic!("kernel build: userspace link failed ({e})"));
     if !status.success() {
         panic!("kernel build: userspace link failed");
-    }
-
-    let bin = out.join("user_init.bin");
-    let status = Command::new("objcopy")
-        .args(["-O", "binary"])
-        .arg(&elf)
-        .arg(&bin)
-        .status()
-        .unwrap_or_else(|e| panic!("kernel build: objcopy not found ({e})"));
-    if !status.success() {
-        panic!("kernel build: objcopy failed");
     }
 }

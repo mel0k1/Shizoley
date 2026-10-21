@@ -1,5 +1,7 @@
 use bootloader::bootinfo::{BootInfo, MemoryMap, MemoryRegionType};
-use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{
+    FrameAllocator, OffsetPageTable, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+};
 use x86_64::{PhysAddr, VirtAddr};
 
 pub fn init(boot_info: &'static BootInfo) -> (OffsetPageTable<'static>, BootInfoFrameAllocator) {
@@ -16,6 +18,23 @@ pub unsafe fn active_pml4(physical_memory_offset: VirtAddr) -> &'static mut Page
     let phys = level_4_table_frame.start_address();
     let virt = physical_memory_offset + phys.as_u64();
     unsafe { &mut *(virt.as_mut_ptr()) }
+}
+
+// every ancestor of [start, end) must carry the user bit or ring 3 faults
+pub unsafe fn mark_user_range(phys_offset: VirtAddr, start: u64, end: u64) {
+    let pml4 = active_pml4(phys_offset);
+    let mut base = start & !0x1F_FFFF;
+    while base < end {
+        let pml4e = &mut pml4[((base >> 39) & 0x1FF) as usize];
+        pml4e.set_flags(pml4e.flags() | PageTableFlags::USER_ACCESSIBLE);
+        let pdpt = &mut *((phys_offset + pml4e.addr().as_u64()).as_mut_ptr::<PageTable>());
+        let pdpte = &mut pdpt[((base >> 30) & 0x1FF) as usize];
+        pdpte.set_flags(pdpte.flags() | PageTableFlags::USER_ACCESSIBLE);
+        let pd = &mut *((phys_offset + pdpte.addr().as_u64()).as_mut_ptr::<PageTable>());
+        let pde = &mut pd[((base >> 21) & 0x1FF) as usize];
+        pde.set_flags(pde.flags() | PageTableFlags::USER_ACCESSIBLE);
+        base += 0x20_0000;
+    }
 }
 
 pub struct BootInfoFrameAllocator {

@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod allocator;
+mod elf;
 mod gdt;
 mod interrupts;
 mod memory;
@@ -33,7 +34,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         squares.push(i * i);
     }
     println!(
-        "shizoley / paparaci v0.2.0 (heap: sum 0..16 = {})",
+        "shizoley / paparaci v0.3.0 (heap: sum 0..16 = {})",
         squares.iter().sum::<u64>()
     );
 
