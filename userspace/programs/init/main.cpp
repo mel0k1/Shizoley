@@ -9,7 +9,7 @@ int main() {
     for (int i = 0; i < 10; ++i) {
         n *= 3;
     }
-    println("3^10 =", n);
+    println("3^10 = ", n);
     return 0;
 }
 

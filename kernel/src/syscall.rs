@@ -12,6 +12,7 @@ global_asm!(
     .section .text.syscall_entry, "ax"
     .p2align 4
     paparaci_syscall_entry:
+        movq %rsp, saved_user_rsp(%rip)
         movabs $syscall_kstack_top, %rsp
         pushq %r11
         pushq %rcx
@@ -40,10 +41,13 @@ global_asm!(
         addq $8, %rsp
         popq %rcx
         popq %r11
+        movq saved_user_rsp(%rip), %rsp
         sysretq
 
     .section .bss, "aw", @nobits
     .p2align 4
+    saved_user_rsp:
+        .quad 0
     syscall_kstack:
         .space 65536
     syscall_kstack_top:
