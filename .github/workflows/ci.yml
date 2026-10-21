@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   pull_request:
 
 jobs:
@@ -45,11 +45,11 @@ jobs:
             > serial.log 2>&1
           set -e
           cat serial.log
-          grep -q "3\^10 = 59049" serial.log
-          grep -q "exit(0)" serial.log
-          grep -qF "[beta] tick 4" serial.log
-          grep -q "exited with code 0" serial.log
-          grep -q "sched] init (3) exited" serial.log
+          grep -qF "[init] threads: 3 4" serial.log
+          grep -qF "[t2] tick 2" serial.log
+          grep -qF "[init] pong from 2" serial.log
+          grep -qF "process 'hello' (2) finished" serial.log
+          grep -qF "process 'init' (1) finished" serial.log
 
   userspace:
     name: userspace (c++)

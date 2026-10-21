@@ -24,15 +24,16 @@
 ```
 +----------------------------+  ring 3
 |      userspace (C++20)     |
-|  shz runtime, init, ...    |
+|  shz runtime, init, hello  |
 +----------------------------+
      | syscall / sysret |
 +----------------------------+  ring 0
 |    paparaci kernel (Rust)  |
 | gdt/idt/pic, paging, heap, |
-| tasks: CR3 на задачу,      |
-| планировщик, потоки,       |
-| syscall msr, elf loader    |
+| процессы и user-потоки,    |
+| mailbox IPC, initrd,       |
+| планировщик, syscall msr,  |
+| elf loader                 |
 +----------------------------+
 |        bootloader          |
 +----------------------------+
@@ -52,14 +53,18 @@
 - [x] адресное пространство на задачу: свой CR3, глубокая копия ветки ядра
 - [x] планировщик round-robin: вытеснение по таймеру (PIT 100 Гц) + yield
 - [x] потоки: контекст-свитч с fxsave, per-task kernel stack (syscall + RSP0)
+- [x] процессы: Process (pid, имя, mailbox) + user-потоки одного адресного пространства
+- [x] initrd: ustar-архив, собираемый build.rs из programs/*, spawn по имени
+- [x] mailbox IPC: ipc_send/ipc_recv с блокировкой получателя и прямой доставкой
 - [ ] драйверы, файловая система
+- [ ] асинхронная очередь ядро->процесс (по мотивам HelQueue из managarm)
 
 ## Структура
 
 ```
 Shizoley/
 ├── kernel/                  # Paparaci — микроядро на Rust
-│   ├── build.rs             # сборка init (g++) и вшивание статического ELF в ядро
+│   ├── build.rs             # сборка programs/* (g++) и упаковка их в ustar-initrd
 │   ├── src/
 │   │   ├── main.rs          # точка входа, panic handler
 │   │   ├── vga.rs           # VGA-текстовый буфер 80x25
@@ -68,17 +73,20 @@ Shizoley/
 │   │   ├── interrupts.rs    # IDT, PIC, таймер, клавиатура
 │   │   ├── memory.rs        # таблицы страниц, глобальный frame-аллокатор
 │   │   ├── allocator.rs     # heap (bump-аллокатор), GlobalAlloc
-│   │   ├── task.rs          # AddressSpace (CR3 на задачу), Task, __switch
-│   │   ├── sched.rs         # ready-очередь, вытеснение, yield, exit, reap
+│   │   ├── task.rs          # AddressSpace (CR3 на процесс), Process, Task, __switch
+│   │   ├── sched.rs         # ready-очередь, парковка в recv, exit, reap
+│   │   ├── ipc.rs           # mailbox процессов: send/recv, registry процессов
+│   │   ├── initrd.rs        # парсер ustar: lookup(name) -> elf-образ
 │   │   ├── elf.rs           # ELF64-загрузчик: PT_LOAD, флаги R/W/X, BSS
 │   │   ├── syscall.rs       # MSR + asm-трамплин syscall/sysret + диспетчер
-│   │   └── user.rs          # spawn процесса в новое адресное пространство и вход в ring 3
+│   │   └── user.rs          # spawn процесса из initrd, вход в ring 3
 │   ├── x86_64-paparaci.json # кастомный target (без red zone)
 │   └── .cargo/config.toml
 ├── userspace/               # окружение на C++20 (freestanding)
 │   ├── include/shizoley/    # syscall ABI, io, типы
 │   ├── src/                 # рантайм: syscall-обёртки, вывод, _start
-│   ├── programs/init/       # init — первая программа в ring 3
+│   ├── programs/init/       # init: user-потоки + spawn + IPC ping-pong
+│   ├── programs/hello/      # hello: второй процесс, участник IPC-демо
 │   └── link.ld              # фиксация образа на 0x400000
 ├── .github/workflows/       # CI: сборка + линт
 └── assets/                  # маскот
@@ -114,14 +122,27 @@ cd kernel && cargo run
 qemu-system-x86_64 -drive format=raw,file=target/x86_64-paparaci/debug/bootimage-paparaci.bin -serial stdio
 ```
 
-Ядро бутится, поднимает heap и MSR, затем планировщик: `main` становится задачей 0, рядом стартуют два потока ядра (`alpha`, `beta`) — каждый печатает пять тиков и завершается, чередуясь по таймеру (PIT 100 Гц, round-robin). Параллельно `elf.rs` раскладывает вшитый статический ELF `init` в **свежее адресное пространство** (свой CR3: верхняя половина ядра разделяется, нижняя — глубокая копия), мапит стек и ставит задачу в очередь. Когда планировщик отдает ей CPU, трамплин через `iretq` уходит в ring 3; `init` печатает баннер и `3^10` через syscall `putc`, на `exit` планировщик снимает задачу, а main-петля-жнец печатает код выхода. Page fault из ring 3 убивает только провинившуюся задачу — ядро продолжает жить. Клавиатура по-прежнему жива — нажатия печатаются на экран из обработчика прерывания.
+Ядро бутится, поднимает heap и MSR, затем планировщик: `main` становится задачей 0, рядом стартует kernel-поток `heartbeat` (доказывает, что вытеснение живёт, пока init блокирован в IPC). Параллельно build.rs кладёт все `programs/*` в ustar-initrd, вшитый в ядро; `spawn_process("init")` находит образ, `elf.rs` раскладывает его в **свежее адресное пространство** (свой CR3) и ставит процесс в очередь. Дальше init в ring 3:
+
+- создаёт **два user-потока** (`thread_create`) — оба работают в одном адресном пространстве, печатают тики и завершаются;
+- делает `spawn("hello")` — ядро грузит второй ELF из initrd в отдельный процесс (pid 2);
+- шлёт `ping` через `ipc_send`, `hello` ловит его блокирующим `ipc_recv`, отвечает `pong` — полный ping-pong между двумя процессами с разными CR3;
+- `exit` всех потоков процесса завершает процесс, жнец печатает коды выходов.
+
+Page fault из ring 3 убивает только провинившуюся задачу — ядро продолжает жить. Клавиатура по-прежнему жива — нажатия печатаются на экран из обработчика прерывания.
 
 ## Syscall ABI
 
-| nr | имя    | аргументы     | описание             |
-|----|--------|---------------|----------------------|
-| 0  | `putc` | `rdi`: символ | символ в консоль     |
-| 1  | `exit` | `rdi`: код    | завершить исполнение |
+| nr | имя             | аргументы                              | описание                                   |
+|----|-----------------|----------------------------------------|--------------------------------------------|
+| 0  | `putc`          | `rdi`: символ                          | символ в консоль                           |
+| 1  | `exit`          | `rdi`: код                             | завершить поток; процесс умирает с последним потоком |
+| 2  | `spawn`         | `rdi`: имя, `rsi`: длина               | ELF из initrd -> новый процесс, -> pid     |
+| 3  | `thread_create` | `rdi`: entry, `rsi`: stack top, `rdx`: arg | user-поток в текущем процессе, -> tid  |
+| 4  | `ipc_send`      | `rdi`: pid, `rsi`: buf, `rdx`: len     | сообщение в mailbox или напрямую ждущему   |
+| 5  | `ipc_recv`      | `rdi`: src (0 = любой), `rsi`: buf, `rdx`: max | блокируется до сообщения, -> sender pid |
+| 6  | `getpid`        | —                                      | pid текущего процесса                      |
+| 7  | `gettid`        | —                                      | tid текущего потока                        |
 
 Конвенция: номер в `rax`, аргументы в `rdi`, `rsi`, `rdx`, результат в `rax`.
 
@@ -138,10 +159,18 @@ qemu-system-x86_64 -drive format=raw,file=target/x86_64-paparaci/debug/bootimage
 - **__switch** — сохранение callee-saved + fxsave/fxrstor + перескок на стек следующей задачи; задача, прерванная прямо внутри обработчика IRQ или syscall, доезжает до конца и корректно уходит через `iretq`/`sysret`;
 - планировщик — round-robin: таймер (PIT 100 Гц) кладёт текущую задачу в конец очереди и переключает, `yield` делает то же кооперативно; завершившаяся задача попадает к жнецу в main-петле, где печатается её код выхода и освобождается kernel-стек.
 
+## Процессы, потоки и IPC
+
+- **Process** — pid, имя, `AddressSpace` (Mutex для мутаций страниц), mailbox, список ждущих recv-потоков и счётчик живых потоков; CR3 хранится отдельно и неизменно, поэтому свитч читает его без блокировки; процесс живёт, пока жив хоть один его поток (Arc);
+- **user-потоки одного процесса** — `thread_create` создаёт Task, разделяющий адресное пространство и mailbox процесса; стек потока — обычная память пользователя (init даёт потоки статические .bss-буферы), аргумент приходит в `rdi`;
+- **mailbox IPC** — `ipc_send` копирует данные из адресного пространства отправителя и либо отдаёт их напрямую первому подходящему припаркованному получателю (просыпаясь с `sender pid` как результатом recv), либо кладёт в mailbox получателя (cap 32 сообщения, payload до 4 КиБ); копии идут через physmap по translate, без переключения CR3;
+- **initrd** — build.rs компилирует каждый `programs/<name>/main.cpp` с рантаймом `shz` в статический ELF и упаковывает их в ustar-архив с корректной контрольной суммой; ядро вшивает архив и раздаёт образы по имени на `spawn`.
+
 ## Дорожная карта
 
-1. IPC в Paparaci (микроядро обязано уметь передавать сообщения), ELF из initrd/ФС, user-потоки одного процесса.
-2. Драйверы и ФС в user space — как и положено микроядру.
+1. Асинхронная очередь ядро->процесс в общей памяти (по мотивам HelQueue из managarm) как «второй помощник» простому mailbox IPC.
+2. Драйверы и ФС в user space — как и положено микроядру; initrd уже даёт базу для spawn'а сервисов.
+3. Дальше — по обстоятельствам: подсматриваем у managarm (C++, LAN/потоковый IPC, universe-хэндлы) и Veda (Rust, capability-каналы, свой VT-x гипервизор с EPT+IOMMU для драйвер-Linux VM).
 
 ## Лицензия
 
@@ -210,7 +239,11 @@ The kernel is named after paparazzi for a reason: Paparaci watches everything ha
 - [x] Per-task address spaces: own CR3, deep-copied kernel branch
 - [x] Round-robin scheduler: timer preemption (PIT 100 Hz) + yield
 - [x] Threads: context switch with fxsave, per-task kernel stack (syscall + RSP0)
+- [x] Processes: Process (pid, name, mailbox) + user threads sharing one address space
+- [x] initrd: ustar archive built by build.rs from programs/*, spawn by name
+- [x] Mailbox IPC: ipc_send/ipc_recv with blocking receiver and direct handoff
 - [ ] Drivers, file system
+- [ ] Async kernel->process queue (inspired by managarm's HelQueue)
 
 ### Build & run
 
@@ -227,14 +260,27 @@ cmake --build userspace/build
 cd kernel && cargo run   # boot in QEMU
 ```
 
-The kernel boots, sets up the heap and MSRs, then hands control to the scheduler: `main` becomes task 0, and two kernel threads (`alpha`, `beta`) start next to it — each prints five ticks and finishes, interleaved by the timer (PIT 100 Hz, round-robin). Meanwhile `elf.rs` lays the embedded static ELF of `init` out into a **fresh address space** (its own CR3: the upper kernel half is shared verbatim, the lower half is a deep copy), maps the stack and queues the task. When the scheduler hands it a CPU, the trampoline drops into ring 3 via `iretq`; `init` prints a banner and `3^10` through the `putc` syscall; on `exit` the scheduler retires the task and the reaper loop in `main` prints its exit code. A page fault from ring 3 kills only the offending task — the kernel lives on. The keyboard still works — keypresses are echoed from the interrupt handler.
+The kernel boots, sets up the heap and MSRs, then hands control to the scheduler: `main` becomes task 0, and a kernel thread `heartbeat` starts next to it (proving preemption keeps running while init blocks in IPC). Meanwhile build.rs packs every `programs/*` into a ustar initrd embedded into the kernel; `spawn_process("init")` looks the image up, `elf.rs` lays it out into a **fresh address space** (its own CR3) and queues the process. Then init runs in ring 3:
+
+- creates **two user threads** (`thread_create`) — both share the process address space, print ticks and finish;
+- calls `spawn("hello")` — the kernel loads the second ELF from the initrd into a separate process (pid 2);
+- sends `ping` via `ipc_send`; `hello` catches it with a blocking `ipc_recv` and replies `pong` — a full ping-pong between two processes with different CR3s;
+- when the last thread of a process exits, the process is done and the reaper prints the exit codes.
+
+A page fault from ring 3 kills only the offending task — the kernel lives on. The keyboard still works — keypresses are echoed from the interrupt handler.
 
 ### Syscall ABI
 
-| nr | name   | args          | description         |
-|----|--------|---------------|---------------------|
-| 0  | `putc` | `rdi`: char   | put char to console |
-| 1  | `exit` | `rdi`: code   | terminate execution |
+| nr | name            | args                                        | description                                        |
+|----|-----------------|---------------------------------------------|----------------------------------------------------|
+| 0  | `putc`          | `rdi`: char                                 | put char to console                                |
+| 1  | `exit`          | `rdi`: code                                 | end the thread; the process dies with its last thread |
+| 2  | `spawn`         | `rdi`: name, `rsi`: len                     | ELF from initrd -> new process, -> pid             |
+| 3  | `thread_create` | `rdi`: entry, `rsi`: stack top, `rdx`: arg  | user thread in the current process, -> tid         |
+| 4  | `ipc_send`      | `rdi`: pid, `rsi`: buf, `rdx`: len          | message to a mailbox or straight to a waiting recv |
+| 5  | `ipc_recv`      | `rdi`: src (0 = any), `rsi`: buf, `rdx`: max | blocks until a message, -> sender pid             |
+| 6  | `getpid`        | —                                           | pid of the current process                         |
+| 7  | `gettid`        | —                                           | tid of the current thread                          |
 
 Convention: number in `rax`, args in `rdi`, `rsi`, `rdx`, result in `rax`.
 
@@ -255,7 +301,15 @@ How it works:
 
 Apache-2.0 — see [LICENSE](LICENSE).
 
+## Processes, threads and IPC
+
+- **Process** — pid, name, an `AddressSpace` (Mutex for page-table mutations), a mailbox, the list of parked recv-threads and a live-thread counter; CR3 is stored separately and never changes, so the switch path reads it lock-free; a process lives while any of its threads holds an Arc;
+- **user threads of one process** — `thread_create` creates a Task sharing the process address space and mailbox; the thread stack is ordinary user memory (init hands out static .bss buffers), the argument arrives in `rdi`;
+- **mailbox IPC** — `ipc_send` copies the payload out of the sender's address space and either hands it straight to the first matching parked receiver (waking it with `sender pid` as the recv result) or drops it into the target mailbox (cap 32 messages, payload up to 4 KiB); copies go through the physmap via translate, no CR3 switch needed;
+- **initrd** — build.rs compiles every `programs/<name>/main.cpp` against the `shz` runtime into a static ELF and packs them into a ustar archive with a correct checksum; the kernel embeds the archive and serves images by name on `spawn`.
+
 ### Roadmap
 
-1. IPC in Paparaci (a microkernel must pass messages), ELF from initrd/FS, user threads of one process.
-2. Drivers and FS in user space — the way a microkernel should.
+1. An async kernel->process queue in shared memory (inspired by managarm's HelQueue) as the "second helper" next to the simple mailbox IPC.
+2. Drivers and FS in user space — the way a microkernel should; the initrd already gives a base for spawning services.
+3. Peek further at managarm (C++, lane/stream IPC, universe handles) and Veda (Rust, capability channels, an own VT-x hypervisor with EPT+IOMMU for a driver-Linux VM).
