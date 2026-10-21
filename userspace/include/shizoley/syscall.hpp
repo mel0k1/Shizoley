@@ -13,6 +13,12 @@ enum class Sys : u64 {
     ipc_recv = 5,       // (src_pid /*0 = any*/, buf, max) -> sender pid
     getpid = 6,
     gettid = 7,
+    eq_setup = 8,      // (mem, size) -> qid; managarm-style event queue
+    eq_post = 9,       // (qid, opcode, buf, len) -> 0 | -1
+    eq_wait = 10,      // (qid) -> 1 | -1; parks until the doorbell
+    eq_kick = 11,      // (qid) -> 0 | -1; release chunk credit
+    initrd_size = 12,  // () -> bytes (initrd mapped ro at INITRD_BASE)
+    write = 13,        // (buf, len) -> len; atomic console line
 };
 
 [[noreturn]] void exit(long code);
@@ -45,6 +51,13 @@ inline long syscall(Sys nr, u64 a1, u64 a2) {
 inline long syscall(Sys nr, u64 a1, u64 a2, u64 a3) {
     u64 ret = static_cast<u64>(nr);
     asm volatile("syscall" : "+a"(ret) : "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
+    return static_cast<long>(ret);
+}
+
+inline long syscall(Sys nr, u64 a1, u64 a2, u64 a3, u64 a4) {
+    u64 ret = static_cast<u64>(nr);
+    register u64 r10 __asm__("r10") = a4; // 4th syscall arg travels in r10
+    asm volatile("syscall" : "+a"(ret) : "D"(a1), "S"(a2), "d"(a3), "r"(r10) : "rcx", "r11", "memory");
     return static_cast<long>(ret);
 }
 

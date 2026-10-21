@@ -1,8 +1,26 @@
 use alloc::vec::Vec;
 
 // ustar archive embedded at link time by build.rs, one file per program;
-// spawn(name) maps the matching elf into a fresh process
-static INITRD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/initrd.tar"));
+// spawn(name) maps the matching elf into a fresh process; the whole image
+// is also mapped read-only into every process at INITRD_BASE so a user
+// space fs service can walk it (syscall 12 reports the size)
+pub const INITRD_BASE: u64 = 0x2000_0000;
+
+include!(concat!(env!("OUT_DIR"), "/initrd_len.rs"));
+
+// page-aligned: the kernel maps these frames straight into user space
+#[repr(align(4096))]
+struct Blob([u8; INITRD_LEN]);
+
+static INITRD_ARRAY: Blob = Blob(*include_bytes!(concat!(env!("OUT_DIR"), "/initrd.tar")));
+static INITRD: &[u8] = &INITRD_ARRAY.0;
+
+pub const INITRD_SIZE: usize = INITRD_LEN;
+
+// kernel-virtual address of the embedded image (for frame sharing)
+pub fn initrd_vaddr() -> u64 {
+    INITRD_ARRAY.0.as_ptr() as u64
+}
 
 fn octal(bytes: &[u8]) -> Option<u64> {
     let mut v: u64 = 0;

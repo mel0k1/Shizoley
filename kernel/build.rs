@@ -22,7 +22,10 @@ fn main() {
 
     // shared shz runtime objects
     let mut runtime = Vec::new();
-    for (i, unit) in ["syscall.cpp", "io.cpp", "start.cpp"].iter().enumerate() {
+    for (i, unit) in ["syscall.cpp", "io.cpp", "eq.cpp", "start.cpp"]
+        .iter()
+        .enumerate()
+    {
         runtime.push(compile(
             &cxx,
             &inc,
@@ -65,6 +68,25 @@ fn main() {
         panic!("kernel build: no userspace programs found");
     }
 
+    // plain data files from userspace/rootfs ride along as initrd entries
+    let rootfs = usr.join("rootfs");
+    println!("cargo:rerun-if-changed={}", rootfs.display());
+    if let Ok(files) = fs::read_dir(&rootfs) {
+        let mut paths: Vec<PathBuf> = files
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        paths.sort();
+        for f in paths {
+            let name = f.file_name().unwrap().to_string_lossy().to_string();
+            images.push((
+                name,
+                fs::read(&f).expect("kernel build: rootfs read failed"),
+            ));
+        }
+    }
+
     // ustar archive: 512-byte header + data + padding per file, zero tail
     let mut tar: Vec<u8> = Vec::new();
     for (name, data) in &images {
@@ -75,6 +97,13 @@ fn main() {
     }
     tar.extend_from_slice(&[0u8; 1024]);
     fs::write(out.join("initrd.tar"), &tar).expect("kernel build: initrd write failed");
+    // the kernel embeds the blob page-aligned (it maps it straight into
+    // user space), so the length has to be known at compile time
+    fs::write(
+        out.join("initrd_len.rs"),
+        format!("pub const INITRD_LEN: usize = {};\n", tar.len()),
+    )
+    .expect("kernel build: initrd_len write failed");
 }
 
 fn compile(cxx: &str, inc: &Path, unit: &Path, obj: &Path) -> PathBuf {

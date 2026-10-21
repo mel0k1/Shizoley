@@ -33,6 +33,7 @@ global_asm!(
         movq 40(%rsp), %rsi
         movq 32(%rsp), %rdx
         movq 24(%rsp), %rcx
+        movq 16(%rsp), %r8
         sti
         call {dispatch}
         cli
@@ -98,7 +99,8 @@ pub fn init() {
 
 const ERR: u64 = (-1i64) as u64;
 
-extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let _ = a4;
     let cur = match sched::current() {
         Some(c) => c,
         None => {
@@ -156,6 +158,32 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         6 => cur.proc.id,
         // 7: gettid() -> tid
         7 => cur.id,
+        // 8: eq_setup(base, size) -> qid; managarm-style event queue
+        8 => crate::eq::setup(a1, a2) as u64,
+        // 9: eq_post(qid, opcode, buf, len) -> 0 | -1
+        9 => crate::eq::post(a1, a2 as u32, a3, a4) as u64,
+        // 10: eq_wait(qid) -> 1 | -1; parks until the doorbell
+        10 => crate::eq::wait(a1) as u64,
+        // 11: eq_kick(qid) -> 0 | -1; release chunk credit to posters
+        11 => crate::eq::kick(a1) as u64,
+        // 12: initrd_size() -> bytes (mapped read-only at INITRD_BASE)
+        12 => crate::initrd::INITRD_SIZE as u64,
+        // 13: write(buf, len) -> len; atomic console line (vga+serial)
+        13 => {
+            let len = a2.min(4096) as usize;
+            let mut bytes = alloc::vec![0u8; len];
+            if !cur.proc.aspace.lock().read_bytes(a1, &mut bytes) {
+                ERR
+            } else {
+                x86_64::instructions::interrupts::without_interrupts(|| {
+                    for b in &bytes {
+                        vga::put_byte(*b);
+                        serial::put_byte(*b);
+                    }
+                });
+                len as u64
+            }
+        }
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);

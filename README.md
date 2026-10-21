@@ -56,8 +56,12 @@
 - [x] процессы: Process (pid, имя, mailbox) + user-потоки одного адресного пространства
 - [x] initrd: ustar-архив, собираемый build.rs из programs/*, spawn по имени
 - [x] mailbox IPC: ipc_send/ipc_recv с блокировкой получателя и прямой доставкой
-- [ ] драйверы, файловая система
-- [ ] асинхронная очередь ядро->процесс (по мотивам HelQueue из managarm)
+- [x] event queue: managarm-подобная очередь ядро->процесс в памяти пользователя (doorbell, chunk-кредиты, eq_wait/eq_kick)
+- [x] сервисы в ring 3: fsd (файлы из initrd по mailbox) и rtcd (CMOS-часы через порты 0x70/0x71, IOPL=3)
+- [x] initrd разделяется в каждый процесс read-only (0x20000000), парсится прямо в user space
+- [x] begin гипервизора: probe VT-x, CR4.VMXE, VMXON, чтение capability-MSR (vmx.rs)
+- [ ] драйверы: клавиатура/консоль в user space через event queue
+- [ ] гипервизор: VMCS, vcpu, guest по Veda-рецепту (GUEST_CREATE/VCPU_RUN)
 
 ## Структура
 
@@ -76,17 +80,22 @@ Shizoley/
 │   │   ├── task.rs          # AddressSpace (CR3 на процесс), Process, Task, __switch
 │   │   ├── sched.rs         # ready-очередь, парковка в recv, exit, reap
 │   │   ├── ipc.rs           # mailbox процессов: send/recv, registry процессов
-│   │   ├── initrd.rs        # парсер ustar: lookup(name) -> elf-образ
+│   │   ├── eq.rs            # event queue: chunk-кольцо в памяти пользователя, doorbell
+│   │   ├── initrd.rs        # парсер ustar: lookup(name) -> elf-образ (page-aligned блоб)
 │   │   ├── elf.rs           # ELF64-загрузчик: PT_LOAD, флаги R/W/X, BSS
 │   │   ├── syscall.rs       # MSR + asm-трамплин syscall/sysret + диспетчер
-│   │   └── user.rs          # spawn процесса из initrd, вход в ring 3
+│   │   ├── user.rs          # spawn процесса из initrd, RO-маппинг initrd, вход в ring 3
+│   │   └── vmx.rs           # гипервизор begin: VT-x probe, VMXON, capability MSRs
 │   ├── x86_64-paparaci.json # кастомный target (без red zone)
 │   └── .cargo/config.toml
 ├── userspace/               # окружение на C++20 (freestanding)
 │   ├── include/shizoley/    # syscall ABI, io, типы
 │   ├── src/                 # рантайм: syscall-обёртки, вывод, _start
-│   ├── programs/init/       # init: user-потоки + spawn + IPC ping-pong
-│   ├── programs/hello/      # hello: второй процесс, участник IPC-демо
+│   ├── programs/init/       # init: потоки, ping-pong, сервисы, event queue
+│   ├── programs/hello/      # hello: 100 событий через event queue
+│   ├── programs/fsd/        # файловый сервис: ustar из RO-маппинга initrd
+│   ├── programs/rtcd/       # драйвер часов: CMOS-порты из ring 3 (IOPL=3)
+│   ├── rootfs/motd          # данные для fsd
 │   └── link.ld              # фиксация образа на 0x400000
 ├── .github/workflows/       # CI: сборка + линт
 └── assets/                  # маскот
@@ -125,9 +134,10 @@ qemu-system-x86_64 -drive format=raw,file=target/x86_64-paparaci/debug/bootimage
 Ядро бутится, поднимает heap и MSR, затем планировщик: `main` становится задачей 0, рядом стартует kernel-поток `heartbeat` (доказывает, что вытеснение живёт, пока init блокирован в IPC). Параллельно build.rs кладёт все `programs/*` в ustar-initrd, вшитый в ядро; `spawn_process("init")` находит образ, `elf.rs` раскладывает его в **свежее адресное пространство** (свой CR3) и ставит процесс в очередь. Дальше init в ring 3:
 
 - создаёт **два user-потока** (`thread_create`) — оба работают в одном адресном пространстве, печатают тики и завершаются;
-- делает `spawn("hello")` — ядро грузит второй ELF из initrd в отдельный процесс (pid 2);
-- шлёт `ping` через `ipc_send`, `hello` ловит его блокирующим `ipc_recv`, отвечает `pong` — полный ping-pong между двумя процессами с разными CR3;
-- `exit` всех потоков процесса завершает процесс, жнец печатает коды выходов.
+- делает `spawn("hello")` — ядро грузит второй ELF из initrd в отдельный процесс (pid 2) и гоняет с ним ping-pong через mailbox IPC;
+- поднимает **сервисы в ring 3**: `fsd` (отдаёт файл `motd` из RO-маппинга initrd по mailbox) и `rtcd` (читает CMOS-часы портами 0x70/0x71 — IOPL=3);
+- регистрирует **event queue** (`eq_setup`), hello постит 100 событий через `eq_post` — init вычитывает их обычными load'ами из памяти (без syscall на элемент), между пачками спя в ядре на doorbell (`eq_wait`);
+- `exit` последнего потока завершает процесс, жнец печатает коды выходов.
 
 Page fault из ring 3 убивает только провинившуюся задачу — ядро продолжает жить. Клавиатура по-прежнему жива — нажатия печатаются на экран из обработчика прерывания.
 
@@ -143,6 +153,12 @@ Page fault из ring 3 убивает только провинившуюся з
 | 5  | `ipc_recv`      | `rdi`: src (0 = любой), `rsi`: buf, `rdx`: max | блокируется до сообщения, -> sender pid |
 | 6  | `getpid`        | —                                      | pid текущего процесса                      |
 | 7  | `gettid`        | —                                      | tid текущего потока                        |
+| 8  | `eq_setup`      | `rdi`: база, `rsi`: размер             | зарегистрировать event queue, -> qid       |
+| 9  | `eq_post`       | `rdi`: qid, `rsi`: opcode, `rdx`: buf, `r10`: len | элемент в очередь + doorbell      |
+| 10 | `eq_wait`       | `rdi`: qid                             | спать до doorbell, -> 1                    |
+| 11 | `eq_kick`       | `rdi`: qid                             | отдать chunk-кредит припаркованным постерам |
+| 12 | `initrd_size`   | —                                      | размер initrd (RO-маппинг на 0x20000000)   |
+| 13 | `write`         | `rdi`: buf, `rsi`: len                 | атомарная строка в консоль (vga+serial)    |
 
 Конвенция: номер в `rax`, аргументы в `rdi`, `rsi`, `rdx`, результат в `rax`.
 
@@ -168,9 +184,9 @@ Page fault из ring 3 убивает только провинившуюся з
 
 ## Дорожная карта
 
-1. Асинхронная очередь ядро->процесс в общей памяти (по мотивам HelQueue из managarm) как «второй помощник» простому mailbox IPC.
-2. Драйверы и ФС в user space — как и положено микроядру; initrd уже даёт базу для spawn'а сервисов.
-3. Дальше — по обстоятельствам: подсматриваем у managarm (C++, LAN/потоковый IPC, universe-хэндлы) и Veda (Rust, capability-каналы, свой VT-x гипервизор с EPT+IOMMU для драйвер-Linux VM).
+1. Гипервизор: VMCS + vcpu + EPT, syscalls GUEST_CREATE/VCPU_RUN (Veda-style driver VM).
+2. Клавиатурный/консольный драйверы в user space на event queue; права на qid как capability (вместо сырых номеров).
+3. Подсматриваем дальше: managarm (universe-хэндлы, UAR/STAC-копии) и Veda (would_cycle-детект capability-каналов, IOMMU для гостевых устройств).
 
 ## Лицензия
 
@@ -242,8 +258,12 @@ The kernel is named after paparazzi for a reason: Paparaci watches everything ha
 - [x] Processes: Process (pid, name, mailbox) + user threads sharing one address space
 - [x] initrd: ustar archive built by build.rs from programs/*, spawn by name
 - [x] Mailbox IPC: ipc_send/ipc_recv with blocking receiver and direct handoff
-- [ ] Drivers, file system
-- [ ] Async kernel->process queue (inspired by managarm's HelQueue)
+- [x] Event queue: managarm-style kernel->process queue in user memory (doorbell, chunk credits, eq_wait/eq_kick)
+- [x] Ring 3 services: fsd (initrd files over mailbox) and rtcd (CMOS clock via ports 0x70/0x71, IOPL=3)
+- [x] initrd shared read-only into every process (0x20000000), parsed in user space
+- [x] Hypervisor begin: VT-x probe, CR4.VMXE, VMXON, capability MSRs (vmx.rs)
+- [ ] Drivers: keyboard/console in user space over the event queue
+- [ ] Hypervisor: VMCS, vcpu, guest the Veda way (GUEST_CREATE/VCPU_RUN)
 
 ### Build & run
 
@@ -263,8 +283,9 @@ cd kernel && cargo run   # boot in QEMU
 The kernel boots, sets up the heap and MSRs, then hands control to the scheduler: `main` becomes task 0, and a kernel thread `heartbeat` starts next to it (proving preemption keeps running while init blocks in IPC). Meanwhile build.rs packs every `programs/*` into a ustar initrd embedded into the kernel; `spawn_process("init")` looks the image up, `elf.rs` lays it out into a **fresh address space** (its own CR3) and queues the process. Then init runs in ring 3:
 
 - creates **two user threads** (`thread_create`) — both share the process address space, print ticks and finish;
-- calls `spawn("hello")` — the kernel loads the second ELF from the initrd into a separate process (pid 2);
-- sends `ping` via `ipc_send`; `hello` catches it with a blocking `ipc_recv` and replies `pong` — a full ping-pong between two processes with different CR3s;
+- calls `spawn("hello")` — the kernel loads the second ELF from the initrd into a separate process (pid 2) and runs a mailbox ping-pong with it;
+- brings up **ring 3 services**: `fsd` (serves the `motd` file from the read-only initrd mapping over the mailbox) and `rtcd` (reads the CMOS clock through ports 0x70/0x71 — IOPL=3);
+- registers an **event queue** (`eq_setup`); hello posts 100 events via `eq_post` — init consumes them with plain loads (no syscall per element), sleeping on the doorbell (`eq_wait`) between batches;
 - when the last thread of a process exits, the process is done and the reaper prints the exit codes.
 
 A page fault from ring 3 kills only the offending task — the kernel lives on. The keyboard still works — keypresses are echoed from the interrupt handler.
@@ -281,6 +302,12 @@ A page fault from ring 3 kills only the offending task — the kernel lives on. 
 | 5  | `ipc_recv`      | `rdi`: src (0 = any), `rsi`: buf, `rdx`: max | blocks until a message, -> sender pid             |
 | 6  | `getpid`        | —                                           | pid of the current process                         |
 | 7  | `gettid`        | —                                           | tid of the current thread                          |
+| 8  | `eq_setup`      | `rdi`: base, `rsi`: size                    | register an event queue, -> qid                    |
+| 9  | `eq_post`       | `rdi`: qid, `rsi`: opcode, `rdx`: buf, `r10`: len | element into the queue + doorbell             |
+| 10 | `eq_wait`       | `rdi`: qid                                  | sleep until the doorbell, -> 1                     |
+| 11 | `eq_kick`       | `rdi`: qid                                  | hand chunk credit to parked posters                |
+| 12 | `initrd_size`   | —                                           | initrd size (RO-mapped at 0x20000000)              |
+| 13 | `write`         | `rdi`: buf, `rsi`: len                      | atomic console line (vga+serial)                   |
 
 Convention: number in `rax`, args in `rdi`, `rsi`, `rdx`, result in `rax`.
 
@@ -306,10 +333,24 @@ Apache-2.0 — see [LICENSE](LICENSE).
 - **Process** — pid, name, an `AddressSpace` (Mutex for page-table mutations), a mailbox, the list of parked recv-threads and a live-thread counter; CR3 is stored separately and never changes, so the switch path reads it lock-free; a process lives while any of its threads holds an Arc;
 - **user threads of one process** — `thread_create` creates a Task sharing the process address space and mailbox; the thread stack is ordinary user memory (init hands out static .bss buffers), the argument arrives in `rdi`;
 - **mailbox IPC** — `ipc_send` copies the payload out of the sender's address space and either hands it straight to the first matching parked receiver (waking it with `sender pid` as the recv result) or drops it into the target mailbox (cap 32 messages, payload up to 4 KiB); copies go through the physmap via translate, no CR3 switch needed;
-- **initrd** — build.rs compiles every `programs/<name>/main.cpp` against the `shz` runtime into a static ELF and packs them into a ustar archive with a correct checksum; the kernel embeds the archive and serves images by name on `spawn`.
+- **initrd** — build.rs compiles every `programs/<name>/main.cpp` against the `shz` runtime into a static ELF and packs them into a ustar archive with a correct checksum; the kernel embeds the archive (page-aligned) and serves images by name on `spawn`.
+
+## Event queue (managarm's HelQueue, adapted)
+
+The queue lives in **user memory**: a ring of chunks with the kernel as producer and the process as consumer. Elements (opcode, sender, payload) are written straight into the chunks through the physmap; the consumer reads them with **plain loads, no syscall per element**, entering the kernel only to sleep on the doorbell (`eq_wait`) or to hand back chunk credit (`eq_kick` after `cons_seq++`). A producer that runs a full lap ahead of the consumer parks until the kick — backpressure without spinning. The data path between doorbells costs zero syscalls, exactly how HelQueue carries async syscall completions in managarm.
+
+## Services in ring 3
+
+- **fsd** — the file service: the kernel shares the initrd read-only into every process address space (0x20000000, page-aligned blob, the same physical frames), fsd parses ustar right in ring 3 and serves file contents to clients over the mailbox;
+- **rtcd** — a hardware driver: owns the CMOS ports 0x70/0x71 (ring 3 entered with IOPL=3), waits out the update-in-progress flag, decodes BCD and answers with a time string. A real user-space driver: the kernel knows nothing about the RTC;
+- next: keyboard/console drivers as processes fed by the kernel through the event queue.
+
+## Hypervisor begin (Veda-style)
+
+`vmx.rs` lays the foundation: a CPUID check for VT-x, setting `CR4.VMXE`, preparing an aligned VMXON region (revision from IA32_VMX_BASIC), entering VMX root operation via `vmxon` and reading the capability MSRs (pin/procbased/secondary, EPT). Under QEMU TCG VT-x is not exposed — the banner honestly prints "not supported by cpu"; with KVM or on real hardware the kernel enters VMX root and reports the revision. Next, the Veda way: VMCS, vcpu objects, EPT and `GUEST_CREATE`/`VCPU_RUN`-style syscalls — to run a Linux driver VM like Veda does.
 
 ### Roadmap
 
-1. An async kernel->process queue in shared memory (inspired by managarm's HelQueue) as the "second helper" next to the simple mailbox IPC.
-2. Drivers and FS in user space — the way a microkernel should; the initrd already gives a base for spawning services.
-3. Peek further at managarm (C++, lane/stream IPC, universe handles) and Veda (Rust, capability channels, an own VT-x hypervisor with EPT+IOMMU for a driver-Linux VM).
+1. Hypervisor: VMCS + vcpu + EPT, GUEST_CREATE/VCPU_RUN syscalls (Veda-style driver VM).
+2. Keyboard/console drivers in user space on the event queue; qid rights as a capability instead of raw numbers.
+3. Keep peeking: managarm (universe handles, UAR/STAC copies) and Veda (would_cycle detection for capability channels, IOMMU for guest devices).

@@ -1,0 +1,2 @@
+shizoley rootfs: hello from fsd in ring 3
+this file was served by a user-space process over mailbox ipc

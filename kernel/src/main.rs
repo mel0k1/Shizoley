@@ -6,6 +6,7 @@ extern crate alloc;
 
 mod allocator;
 mod elf;
+mod eq;
 mod gdt;
 mod initrd;
 mod interrupts;
@@ -17,6 +18,7 @@ mod syscall;
 mod task;
 mod user;
 mod vga;
+mod vmx;
 
 use bootloader::{entry_point, BootInfo};
 
@@ -31,8 +33,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     allocator::init(&mut mapper).expect("heap init failed");
     serial_println!("[paparaci] heap up");
 
-    println!("shizoley / paparaci v0.5.0 (ipc, initrd, user threads)");
+    println!("shizoley / paparaci v0.6.0 (event queues, user services, vmx begin)");
 
+    vmx::init();
     syscall::init();
 
     sched::init_current(task::Task::boot_current("main", sched::kernel_process()));

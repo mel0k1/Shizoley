@@ -88,6 +88,17 @@ pub fn push_ready(task: Arc<Task>) {
     SCHED.lock().ready.push_back(task);
 }
 
+// resume a parked task (ipc/eq waiters) with ret as its blocked-syscall result
+pub fn wake_parked(task: &Arc<Task>, ret: u64) {
+    {
+        let t = task.inner();
+        t.wake_ret = ret;
+        t.blocked = None;
+        t.state = TaskState::Ready;
+    }
+    SCHED.lock().ready.push_back(task.clone());
+}
+
 // prev must stay alive across the switch: its context is written by the asm
 fn switch_to(next: Arc<Task>) {
     let prev = CURRENT
@@ -109,7 +120,7 @@ fn switch_to(next: Arc<Task>) {
 // switch away while current stays parked (Blocked); the waker will push it
 // back and enter_task restores its syscall frame state on the way in
 // returns false when there is nobody else to run
-fn switch_away_parked() -> bool {
+pub(crate) fn switch_away_parked() -> bool {
     let next = SCHED.lock().ready.pop_front();
     let Some(next) = next else {
         return false;

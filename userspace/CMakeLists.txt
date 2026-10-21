@@ -18,7 +18,7 @@ add_compile_options(
     -Werror
 )
 
-add_library(shz STATIC src/syscall.cpp src/io.cpp)
+add_library(shz STATIC src/syscall.cpp src/io.cpp src/eq.cpp)
 target_include_directories(shz PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_executable(init programs/init/main.cpp src/start.cpp)
@@ -28,3 +28,11 @@ target_link_options(init PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -
 add_executable(hello programs/hello/main.cpp src/start.cpp)
 target_link_libraries(hello PRIVATE shz)
 target_link_options(hello PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)
+
+add_executable(fsd programs/fsd/main.cpp src/start.cpp)
+target_link_libraries(fsd PRIVATE shz)
+target_link_options(fsd PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)
+
+add_executable(rtcd programs/rtcd/main.cpp src/start.cpp)
+target_link_libraries(rtcd PRIVATE shz)
+target_link_options(rtcd PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)

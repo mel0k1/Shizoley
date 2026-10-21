@@ -10,6 +10,10 @@ use crate::{elf, gdt, initrd, ipc, memory, sched, task};
 pub const USER_STACK_BASE: u64 = 0x0050_0000;
 pub const USER_STACK_TOP: u64 = 0x0060_0000;
 
+// every process sees the initrd read-only here: services (fsd) walk it from
+// ring 3; the frames are shared with the kernel image, no copies
+const INITRD_PAGES: u64 = (initrd::INITRD_SIZE as u64).div_ceil(0x1000);
+
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
 fn map_zeroed_range(aspace: &mut task::AddressSpace, base: u64, top: u64, what: &str) {
@@ -29,6 +33,34 @@ fn map_zeroed_range(aspace: &mut task::AddressSpace, base: u64, top: u64, what: 
     }
 }
 
+// share the kernel's initrd frames read-only into a fresh address space
+fn map_initrd(aspace: &mut task::AddressSpace) {
+    use x86_64::structures::paging::{Mapper, OffsetPageTable};
+
+    let flags =
+        PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
+    // the blob lives in the kernel image: resolve its physical frames via
+    // the boot page tables and map the same frames for the user
+    let root = *memory::KERNEL_PML4.get().expect("kernel pml4");
+    let kmapper = unsafe {
+        OffsetPageTable::new(
+            &mut *(memory::phys_to_virt(root.start_address()).as_mut_ptr()),
+            memory::phys_offset(),
+        )
+    };
+    let blob = initrd::initrd_vaddr();
+    for i in 0..INITRD_PAGES {
+        let kpage = Page::containing_address(VirtAddr::new(blob + i * 0x1000));
+        let frame = kmapper
+            .translate_page(kpage)
+            .expect("initrd: kernel page unmapped");
+        let upage = Page::containing_address(VirtAddr::new(initrd::INITRD_BASE + i * 0x1000));
+        aspace
+            .map_user_page(upage, frame, flags)
+            .expect("initrd map failed");
+    }
+}
+
 // loads `name` from the initrd into a fresh process and queues its main
 // thread; each process gets its own CR3 and the standard user stack region
 pub fn spawn_process(name: &str) -> Option<u64> {
@@ -36,6 +68,7 @@ pub fn spawn_process(name: &str) -> Option<u64> {
     let mut aspace = task::AddressSpace::new_user().ok()?;
     let entry = elf::load(image, &mut aspace).ok()?;
     map_zeroed_range(&mut aspace, USER_STACK_BASE, USER_STACK_TOP, "user stack");
+    map_initrd(&mut aspace);
 
     let pid = NEXT_PID.fetch_add(1, Ordering::AcqRel);
     let proc = Arc::new(task::Process::new(pid, name, aspace));
@@ -78,7 +111,7 @@ pub unsafe fn enter_ring3(entry: VirtAddr, stack_top: VirtAddr, arg: u64) -> ! {
         d = in(reg) data,
         c = in(reg) code,
         sp = in(reg) stack_top.as_u64(),
-        fl = in(reg) 0x202u64,
+        fl = in(reg) 0x3202u64,
         ip = in(reg) entry.as_u64(),
         in("rdi") arg,
         options(noreturn)

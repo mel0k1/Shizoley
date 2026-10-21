@@ -13,4 +13,7 @@ using i64 = long long;
 using usize = u64;
 using isize = i64;
 
+// the kernel maps the whole initrd read-only here in every process
+constexpr u64 INITRD_BASE = 0x20000000ull;
+
 }

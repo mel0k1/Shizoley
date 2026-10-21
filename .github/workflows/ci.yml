@@ -48,8 +48,13 @@ jobs:
           grep -qF "[init] threads: 3 4" serial.log
           grep -qF "[t2] tick 2" serial.log
           grep -qF "[init] pong from 2" serial.log
-          grep -qF "process 'hello' (2) finished" serial.log
+          grep -qF "[fsd] served 'motd' (104 bytes) to 1" serial.log
+          grep -qE "\[init\] rtc says: [0-9][0-9]:[0-9][0-9]:[0-9][0-9]" serial.log
+          grep -qF "[eq] first event: 'e0' op 1 from 2" serial.log
+          grep -qF "[eq] 100 events in" serial.log
+          grep -qF "[init] drained 100 events, bye" serial.log
           grep -qF "process 'init' (1) finished" serial.log
+          grep -qF "[vmx]" serial.log
 
   userspace:
     name: userspace (c++)
