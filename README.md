@@ -137,6 +137,8 @@ cd kernel && cargo run
 qemu-system-x86_64 -drive format=raw,file=target/x86_64-paparaci/debug/bootimage-paparaci.bin -serial stdio
 ```
 
+Полный круг гипервизора проверяется только под KVM: `make run-kvm` (это `-enable-kvm -cpu host` — VMX/EPT пробрасываются в Paparaci, гость L2 печатает «VEDA VMX OK» в serial). Под чистым TCG ядро честно рапортует `vmx unavailable` — этот graceful-путь и проверяет CI. Подробное сравнение нашей реализации с managarm/Veda: `docs/managarm-veda-vs-paparaci.md`.
+
 Ядро бутится, поднимает heap и MSR, затем планировщик: `main` становится задачей 0, рядом стартует kernel-поток `heartbeat` (доказывает, что вытеснение живёт, пока init блокирован в IPC). Параллельно build.rs кладёт все `programs/*` в ustar-initrd, вшитый в ядро; `spawn_process("init")` находит образ, `elf.rs` раскладывает его в **свежее адресное пространство** (свой CR3) и ставит процесс в очередь. Дальше init в ring 3:
 
 - создаёт **два user-потока** (`thread_create`) — оба работают в одном адресном пространстве, печатают тики и завершаются;
@@ -299,6 +301,8 @@ cmake --build userspace/build
 
 cd kernel && cargo run   # boot in QEMU
 ```
+
+The full hypervisor round trip only works under KVM: `make run-kvm` (that is `-enable-kvm -cpu host` — VMX/EPT are passed through to Paparaci, the L2 guest prints "VEDA VMX OK" on serial). Under plain TCG the kernel honestly reports `vmx unavailable` — that graceful path is what CI checks. A detailed comparison of our implementation against managarm/Veda: `docs/managarm-veda-vs-paparaci.md`.
 
 The kernel boots, sets up the heap and MSRs, then hands control to the scheduler: `main` becomes task 0, and a kernel thread `heartbeat` starts next to it (proving preemption keeps running while init blocks in IPC). Meanwhile build.rs packs every `programs/*` into a ustar initrd embedded into the kernel; `spawn_process("init")` looks the image up, `elf.rs` lays it out into a **fresh address space** (its own CR3) and queues the process. Then init runs in ring 3:
 
