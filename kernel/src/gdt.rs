@@ -13,6 +13,8 @@ pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
 pub const USER_DATA: u16 = 0x18;
 pub const USER_CODE: u16 = 0x20;
+// tss is the sixth entry (after null)
+pub const TSS_SEL: u16 = 0x28;
 
 // static mut: these must land in .bss (writable) — const statics go to rodata
 #[repr(align(16))]
@@ -54,4 +56,9 @@ pub fn set_rsp0(top: VirtAddr) {
         let tss = core::ptr::addr_of!(*TSS) as *mut TaskStateSegment;
         (*tss).privilege_stack_table[0] = top;
     }
+}
+
+// linear address of the live TSS (vmx host state needs it)
+pub fn tss_base() -> u64 {
+    core::ptr::addr_of!(*TSS) as u64
 }

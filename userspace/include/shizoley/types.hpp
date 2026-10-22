@@ -16,4 +16,7 @@ using isize = i64;
 // the kernel maps the whole initrd read-only here in every process
 constexpr u64 INITRD_BASE = 0x20000000ull;
 
+// guest ram window installed by GUEST_CREATE (pages*4KiB starting here)
+constexpr u64 GUEST_WINDOW = 0x30000000ull;
+
 }

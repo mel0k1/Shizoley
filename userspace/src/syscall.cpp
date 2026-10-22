@@ -32,4 +32,21 @@ long gettid() {
     return syscall(Sys::gettid);
 }
 
+long kill(u64 pid) {
+    return syscall(Sys::kill, pid);
+}
+
+long guest_create(u64 pages) {
+    return syscall(Sys::guest_create, pages);
+}
+
+long vcpu_run(long handle, u64* out) {
+    return syscall(Sys::vcpu_run, static_cast<u64>(handle),
+                   reinterpret_cast<u64>(out));
+}
+
+long guest_destroy(long handle) {
+    return syscall(Sys::guest_destroy, static_cast<u64>(handle));
+}
+
 }

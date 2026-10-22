@@ -19,6 +19,13 @@ enum class Sys : u64 {
     eq_kick = 11,      // (qid) -> 0 | -1; release chunk credit
     initrd_size = 12,  // () -> bytes (initrd mapped ro at INITRD_BASE)
     write = 13,        // (buf, len) -> len; atomic console line
+    kill = 14,         // (pid) -> 0 | -1; end every thread of the process
+    guest_create = 15, // (pages) -> handle; vmcs + ept + ram window
+    vcpu_run = 16,     // (handle, out u64[20]) -> exit reason
+    guest_destroy = 17,// (handle) -> 0 | -1; frees ram, ept, vmcs
+    eq_listen = 18,    // (qid) -> 0 | -1; register kernel event sink
+    eq_grant = 19,     // (qid, pid, rights) -> 0 | -1
+    eq_revoke = 20,    // (qid, pid) -> 0 | -1
 };
 
 [[noreturn]] void exit(long code);
@@ -29,6 +36,10 @@ long send(u64 pid, const void* buf, u64 len);
 long recv(u64 src, void* buf, u64 max);
 long getpid();
 long gettid();
+long kill(u64 pid);
+long guest_create(u64 pages);
+long vcpu_run(long handle, u64* out /* 20 u64s */);
+long guest_destroy(long handle);
 
 inline long syscall(Sys nr) {
     u64 ret = static_cast<u64>(nr);

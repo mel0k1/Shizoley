@@ -184,6 +184,20 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
                 len as u64
             }
         }
+        // 14: kill(pid) -> 0 | -1; ends every thread of the process
+        14 => sched::kill_process(a1) as u64,
+        // 15: guest_create(pages) -> handle | -1; vmcs + ept + ram window
+        15 => crate::vmx::guest_create(cur.proc.id, a1) as u64,
+        // 16: vcpu_run(handle, out16x u64) -> exit reason | -1
+        16 => crate::vmx::vcpu_run(cur.proc.id, a1, a2) as u64,
+        // 17: guest_destroy(handle) -> 0 | -1; frees ram, ept, vmcs
+        17 => crate::vmx::guest_destroy(cur.proc.id, a1) as u64,
+        // 18: eq_listen(qid) -> 0 | -1; register kernel event sink (LISTEN)
+        18 => crate::eq::listen(a1) as u64,
+        // 19: eq_grant(qid, pid, rights) -> 0 | -1; owner hands out rights
+        19 => crate::eq::grant(a1, a2, a3 as u32) as u64,
+        // 20: eq_revoke(qid, pid) -> 0 | -1; owner takes rights back
+        20 => crate::eq::revoke(a1, a2) as u64,
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);

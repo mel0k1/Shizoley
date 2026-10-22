@@ -58,6 +58,18 @@ long eq_kick(long qid) {
     return syscall(Sys::eq_kick, static_cast<u64>(qid));
 }
 
+long eq_listen(long qid) {
+    return syscall(Sys::eq_listen, static_cast<u64>(qid));
+}
+
+long eq_grant(long qid, u64 pid, u32 rights) {
+    return syscall(Sys::eq_grant, static_cast<u64>(qid), pid, rights);
+}
+
+long eq_revoke(long qid, u64 pid) {
+    return syscall(Sys::eq_revoke, static_cast<u64>(qid), pid);
+}
+
 u32 eq_drive(long qid, void* base, void (*cb)(const EqEvent&)) {
     u8* b = static_cast<u8*>(base);
     volatile u8* h = b;

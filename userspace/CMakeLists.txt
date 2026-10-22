@@ -36,3 +36,10 @@ target_link_options(fsd PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -W
 add_executable(rtcd programs/rtcd/main.cpp src/start.cpp)
 target_link_libraries(rtcd PRIVATE shz)
 target_link_options(rtcd PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)
+
+add_executable(consoled programs/consoled/main.cpp src/start.cpp)
+target_link_libraries(consoled PRIVATE shz)
+target_link_options(consoled PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)
+add_executable(gdemo programs/gdemo/main.cpp src/start.cpp)
+target_link_libraries(gdemo PRIVATE shz)
+target_link_options(gdemo PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)

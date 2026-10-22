@@ -86,6 +86,14 @@ int main() {
     println("[init] spawned fsd (", static_cast<u64>(fsd), ") rtcd (",
             static_cast<u64>(rtcd), ")");
 
+    // keyboard/console live as a ring-3 process on its own event queue
+    long console = spawn("consoled", 8);
+    println("[init] spawned consoled (", static_cast<u64>(console), ")");
+
+    // the veda-approach smoke: a guest behind GUEST_CREATE/VCPU_RUN
+    long gd = spawn("gdemo", 5);
+    println("[init] spawned gdemo (", static_cast<u64>(gd), ")");
+
     // recv returns the sender pid; messages carry their own NUL
     request(fsd, "motd", 4, buf, sizeof(buf));
     buf[127] = '\0';
@@ -102,6 +110,8 @@ int main() {
     eqmem[8] = 4;                // nchunks
     long q = eq_setup(eqmem, sizeof(eqmem));
     println("[init] event queue ", static_cast<u64>(q));
+    // hello may post into our queue: hand it the POST capability
+    eq_grant(q, static_cast<u64>(hello), EQ_RIGHT_POST);
 
     char msg[32];
     u64 mn = 0;

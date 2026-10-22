@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod allocator;
+mod caps;
 mod elf;
 mod eq;
 mod gdt;
@@ -31,9 +32,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     let mut mapper = memory::init(boot_info);
     allocator::init(&mut mapper).expect("heap init failed");
-    serial_println!("[paparaci] heap up");
+    serial_println!(
+        "[paparaci] heap up, {} frames in use",
+        memory::frames_used()
+    );
 
-    println!("shizoley / paparaci v0.6.0 (event queues, user services, vmx begin)");
+    println!("shizoley / paparaci v0.7.0 (vmcs/ept, console process, qid caps)");
 
     vmx::init();
     syscall::init();
