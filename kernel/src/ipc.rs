@@ -26,6 +26,15 @@ pub fn register(proc: &Arc<Process>) {
     list.push(Arc::downgrade(proc));
 }
 
+// drop a dead process from the pid registry so sends to it fail cleanly
+pub fn unregister(pid: u64) {
+    let mut list = PROCESSES.lock();
+    list.retain(|w| match w.upgrade() {
+        Some(p) => p.id != pid,
+        None => false,
+    });
+}
+
 pub fn find(pid: u64) -> Option<Arc<Process>> {
     let mut list = PROCESSES.lock();
     list.retain(|w| w.upgrade().is_some());
@@ -38,8 +47,12 @@ pub fn find(pid: u64) -> Option<Arc<Process>> {
 // kernel-side send: copy the payload out of the sender, then either hand it
 // straight to a parked receiver or drop it into the target mailbox
 pub fn send(sender: &Arc<Task>, dest_pid: u64, buf: u64, len: u64) -> i64 {
+    // edge cases: empty/oversized payloads, kernel pid, self-send is allowed
     if len == 0 || len as usize > MAX_MSG {
         return -1;
+    }
+    if dest_pid == 0 {
+        return -1; // the kernel process does not take mailbox messages
     }
     let mut data = alloc::vec![0u8; len as usize];
     {
@@ -50,7 +63,7 @@ pub fn send(sender: &Arc<Task>, dest_pid: u64, buf: u64, len: u64) -> i64 {
     }
     let from = sender.proc.id;
     let Some(dest) = find(dest_pid) else {
-        return -1;
+        return -1; // unknown or dead pid
     };
 
     interrupts::without_interrupts(|| {
@@ -94,17 +107,31 @@ pub fn send(sender: &Arc<Task>, dest_pid: u64, buf: u64, len: u64) -> i64 {
     })
 }
 
+// result of a non-blocking receive attempt
+pub enum Recv {
+    // no matching message: the caller may park
+    Empty,
+    // message copied out, value = sender pid
+    Delivered(u64),
+    // a matching message exists but cannot be delivered (buffer too small
+    // or not writable): the caller must fail its syscall, not park forever
+    Bad,
+}
+
 // non-blocking half of recv; called with interrupts off from recv_or_block
-pub fn try_recv(receiver: &Arc<Task>, src: u64, buf: u64, max: u64) -> Option<u64> {
+pub fn try_recv(receiver: &Arc<Task>, src: u64, buf: u64, max: u64) -> Recv {
     let proc = &receiver.proc;
     let mut mb = proc.mailbox.lock();
-    let idx = mb
+    let Some(idx) = mb
         .iter()
-        .position(|m| (src == 0 || m.from == src) && m.data.len() <= max as usize)?;
-    let msg = mb.remove(idx)?;
+        .position(|m| (src == 0 || m.from == src) && m.data.len() <= max as usize)
+    else {
+        return Recv::Empty;
+    };
+    let msg = mb.remove(idx).expect("position vanished");
     if !proc.aspace.lock().write_bytes(buf, &msg.data) {
         mb.push_front(msg);
-        return None;
+        return Recv::Bad;
     }
-    Some(msg.from)
+    Recv::Delivered(msg.from)
 }

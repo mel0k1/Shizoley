@@ -16,29 +16,39 @@ const INITRD_PAGES: u64 = (initrd::INITRD_SIZE as u64).div_ceil(0x1000);
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
-fn map_zeroed_range(aspace: &mut task::AddressSpace, base: u64, top: u64, what: &str) {
+fn map_zeroed_range(
+    aspace: &mut task::AddressSpace,
+    base: u64,
+    top: u64,
+    what: &str,
+) -> Result<(), &'static str> {
     let flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
     let first = Page::containing_address(VirtAddr::new(base));
     let last = Page::containing_address(VirtAddr::new(top - 1));
     for page in Page::range_inclusive(first, last) {
-        let frame = memory::alloc_frame().unwrap_or_else(|| panic!("{}: no frames", what));
+        let frame = memory::alloc_frame().ok_or("no frames")?;
         let fresh = aspace
             .map_user_page(page, frame, flags)
-            .expect("map failed");
+            .map_err(|_| "map")?;
         if fresh {
             let dst = memory::phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
             unsafe { core::ptr::write_bytes(dst, 0, 4096) };
         }
     }
+    let _ = what;
+    Ok(())
 }
 
 // share the kernel's initrd frames read-only into a fresh address space
 fn map_initrd(aspace: &mut task::AddressSpace) {
     use x86_64::structures::paging::{Mapper, OffsetPageTable};
 
-    let flags =
-        PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
+    // BIT_9 marks kernel-owned frames: teardown must not free them
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::BIT_9;
     // the blob lives in the kernel image: resolve its physical frames via
     // the boot page tables and map the same frames for the user
     let root = *memory::KERNEL_PML4.get().expect("kernel pml4");
@@ -62,12 +72,39 @@ fn map_initrd(aspace: &mut task::AddressSpace) {
 }
 
 // loads `name` from the initrd into a fresh process and queues its main
-// thread; each process gets its own CR3 and the standard user stack region
+// thread; each process gets its own CR3 and the standard user stack region.
+// every failure path tears the half-built address space down so no frames
+// leak into the void
 pub fn spawn_process(name: &str) -> Option<u64> {
     let image = initrd::lookup(name)?;
     let mut aspace = task::AddressSpace::new_user().ok()?;
-    let entry = elf::load(image, &mut aspace).ok()?;
-    map_zeroed_range(&mut aspace, USER_STACK_BASE, USER_STACK_TOP, "user stack");
+    let loaded = match elf::load(image, &mut aspace) {
+        Ok(l) => l,
+        Err(e) => {
+            serial_println!("[spawn] elf '{}' rejected: {}", name, e);
+            aspace.teardown();
+            return None;
+        }
+    };
+    // the image must not claim our own regions: stack window and initrd
+    let stack_range = (USER_STACK_BASE, USER_STACK_TOP);
+    let initrd_range = (
+        initrd::INITRD_BASE,
+        initrd::INITRD_BASE + initrd::INITRD_SIZE as u64,
+    );
+    for (s, e) in &loaded.ranges {
+        for (rs, re) in [stack_range, initrd_range] {
+            if *s < re && rs < *e {
+                serial_println!("[spawn] elf '{}' overlaps reserved region", name);
+                aspace.teardown();
+                return None;
+            }
+        }
+    }
+    if map_zeroed_range(&mut aspace, USER_STACK_BASE, USER_STACK_TOP, "user stack").is_err() {
+        aspace.teardown();
+        return None;
+    }
     map_initrd(&mut aspace);
 
     let pid = NEXT_PID.fetch_add(1, Ordering::AcqRel);
@@ -76,7 +113,7 @@ pub fn spawn_process(name: &str) -> Option<u64> {
     let tid = sched::spawn_user(
         "main",
         proc,
-        entry,
+        loaded.entry,
         // 8 mod 16: _start behaves like a normal call frame
         VirtAddr::new(USER_STACK_TOP - 8),
         0,
@@ -85,7 +122,7 @@ pub fn spawn_process(name: &str) -> Option<u64> {
         "[paparaci] spawned '{}' from initrd: {} bytes, entry {:#x}, pid {} tid {}",
         name,
         image.len(),
-        entry,
+        loaded.entry,
         pid,
         tid
     );

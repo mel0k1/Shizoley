@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 use x86_64::VirtAddr;
@@ -40,7 +41,9 @@ pub fn init_current(task: Task) {
 }
 
 pub fn current() -> Option<Arc<Task>> {
-    CURRENT.lock().clone()
+    // irq-off: the timer handler locks CURRENT from on_tick; a syscall
+    // context holding it with interrupts on would deadlock the handler
+    interrupts::without_interrupts(|| CURRENT.lock().clone())
 }
 
 fn alloc_id() -> u64 {
@@ -121,7 +124,7 @@ fn switch_to(next: Arc<Task>) {
 // back and enter_task restores its syscall frame state on the way in
 // returns false when there is nobody else to run
 pub(crate) fn switch_away_parked() -> bool {
-    let next = SCHED.lock().ready.pop_front();
+    let next = pop_ready();
     let Some(next) = next else {
         return false;
     };
@@ -143,12 +146,11 @@ pub fn on_tick() {
         Some(c) => c,
         None => return,
     };
-    let next = {
+    {
         let mut s = SCHED.lock();
         s.ready.push_back(cur.clone());
-        s.ready.pop_front()
-    };
-    if let Some(next) = next {
+    }
+    if let Some(next) = pop_ready() {
         if !Arc::ptr_eq(&next, &cur) {
             switch_to(next);
         }
@@ -166,8 +168,12 @@ pub fn yield_now() {
 pub fn recv_or_block(src: u64, buf: u64, max: u64) -> u64 {
     interrupts::without_interrupts(|| {
         let cur = current().expect("recv without current");
-        if let Some(from) = crate::ipc::try_recv(&cur, src, buf, max) {
-            return from;
+        match crate::ipc::try_recv(&cur, src, buf, max) {
+            crate::ipc::Recv::Delivered(from) => return from,
+            // a matching message exists but cannot be delivered into the
+            // given buffer: report the error instead of parking on it forever
+            crate::ipc::Recv::Bad => return (-1i64) as u64,
+            crate::ipc::Recv::Empty => {}
         }
         {
             let t = cur.inner();
@@ -199,7 +205,7 @@ pub fn exit_current(code: i64) -> ! {
     }
     // never keep an exited task in the ipc park list
     cur.proc.waiters.lock().retain(|t| !Arc::ptr_eq(t, &cur));
-    if cur.proc.id != 0 {
+    if cur.proc.id != 0 && cur.proc.alive.load(Ordering::Acquire) > 0 {
         let was = cur
             .proc
             .alive
@@ -214,7 +220,7 @@ pub fn exit_current(code: i64) -> ! {
     }
     REAPED.lock().push(cur);
     // guard must be dropped before the switch: this task never returns
-    let next = SCHED.lock().ready.pop_front();
+    let next = pop_ready();
     if let Some(next) = next {
         // no prev to save: the exiting task already left CURRENT
         *CURRENT.lock() = Some(next.clone());
@@ -239,6 +245,84 @@ pub fn reap() {
             task.id,
             task.inner().exit_code
         );
-        // drops the kernel stack; user frames stay leaked until frame dealloc
+        // drops the kernel stack; the process half is freed right here
+        maybe_destroy_process(&task.proc);
     }
+}
+
+// last thread of a user process is gone: release everything it owned —
+// address space frames, page tables, ipc registration, event queues, caps
+fn maybe_destroy_process(proc: &Arc<Process>) {
+    if proc.id == 0 || proc.alive.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    if proc.torn_down.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::ipc::unregister(proc.id);
+    crate::eq::close_process(proc.id);
+    crate::caps::drop_process(proc.id);
+    let freed = proc.aspace.lock().teardown();
+    serial_println!(
+        "[sched] process '{}' ({}) torn down, {} frames freed",
+        proc.name,
+        proc.id,
+        freed
+    );
+}
+
+// pop the next runnable task, silently reaping Finished ones (kill can mark
+// tasks that still sit in the ready queue)
+fn pop_ready() -> Option<Arc<Task>> {
+    loop {
+        let task = SCHED.lock().ready.pop_front()?;
+        if task.inner().state == TaskState::Finished {
+            REAPED.lock().push(task);
+            continue;
+        }
+        return Some(task);
+    }
+}
+
+// kill(14): mark every thread of the target process Finished, detach it from
+// every park list and let the reaper free the process. killing the caller's
+// own process is allowed and behaves like exiting the whole group.
+pub fn kill_process(target: u64) -> i64 {
+    if target == 0 {
+        return -1; // the kernel process is immortal
+    }
+    interrupts::without_interrupts(|| {
+        let cur = current();
+        let is_self = cur.as_ref().is_some_and(|t| t.proc.id == target);
+        let mut killed = Vec::new();
+        // members sitting in the ready queue
+        {
+            let mut s = SCHED.lock();
+            let (mine, rest): (Vec<_>, Vec<_>) =
+                s.ready.drain(..).partition(|t| t.proc.id == target);
+            s.ready.extend(rest);
+            killed.extend(mine);
+        }
+        // parked in event-queue wait/producer lists
+        killed.extend(crate::eq::detach_process(target));
+        // parked in the target's own recv waiters
+        if let Some(proc) = crate::ipc::find(target) {
+            killed.extend(proc.waiters.lock().drain(..));
+        }
+        for task in &killed {
+            let t = task.inner();
+            t.state = TaskState::Finished;
+            t.blocked = None;
+        }
+        if let Some(proc) = crate::ipc::find(target) {
+            proc.alive.store(0, Ordering::Release);
+        }
+        REAPED.lock().extend(killed);
+        if is_self {
+            // the caller is part of the group: exit via the normal path;
+            // exit_current will not double-count alive since it is already 0
+            exit_current(-3);
+        }
+        0
+    })
 }

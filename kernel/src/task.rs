@@ -5,9 +5,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, AtomicUsize};
 use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::mapper::UnmapError;
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{
     Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
@@ -128,15 +129,59 @@ impl AddressSpace {
 
     // byte-wise access into this address space via the physmap; works no
     // matter which CR3 is active, used for ipc copies between processes
+    // resolve the 4 KiB leaf behind a virtual address through THIS space's
+    // tables (via the physmap, so any CR3 works); huge pages are rejected:
+    // user mappings are always built from 4 KiB frames
+    fn walk_leaf(&mut self, addr: VirtAddr) -> Option<(PhysFrame<Size4KiB>, PageTableFlags)> {
+        let p4: &PageTable =
+            unsafe { &*(memory::phys_to_virt(self.pml4.start_address()).as_ptr()) };
+        let e4 = &p4[addr.p4_index()];
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let p3: &PageTable = unsafe { &*(memory::phys_to_virt(e4.addr()).as_ptr()) };
+        let e3 = &p3[addr.p3_index()];
+        if !e3.flags().contains(PageTableFlags::PRESENT)
+            || e3.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let p2: &PageTable = unsafe { &*(memory::phys_to_virt(e3.addr()).as_ptr()) };
+        let e2 = &p2[addr.p2_index()];
+        if !e2.flags().contains(PageTableFlags::PRESENT)
+            || e2.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let p1: &PageTable = unsafe { &*(memory::phys_to_virt(e2.addr()).as_ptr()) };
+        let e1 = &p1[addr.p1_index()];
+        if !e1.flags().contains(PageTableFlags::PRESENT)
+            || e1.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        Some((PhysFrame::containing_address(e1.addr()), e1.flags()))
+    }
+
+    // byte-wise access into this address space via the physmap; works no
+    // matter which CR3 is active, used for ipc copies between processes.
+    // every page is checked: it must be user-accessible and, for writes,
+    // writable — so read-only mappings (initrd, .text) cannot be written
+    // through kernel copy paths
     pub fn write_bytes(&mut self, mut addr: u64, mut data: &[u8]) -> bool {
         while !data.is_empty() {
             if addr >= USER_LIMIT {
                 return false;
             }
-            let page = Page::containing_address(VirtAddr::new(addr));
-            let Some(frame) = self.translate_page(page) else {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+            let Some((frame, flags)) = self.walk_leaf(page.start_address()) else {
                 return false;
             };
+            if !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                || !flags.contains(PageTableFlags::WRITABLE)
+            {
+                return false;
+            }
             let off = (addr & 0xFFF) as usize;
             let n = core::cmp::min(4096 - off, data.len());
             let dst = memory::phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
@@ -153,10 +198,13 @@ impl AddressSpace {
             if addr >= USER_LIMIT {
                 return false;
             }
-            let page = Page::containing_address(VirtAddr::new(addr));
-            let Some(frame) = self.translate_page(page) else {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+            let Some((frame, flags)) = self.walk_leaf(page.start_address()) else {
                 return false;
             };
+            if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+                return false;
+            }
             let page_off = (addr & 0xFFF) as usize;
             let n = core::cmp::min(4096 - page_off, buf.len() - off);
             let src = memory::phys_to_virt(frame.start_address()).as_ptr::<u8>();
@@ -168,12 +216,81 @@ impl AddressSpace {
         }
         true
     }
+
+    // remove one user mapping, returning its frame (guest_destroy needs this
+    // so freed guest ram is not reachable from ring 3 anymore)
+    pub fn unmap_user_page(&mut self, page: Page<Size4KiB>) -> Option<PhysFrame<Size4KiB>> {
+        let mut mapper = self.mapper();
+        match mapper.unmap(page) {
+            Ok((frame, flush)) => {
+                flush.flush();
+                Some(frame)
+            }
+            Err(UnmapError::PageNotMapped) => None,
+            Err(_) => None,
+        }
+    }
+
+    // free every frame of the private lower half (leaves + tables + root).
+    // leaves carrying BIT_9 are shared with the kernel (initrd, boot copies)
+    // and stay. only ever called for dead user processes.
+    pub fn teardown(&mut self) -> u64 {
+        let mut freed = 0u64;
+        unsafe {
+            let root: &mut PageTable =
+                &mut *(memory::phys_to_virt(self.pml4.start_address()).as_mut_ptr());
+            for i in 0..256 {
+                let e = root[i].clone();
+                if !e.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                freed += free_subtree(&e, 4);
+                root[i] = PageTableEntry::new();
+            }
+        }
+        if memory::dealloc_frame(self.pml4) {
+            freed += 1;
+        }
+        freed
+    }
+}
+
+// teardown: free a lower-half subtree; level = table level of `entry`
+// (4 = pml4 entry ... 1 = leaf). leaves marked BIT_9 belong to the kernel.
+unsafe fn free_subtree(entry: &PageTableEntry, level: u8) -> u64 {
+    if !entry.flags().contains(PageTableFlags::PRESENT) {
+        return 0;
+    }
+    if level > 1 && !entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        let mut freed = 0u64;
+        let table: &PageTable = &*(memory::phys_to_virt(entry.addr()).as_ptr());
+        for i in 0..512 {
+            freed += free_subtree(&table[i], level - 1);
+        }
+        // table frames of the lower half are always private copies
+        if memory::dealloc_frame(PhysFrame::containing_address(entry.addr())) {
+            freed += 1;
+        }
+        return freed;
+    }
+    // leaf: only private user leaves are returned to the pool
+    let f = entry.flags();
+    if f.contains(PageTableFlags::USER_ACCESSIBLE)
+        && !f.contains(PageTableFlags::BIT_9)
+        && memory::dealloc_frame(PhysFrame::containing_address(entry.addr()))
+    {
+        return 1;
+    }
+    0
 }
 
 // pdpt level: children are page directories, copied one level down
 fn copy_level2(entry: &PageTableEntry) -> Result<PageTableEntry, &'static str> {
     if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-        return Ok(entry.clone());
+        // huge leaf shared with the kernel root: keep it, mark not-ours
+        let mut e = entry.clone();
+        e.set_flags(e.flags() | PageTableFlags::BIT_9);
+        return Ok(e);
     }
     let src: &PageTable = unsafe { &*(memory::phys_to_virt(entry.addr()).as_ptr()) };
     let frame = memory::alloc_frame().ok_or("no frames for page tables")?;
@@ -205,7 +322,11 @@ fn copy_level1(entry: &PageTableEntry) -> Result<PageTableEntry, &'static str> {
     for i in 0..512 {
         let child = src[i].clone();
         if child.flags().contains(PageTableFlags::PRESENT) {
-            dst[i] = child;
+            // leaf frames are shared with the source space: BIT_9 tells
+            // teardown to skip them (kernel-owned data behind the copy)
+            let mut e = child;
+            e.set_flags(e.flags() | PageTableFlags::BIT_9);
+            dst[i] = e;
         }
     }
     let mut new_entry = entry.clone();
@@ -234,6 +355,8 @@ pub struct Process {
     // threads parked in ipc_recv, woken by ipc_send handoff
     pub waiters: Mutex<Vec<Arc<Task>>>,
     pub alive: AtomicUsize,
+    // set once by the reaper: frees the address space, queues and caps
+    pub torn_down: AtomicBool,
 }
 
 impl Process {
@@ -246,6 +369,7 @@ impl Process {
             mailbox: Mutex::new(VecDeque::new()),
             waiters: Mutex::new(Vec::new()),
             alive: AtomicUsize::new(0),
+            torn_down: AtomicBool::new(false),
         }
     }
 

@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::fmt;
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
@@ -21,6 +22,8 @@ pub enum ElfError {
     NotExec,
     NotX86_64,
     BadSegments,
+    BadEntry,
+    Overlap,
     OutOfMemory,
     Mapping,
 }
@@ -35,6 +38,8 @@ impl fmt::Display for ElfError {
             ElfError::NotExec => "not ET_EXEC",
             ElfError::NotX86_64 => "not x86_64",
             ElfError::BadSegments => "bad program headers",
+            ElfError::BadEntry => "entry outside executable segment",
+            ElfError::Overlap => "overlapping load segments",
             ElfError::OutOfMemory => "out of frames",
             ElfError::Mapping => "mapping failed",
         };
@@ -70,9 +75,18 @@ fn u64_at(buf: &[u8], off: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b))
 }
 
+// result of a successful load: entry point plus every mapped range, so the
+// caller can reject images that collide with its own regions (stack, initrd)
+pub struct LoadedImage {
+    pub entry: VirtAddr,
+    pub ranges: Vec<(u64, u64)>,
+}
+
 // maps every PT_LOAD of a static ELF64 into the given address space
-// with user pages (R/W/X derived from p_flags), zero-fills BSS
-pub fn load(image: &[u8], aspace: &mut AddressSpace) -> Result<VirtAddr, ElfError> {
+// with user pages (R/W/X derived from p_flags), zero-fills BSS.
+// all header fields are validated first; on any error the caller is expected
+// to tear the address space down (partial mappings must not leak frames)
+pub fn load(image: &[u8], aspace: &mut AddressSpace) -> Result<LoadedImage, ElfError> {
     if image.len() < 64 {
         return Err(ElfError::Truncated);
     }
@@ -98,14 +112,25 @@ pub fn load(image: &[u8], aspace: &mut AddressSpace) -> Result<VirtAddr, ElfErro
     if e_machine != EM_X86_64 {
         return Err(ElfError::NotX86_64);
     }
+    if phnum == 0 || phnum > 64 {
+        return Err(ElfError::BadSegments);
+    }
     if phentsize < 56 {
         return Err(ElfError::BadSegments);
     }
+    // the whole program header table must sit inside the file
+    let table_end = phoff
+        .checked_add(phnum.checked_mul(phentsize).ok_or(ElfError::BadSegments)?)
+        .ok_or(ElfError::BadSegments)?;
+    if table_end > image.len() as u64 {
+        return Err(ElfError::Truncated);
+    }
 
+    // first pass: validate every segment, collect ranges
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut exec_hit = false;
     for i in 0..phnum {
-        let base = phoff
-            .checked_add(i.checked_mul(phentsize).ok_or(ElfError::BadSegments)?)
-            .ok_or(ElfError::BadSegments)?;
+        let base = phoff + i * phentsize;
         let p_type = u32_at(image, base as usize).ok_or(ElfError::Truncated)?;
         if p_type != PT_LOAD {
             continue;
@@ -119,6 +144,9 @@ pub fn load(image: &[u8], aspace: &mut AddressSpace) -> Result<VirtAddr, ElfErro
         if p_memsz == 0 {
             continue;
         }
+        if p_memsz < p_filesz {
+            return Err(ElfError::BadSegments);
+        }
         if p_offset
             .checked_add(p_filesz)
             .ok_or(ElfError::BadSegments)?
@@ -126,9 +154,47 @@ pub fn load(image: &[u8], aspace: &mut AddressSpace) -> Result<VirtAddr, ElfErro
         {
             return Err(ElfError::Truncated);
         }
-        let mem_end = p_vaddr.checked_add(p_memsz).ok_or(ElfError::BadSegments)?;
-        if mem_end > 0x0000_8000_0000_0000 {
+        // page-aligned lower half mappings only, and never the null page
+        if p_vaddr < 0x1000 || p_vaddr & 0xFFF != 0 {
             return Err(ElfError::BadSegments);
+        }
+        let mem_end = p_vaddr.checked_add(p_memsz).ok_or(ElfError::BadSegments)?;
+        if mem_end > USER_TOP {
+            return Err(ElfError::BadSegments);
+        }
+        let range = (p_vaddr, mem_end);
+        for (s, e) in &ranges {
+            if range.0 < *e && *s < range.1 {
+                return Err(ElfError::Overlap);
+            }
+        }
+        if p_flags & PF_X != 0 && entry >= range.0 && entry < range.1 {
+            exec_hit = true;
+        }
+        ranges.push(range);
+    }
+    if ranges.is_empty() {
+        return Err(ElfError::BadSegments);
+    }
+    // the entry point must land inside an executable load segment
+    if entry < 0x1000 || !exec_hit {
+        return Err(ElfError::BadEntry);
+    }
+
+    // second pass: map (any failure leaves partial mappings — caller tears down)
+    for i in 0..phnum {
+        let base = phoff + i * phentsize;
+        let p_type = u32_at(image, base as usize).ok_or(ElfError::Truncated)?;
+        if p_type != PT_LOAD {
+            continue;
+        }
+        let p_flags = u32_at(image, base as usize + 4).ok_or(ElfError::Truncated)?;
+        let p_offset = u64_at(image, base as usize + 8).ok_or(ElfError::Truncated)?;
+        let p_vaddr = u64_at(image, base as usize + 16).ok_or(ElfError::Truncated)?;
+        let p_filesz = u64_at(image, base as usize + 32).ok_or(ElfError::Truncated)?;
+        let p_memsz = u64_at(image, base as usize + 40).ok_or(ElfError::Truncated)?;
+        if p_memsz == 0 {
+            continue;
         }
 
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -142,8 +208,13 @@ pub fn load(image: &[u8], aspace: &mut AddressSpace) -> Result<VirtAddr, ElfErro
         map_segment(image, p_offset, p_vaddr, p_filesz, p_memsz, flags, aspace)?;
     }
 
-    Ok(VirtAddr::new(entry))
+    Ok(LoadedImage {
+        entry: VirtAddr::new(entry),
+        ranges,
+    })
 }
+
+const USER_TOP: u64 = 0x0000_8000_0000_0000;
 
 fn map_segment(
     image: &[u8],

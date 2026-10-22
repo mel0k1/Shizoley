@@ -1,13 +1,95 @@
 use bootloader::bootinfo::{BootInfo, MemoryMap, MemoryRegionType};
 use spin::{Mutex, Once};
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB};
+use x86_64::structures::paging::page_table::PageTableEntry;
+use x86_64::structures::paging::{
+    FrameAllocator, OffsetPageTable, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+};
 use x86_64::{PhysAddr, VirtAddr};
 
 pub static PHYS_OFFSET: Once<u64> = Once::new();
 pub static KERNEL_PML4: Once<PhysFrame<Size4KiB>> = Once::new();
 
-static FRAMES: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
+// bitmap frame allocator: unlike the boot bump allocator it can free, which
+// process teardown needs. one bit per 4 KiB frame, up to 512 MiB of ram.
+const BITMAP_WORDS: usize = 2048; // 2048 * 64 frames = 512 MiB
+const FRAME_SIZE: u64 = 4096;
+
+struct BitmapFrames {
+    // frame number of bit 0
+    base: u64,
+    // bit i of bits[] = frame (base + i) is allocated
+    bits: [u64; BITMAP_WORDS],
+    // scan cursor so consecutive allocs do not rescan from zero
+    cursor: usize,
+}
+
+impl BitmapFrames {
+    // start with every covered frame free
+    fn new(base_frame: u64) -> Self {
+        BitmapFrames {
+            base: base_frame,
+            bits: [0u64; BITMAP_WORDS],
+            cursor: 0,
+        }
+    }
+
+    fn total_bits(&self) -> u64 {
+        (BITMAP_WORDS * 64) as u64
+    }
+
+    fn mark_used(&mut self, frame_no: u64) {
+        let Some(idx) = frame_no.checked_sub(self.base / FRAME_SIZE) else {
+            return;
+        };
+        if idx >= self.total_bits() {
+            return;
+        }
+        self.bits[idx as usize / 64] |= 1 << (idx % 64);
+    }
+
+    fn mark_free(&mut self, frame_no: u64) {
+        let Some(idx) = frame_no.checked_sub(self.base / FRAME_SIZE) else {
+            return;
+        };
+        if idx >= self.total_bits() {
+            return;
+        }
+        self.bits[idx as usize / 64] &= !(1 << (idx % 64));
+    }
+
+    fn alloc(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        let total = self.total_bits() as usize;
+        for off in 0..total {
+            let i = (self.cursor + off) % total;
+            if self.bits[i / 64] & (1 << (i % 64)) != 0 {
+                continue;
+            }
+            self.bits[i / 64] |= 1 << (i % 64);
+            self.cursor = (i + 1) % total;
+            let addr = (self.base / FRAME_SIZE + i as u64) * FRAME_SIZE;
+            return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
+        }
+        None
+    }
+
+    // returns false when the frame was never handed out (or is unknown):
+    // double frees and kernel-frame frees are refused
+    fn free(&mut self, frame: PhysFrame<Size4KiB>) -> bool {
+        let frame_no = frame.start_address().as_u64() / FRAME_SIZE;
+        let idx = match frame_no.checked_sub(self.base / FRAME_SIZE) {
+            Some(i) if i < self.total_bits() => i as usize,
+            _ => return false,
+        };
+        if self.bits[idx / 64] & (1 << (idx % 64)) == 0 {
+            return false;
+        }
+        self.bits[idx / 64] &= !(1 << (idx % 64));
+        true
+    }
+}
+
+static FRAMES: Mutex<Option<BitmapFrames>> = Mutex::new(None);
 
 pub fn init(boot_info: &'static BootInfo) -> OffsetPageTable<'static> {
     let phys_offset = boot_info.physical_memory_offset;
@@ -20,9 +102,79 @@ pub fn init(boot_info: &'static BootInfo) -> OffsetPageTable<'static> {
             VirtAddr::new(phys_offset),
         )
     };
-    let frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
-    *FRAMES.lock() = Some(frame_allocator);
+    init_bitmap(&boot_info.memory_map, phys_offset);
     mapper
+}
+
+fn init_bitmap(map: &MemoryMap, phys_offset: u64) {
+    // usable span covered by the bitmap
+    let mut min_frame = u64::MAX;
+    let mut max_frame = 0u64;
+    for region in map.iter() {
+        if region.region_type != MemoryRegionType::Usable {
+            continue;
+        }
+        min_frame = min_frame.min(region.range.start_frame_number);
+        max_frame = max_frame.max(region.range.end_frame_number);
+    }
+    if min_frame == u64::MAX {
+        panic!("no usable memory regions");
+    }
+    let covered = BITMAP_WORDS as u64 * 64;
+    if max_frame - min_frame > covered {
+        serial_log("[memory] ram beyond bitmap limit stays unused");
+        max_frame = min_frame + covered;
+    }
+    let mut bm = BitmapFrames::new(min_frame * FRAME_SIZE);
+    // everything in a usable region starts free
+    for region in map.iter() {
+        if region.region_type != MemoryRegionType::Usable {
+            continue;
+        }
+        let start = region.range.start_frame_number;
+        let end = region.range.end_frame_number.min(max_frame);
+        for f in start..end {
+            bm.mark_free(f);
+        }
+    }
+    // frames the bootloader/kernel already occupy are hidden behind boot page
+    // tables: walk them and mark every referenced frame used. the physmap
+    // subtree maps all of ram, so only its table frames are protected there.
+    let physmap_pml4 = (phys_offset / (512 * 1024 * 1024 * 1024u64)) as usize;
+    unsafe {
+        let root: &PageTable =
+            &*(phys_to_virt(KERNEL_PML4.get().unwrap().start_address()).as_ptr());
+        bm.mark_used(KERNEL_PML4.get().unwrap().start_address().as_u64() / FRAME_SIZE);
+        for i in 0..512 {
+            let e = &root[i];
+            if !e.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            let depth = if i == physmap_pml4 { 3 } else { 4 };
+            protect_subtree(&mut bm, e, depth);
+        }
+    }
+    *FRAMES.lock() = Some(bm);
+}
+
+// mark the frame behind `entry`, then descend; depth counts how many table
+// levels still follow (depth 0 = leaf frame, depth 3 = pml4-style entry)
+unsafe fn protect_subtree(bm: &mut BitmapFrames, entry: &PageTableEntry, depth: u8) {
+    if !entry.flags().contains(PageTableFlags::PRESENT) {
+        return;
+    }
+    bm.mark_used(entry.addr().as_u64() / FRAME_SIZE);
+    if depth == 0 || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return;
+    }
+    let table: &PageTable = &*(phys_to_virt(entry.addr()).as_ptr());
+    for i in 0..512 {
+        protect_subtree(bm, &table[i], depth - 1);
+    }
+}
+
+fn serial_log(s: &str) {
+    crate::serial_println!("{}", s);
 }
 
 pub unsafe fn active_pml4(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
@@ -51,40 +203,24 @@ unsafe impl FrameAllocator<Size4KiB> for GlobalFrames {
 
 pub fn alloc_frame() -> Option<PhysFrame<Size4KiB>> {
     let mut guard = FRAMES.lock();
-    guard.as_mut()?.allocate_frame()
+    guard.as_mut()?.alloc()
 }
 
-pub struct BootInfoFrameAllocator {
-    memory_map: &'static MemoryMap,
-    next: usize,
-}
-
-impl BootInfoFrameAllocator {
-    unsafe fn init(memory_map: &'static MemoryMap) -> Self {
-        BootInfoFrameAllocator {
-            memory_map,
-            next: 0,
-        }
+// hand a frame back to the pool; returns false for unknown/already-free
+// frames (kernel-owned frames are never in the free set)
+pub fn dealloc_frame(frame: PhysFrame<Size4KiB>) -> bool {
+    let mut guard = FRAMES.lock();
+    match guard.as_mut() {
+        Some(bm) => bm.free(frame),
+        None => false,
     }
 }
 
-unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
-    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        let mut remaining = self.next;
-        for region in self.memory_map.iter() {
-            if region.region_type != MemoryRegionType::Usable {
-                continue;
-            }
-            let count = region.range.end_frame_number - region.range.start_frame_number;
-            if remaining < count as usize {
-                let frame_number = region.range.start_frame_number + remaining as u64;
-                self.next += 1;
-                return Some(PhysFrame::containing_address(PhysAddr::new(
-                    frame_number * 4096,
-                )));
-            }
-            remaining -= count as usize;
-        }
-        None
-    }
+// frames currently allocated (for boot-time stats)
+pub fn frames_used() -> u64 {
+    let guard = FRAMES.lock();
+    let Some(bm) = guard.as_ref() else {
+        return 0;
+    };
+    bm.bits.iter().map(|w| w.count_ones() as u64).sum()
 }
