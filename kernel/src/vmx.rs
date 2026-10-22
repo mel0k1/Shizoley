@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::{Mutex, Once};
 use x86_64::registers::control::{Cr0, Cr3, Cr3Flags, Cr4};
 use x86_64::registers::model_specific::Msr;
@@ -16,7 +16,14 @@ use crate::{gdt, memory, println};
 // the guest ram which is also mapped into the creator's address space so
 // ring 3 can load images and read results (e.g. the guest's "VGA" text).
 
+const IA32_FEATURE_CONTROL: u32 = 0x3A;
 const IA32_VMX_BASIC: u32 = 0x480;
+// raw control-capability msrs (always present); the TRUE_* variants are
+// only valid when IA32_VMX_BASIC[55] is set (see TRUE_CTLS)
+const IA32_VMX_PIN: u32 = 0x481;
+const IA32_VMX_PROC: u32 = 0x482;
+const IA32_VMX_EXIT: u32 = 0x483;
+const IA32_VMX_ENTRY: u32 = 0x484;
 const IA32_VMX_CR0_FIXED0: u32 = 0x486;
 const IA32_VMX_CR0_FIXED1: u32 = 0x487;
 const IA32_VMX_CR4_FIXED0: u32 = 0x488;
@@ -80,6 +87,8 @@ const VMX_EXCEPTION_BITMAP: u64 = 0x4004;
 const VMX_EXIT_CTLS: u64 = 0x400C;
 const VMX_ENTRY_CTLS: u64 = 0x4012;
 const VMX_MSR_BITMAPS: u64 = 0x2004;
+const VMX_CR4_GUEST_HOST_MASK: u64 = 0x4002;
+const VMX_CR4_READ_SHADOW: u64 = 0x4006;
 const VMX_EPTP: u64 = 0x201A;
 const VMX_PROC_CTLS2: u64 = 0x401E;
 const GUEST_PHYSICAL_ADDR: u64 = 0x2400;
@@ -119,6 +128,7 @@ const HOST_RIP: u64 = 0x6C16;
 const R_EXTERNAL_INT: u64 = 1;
 const R_RDMSR: u64 = 31;
 const R_WRMSR: u64 = 32;
+const R_IO: u64 = 30;
 const R_EPT_VIOLATION: u64 = 49;
 const R_EPT_MISCONFIG: u64 = 50;
 
@@ -322,6 +332,12 @@ extern "C" fn vmx_after_exit(vcpu: *mut Vcpu) -> u64 {
             let info = vmread(VM_EXIT_INTR_INFO);
             let vector = (info & 0xFF) as u8;
             crate::interrupts::dispatch_in_root(vector);
+            // fairness: a timer tick ends this guest slice so the scheduler
+            // decides who owns the cpu next; ext-int never retires an
+            // instruction, so the monitor just re-enters (vmresume)
+            if vector == crate::interrupts::TIMER_VECTOR {
+                return 1;
+            }
             0
         }
         R_RDMSR | R_WRMSR => {
@@ -330,11 +346,16 @@ extern "C" fn vmx_after_exit(vcpu: *mut Vcpu) -> u64 {
             0
         }
         _ => {
+            let qual = vmread(VM_EXIT_QUALIFICATION);
             vcpu.out[0] = reason;
             vcpu.out[1] = vmread(GUEST_RIP);
-            vcpu.out[2] = vmread(VM_EXIT_QUALIFICATION);
+            vcpu.out[2] = qual;
             vcpu.out[3] = if reason == R_EPT_VIOLATION || reason == R_EPT_MISCONFIG {
                 vmread(GUEST_PHYSICAL_ADDR)
+            } else if reason == R_IO {
+                // io exit: the guest tried a real port; it stays blocked —
+                // qualification bits 31:16 carry the port number
+                (qual >> 16) & 0xFFFF
             } else {
                 0
             };
@@ -438,6 +459,9 @@ fn adjust_ctl(msr: u32, desired: u64) -> u64 {
 
 // ---------------------------------------------------------------- init
 
+// IA32_VMX_BASIC[55]: the TRUE_* control msrs exist and allow changing
+// defaults; on older cpus only the raw capability msrs are there
+static TRUE_CTLS: AtomicBool = AtomicBool::new(false);
 static VMX_READY: Once<()> = Once::new();
 
 pub fn vmx_ready() -> bool {
@@ -519,6 +543,12 @@ fn cpu_has_vmx() -> bool {
 
 fn enter_root() -> Result<u32, &'static str> {
     unsafe {
+        // a bios that locked feature control without vmx would make vmxon
+        // die with a bare #gp; detect it and tell the story instead
+        let fc = Msr::new(IA32_FEATURE_CONTROL).read();
+        if fc & 1 != 0 && fc & 0b110 == 0 {
+            return Err("feature control locked without vmx (bios)");
+        }
         let mut cr4 = Cr4::read();
         if cr4.contains(x86_64::registers::control::Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS) {
             return Err("vmxe already set");
@@ -528,6 +558,7 @@ fn enter_root() -> Result<u32, &'static str> {
     }
 
     let basic = unsafe { Msr::new(IA32_VMX_BASIC).read() };
+    TRUE_CTLS.store(basic & (1 << 55) != 0, Ordering::Relaxed);
     let rev = basic as u32;
 
     let frame = memory::alloc_frame().ok_or("no frame for vmxon region")?;
@@ -774,15 +805,27 @@ fn setup_vmcs(vmcs: PhysFrame<Size4KiB>, ept_pml4: PhysFrame<Size4KiB>, ram: &[P
         ok &= vmwrite(f, v);
     };
 
-    // controls
+    // controls; the capability msrs depend on basic[55] (true ctls or raw)
+    let (m_pin, m_proc, m_exit, m_entry) = if TRUE_CTLS.load(Ordering::Relaxed) {
+        (
+            IA32_VMX_TRUE_PIN,
+            IA32_VMX_TRUE_PROC,
+            IA32_VMX_TRUE_EXIT,
+            IA32_VMX_TRUE_ENTRY,
+        )
+    } else {
+        (IA32_VMX_PIN, IA32_VMX_PROC, IA32_VMX_EXIT, IA32_VMX_ENTRY)
+    };
     let pin = adjust_ctl(
-        IA32_VMX_TRUE_PIN,
+        m_pin,
         1 | (1 << 3), // external interrupt exiting | nmi exiting
     );
     w(VMX_PIN_CTLS, pin);
     let proc = adjust_ctl(
-        IA32_VMX_TRUE_PROC,
-        (1 << 7) | (1 << 31), // hlt exiting | activate secondary controls
+        m_proc,
+        (1 << 7) | (1 << 24) | (1 << 31), // hlt | unconditional io | secondary;
+                                          // io exiting keeps guest ports away
+                                          // from the real pic/pit/keyboard
     );
     w(VMX_PROC_CTLS, proc);
     let proc2 = adjust_ctl(
@@ -791,14 +834,14 @@ fn setup_vmcs(vmcs: PhysFrame<Size4KiB>, ept_pml4: PhysFrame<Size4KiB>, ram: &[P
     );
     w(VMX_PROC_CTLS2, proc2);
     let exit_ctl = adjust_ctl(
-        IA32_VMX_TRUE_EXIT,
+        m_exit,
         (1 << 9)    // host address-space size (64-bit)
             | (1 << 15) // acknowledge interrupt on exit
             | (1 << 20) // save ia32_efer on exit
             | (1 << 21), // load ia32_efer on exit
     );
     w(VMX_EXIT_CTLS, exit_ctl);
-    let entry_ctl = adjust_ctl(IA32_VMX_TRUE_ENTRY, 1 << 15); // load ia32_efer
+    let entry_ctl = adjust_ctl(m_entry, 1 << 15); // load ia32_efer
     w(VMX_ENTRY_CTLS, entry_ctl);
     w(VMX_EXCEPTION_BITMAP, (1 << 6) | (1 << 13)); // #ud, #gp exit to host
     w(VMX_MSR_BITMAPS, 0); // all msr access exits
@@ -841,6 +884,11 @@ fn setup_vmcs(vmcs: PhysFrame<Size4KiB>, ept_pml4: PhysFrame<Size4KiB>, ram: &[P
     w(GUEST_CR0, gcr0);
     w(GUEST_CR3, 0); // guest cr3
     w(GUEST_CR4, gcr4);
+    // vmxe is kernel-owned: guest writes to it exit (reason 28, reportable)
+    // and reads see it set — a guest can never drop itself out of the ept
+    // walk (cr4 mask/shadow must agree with the cr4 field on masked bits)
+    w(VMX_CR4_GUEST_HOST_MASK, 1 << 13); // vmxe
+    w(VMX_CR4_READ_SHADOW, 0x2000);
     w(GUEST_DR7, 0x400);
     w(GUEST_RSP, 0);
     w(GUEST_RIP, 0);

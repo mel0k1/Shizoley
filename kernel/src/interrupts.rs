@@ -10,6 +10,8 @@ use x86_64::PrivilegeLevel;
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
+// the timer's line, visible to vmx exit handling for scheduler fairness
+pub const TIMER_VECTOR: u8 = PIC_1_OFFSET;
 
 static PICS: spin::Mutex<ChainedPics> =
     spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });

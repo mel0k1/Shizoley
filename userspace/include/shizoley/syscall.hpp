@@ -28,6 +28,15 @@ enum class Sys : u64 {
     eq_revoke = 20,    // (qid, pid) -> 0 | -1
 };
 
+// vcpu_run exit reasons (reportable vmx exits; see kernel vmx.rs)
+enum class VmxExit : long {
+    ext_int = 1,       // timer tick stopped the guest for scheduling: re-enter
+    vmcall = 18,       // guest hypercall
+    io = 30,           // guest touched a real port: kernel blocks it (out[3]=port)
+    ept_violation = 49,
+    ept_misconfig = 50,
+};
+
 [[noreturn]] void exit(long code);
 
 long spawn(const char* name, u64 len);

@@ -1,6 +1,6 @@
 # Подглядывание: managarm и Veda против Paparaci
 
-Дата: 2026-10-22 · база: `main` @ v0.7.0 (`575036e`).
+Дата: 2026-10-22 · база: `main` @ v0.7.0 (`575036e`); P0/P1 из бэклога закрыты в v0.8.0.
 Предмет: (1) передача данных «ядро → процесс» в managarm против нашего `eq.rs`;
 (2) VMCS/EPT в гипервизоре Veda против нашего `vmx.rs`. Всё сверено по коду
 обоих проектов, ссылки `файл:строка` — на их деревья на момент клонирования.
@@ -216,25 +216,28 @@ guest_destroy` за syscalls 15/16/17.
 
 ### 3.3 Наши пробелы, найденные сравнением
 
-1. **P0 — IO-порты гостя не перехватываются.** У нас в proc-ctls только
-   `HLT exiting | secondary`; `UNCONDITIONAL_IO_EXITING` (bit 24) не ставится,
-   IO-bitmaps нет — значит `in/out` гостя уходят в **реальные порты** (маска
-   PIC и всё остальное). У Veda этот бит required. Фикс: bit 24 + IO-выход в
-   ring 3 как reportable (порт/значение из qualification).
-2. **P0 — гость может снять VMXE.** Мы не пишем `CR4_GUEST_HOST_MASK`/
-   `CR4_READ_SHADOW`; mov-to-CR4 не перехватывается вовсе. У Veda — явные
-   проверки в CR-access exit. Фикс (минимальный): mask bit 13 (VMXE),
-   shadow = 0x2000.
-3. **P1 — FEATURE_CONTROL не читается.** На живом железе с locked MSR 0x3A
-   без VMX-бита `vmxon` упадёт #GP. У Veda — проверка в `caps()`.
-4. **P1 — true-CTLS без gate.** `adjust_ctl` безусловно читает 0x48D-0x490;
-   на CPU без `IA32_VMX_BASIC[55]` это #GP ядра. Veda требует бит 55 и
-   честно отказывается. Фикс: gate на BASIC[55] (fallback на сырые
-   0x400/0x402/0x40C/0x412 или отказ).
-5. **P1 — справедливость.** Timer-exit из гостя сейчас EOI+resume в корне:
-   задача с гостем монополизирует CPU до reportable exit. У Veda в круге
-   `need_resched`. Фикс: на timer-exit останавливать гостя (reportable) и
-   возвращаться к планировщику; vcpu_run продолжит с vmresume.
+1. **P0 — IO-порты гостя не перехватываются.** ~~У нас в proc-ctls только
+   `HLT exiting | secondary`; `UNCONDITIONAL_IO_EXITING` (bit 24) не ставится,~~
+   **закрыто в v0.8.0**: bit 24 включён, IO-выход reportable, порт из
+   qualification (bits 31:16) кладётся в `out[3]`; контроль за политикой — в
+   ring 3 (микроядерный контракт).
+2. **P0 — гость может снять VMXE.** ~~Мы не пишем `CR4_GUEST_HOST_MASK`/
+   `CR4_READ_SHADOW`; mov-to-CR4 не перехватывается вовсе.~~ **закрыто в
+   v0.8.0**: `CR4_GUEST_HOST_MASK = VMXE`, `CR4_READ_SHADOW = 0x2000`
+   (запись в VMXE → выход 28 → reportable, чтение видит VMXE установленным;
+   маска/shadow согласованы с guest CR4 полем — VM-entry проверка проходит).
+3. **P1 — FEATURE_CONTROL не читается.** **закрыто в v0.8.0**: `enter_root`
+   читает 0x3A и отказывается с внятной ошибкой при locked-без-VMX (иначе
+   `vmxon` умер бы голым #GP).
+4. **P1 — true-CTLS без gate.** **закрыто в v0.8.0**: `TRUE_CTLS` берётся из
+   `IA32_VMX_BASIC[55]`; без бита используется raw-четвёрка 0x481–0x484 —
+   формула `adjust_ctl` одинакова для обоих.
+5. **P1 — справедливость.** ~~Timer-exit из гостя сейчас EOI+resume в корне.~~
+   **закрыто в v0.8.0**: таймер-выход (после EOI+тик в `dispatch_in_root`)
+   останавливает гостя → reportable exit 1 → syscall-граница даёт
+   планировщику точку вытеснения; монитор перезапускает `vcpu_run`
+   (vmresume безопасен: ext-int инструкцию не рвёт). Контракт: причина 1 =
+   «перезапустите vcpu_run» (в userspace ABI появился `VmxExit`).
 6. **P2 — MSR bitmap, vAPIC, preemption timer, VPID, 2 MiB-листья EPT,
    GUEST_MAP/UNMAP + invept, двусторонний VcpuExit** — по мере роста гостя
    от 16-бит блоба к чему-то серьёзному.
@@ -244,11 +247,11 @@ guest_destroy` за syscalls 15/16/17.
 ## 4. Бэклог (сортированный)
 
 **vmx.rs**
-- [ ] P0: `UNCONDITIONAL_IO_EXITING` + IO-exit → reportable (безопасность).
-- [ ] P0: `CR4_GUEST_HOST_MASK = VMXE`, `CR4_READ_SHADOW = 0x2000`.
-- [ ] P1: FEATURE_CONTROL (0x3A) read/lock-check в `enter_root`.
-- [ ] P1: gate на `IA32_VMX_BASIC[55]` перед `adjust_ctl`.
-- [ ] P1: timer-exit → stop гостя → планировщик (справедливость).
+- [x] P0: `UNCONDITIONAL_IO_EXITING` + IO-exit → reportable (безопасность) — v0.8.0.
+- [x] P0: `CR4_GUEST_HOST_MASK = VMXE`, `CR4_READ_SHADOW = 0x2000` — v0.8.0.
+- [x] P1: FEATURE_CONTROL (0x3A) read/lock-check в `enter_root` — v0.8.0.
+- [x] P1: gate на `IA32_VMX_BASIC[55]` перед `adjust_ctl` — v0.8.0.
+- [x] P1: timer-exit → stop гостя → планировщик (справедливость) — v0.8.0.
 - [ ] P2: MSR bitmap + passthrough; vAPIC; preemption timer; VPID;
       GUEST_MAP/GUEST_UNMAP + invept; двусторонний контракт выхода.
 

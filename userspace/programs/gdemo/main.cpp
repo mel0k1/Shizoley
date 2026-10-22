@@ -55,11 +55,19 @@ int main() {
     }
 
     u64 out[20];
-    long reason = vcpu_run(g, out);
-    if (reason < 0) {
-        println("[gdemo] vcpu_run failed");
-        guest_destroy(g);
-        return 1;
+    long reason = -1;
+    for (int i = 0; i < 1000; ++i) {
+        reason = vcpu_run(g, out);
+        if (reason < 0) {
+            println("[gdemo] vcpu_run failed");
+            guest_destroy(g);
+            return 1;
+        }
+        if (reason == static_cast<long>(VmxExit::ext_int)) {
+            // the timer took the cpu back for scheduling; re-enter
+            continue;
+        }
+        break;
     }
     println("[gdemo] exit reason ", static_cast<u64>(reason), " rip ",
             out[1], " qual ", out[2]);
