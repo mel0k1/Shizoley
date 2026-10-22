@@ -84,12 +84,15 @@ const GUEST_LDTR_AR: u64 = 0x4820;
 const GUEST_TR_AR: u64 = 0x4822;
 const GUEST_INTERRUPTIBILITY: u64 = 0x4824;
 const GUEST_ACTIVITY_STATE: u64 = 0x4826;
-const GUEST_SMBASE: u64 = 0x4828;
+// gpa 0x4828 would be guest smbase — kvm's vmcs12 has no slot for it ("SMM
+// is not supported") and we never deliver SMIs, so it is never written
 const GUEST_SYSENTER_CS: u64 = 0x482A;
 const VM_INSTRUCTION_ERROR: u64 = 0x4400;
 const VM_EXIT_REASON: u64 = 0x4402;
-const VM_EXIT_QUALIFICATION: u64 = 0x4404;
-const VM_EXIT_INTR_INFO: u64 = 0x4406;
+// 0x4404 is vm-exit interruption information (its error code is 0x4406);
+// exit qualification lives in the natural-width read-only area (0x6400)
+const VM_EXIT_INTR_INFO: u64 = 0x4404;
+const VM_EXIT_QUALIFICATION: u64 = 0x6400;
 const VM_ENTRY_INTR_INFO: u64 = 0x4016;
 const VM_ENTRY_EXCEPTION_ERR_CODE: u64 = 0x4018;
 const VM_ENTRY_INSTRUCTION_LEN: u64 = 0x401A;
@@ -103,10 +106,15 @@ const VMX_VPID: u64 = 0x0000;
 const VMX_PREEMPT_TIMER: u64 = 0x482E;
 const VMX_VIRTUAL_APIC: u64 = 0x2012;
 const VMX_APIC_ACCESS: u64 = 0x2014;
-const VMX_TPR_THRESHOLD: u64 = 0x401E;
+// 0x401c is the tpr threshold; 0x401e is secondary proc ctls — off by one
+// pair and one of them silently eats the other
+const VMX_TPR_THRESHOLD: u64 = 0x401C;
 const VM_EXIT_INSTRUCTION_LEN: u64 = 0x440C;
-const VMX_CR4_GUEST_HOST_MASK: u64 = 0x4002;
-const VMX_CR4_READ_SHADOW: u64 = 0x4006;
+// cr4 mask/shadow are natural-width control fields (0x6002/0x6006); the
+// 0x40xx slot aliases are 32-bit control fields — writing there clobbers
+// live execution controls
+const VMX_CR4_GUEST_HOST_MASK: u64 = 0x6002;
+const VMX_CR4_READ_SHADOW: u64 = 0x6006;
 const VMX_EPTP: u64 = 0x201A;
 const VMX_PROC_CTLS2: u64 = 0x401E;
 const GUEST_PHYSICAL_ADDR: u64 = 0x2400;
@@ -1105,7 +1113,9 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
     id as i64
 }
 
-// write every field a real-mode unrestricted guest needs
+// write every field a real-mode unrestricted guest needs; any field the
+// host vmcs has no slot for is reported by encoding so the serial log
+// names the culprit instead of failing the whole setup blind
 fn setup_vmcs(
     vmcs: PhysFrame<Size4KiB>,
     ept_pml4: PhysFrame<Size4KiB>,
@@ -1115,9 +1125,11 @@ fn setup_vmcs(
     virtual_apic: u64,
 ) -> bool {
     let _ = vmcs;
-    let mut ok = true;
+    let mut failed: Vec<u64> = Vec::new();
     let mut w = |f: u64, v: u64| {
-        ok &= vmwrite(f, v);
+        if !vmwrite(f, v) {
+            failed.push(f);
+        }
     };
 
     // controls; the capability msrs depend on basic[55] (true ctls or raw)
@@ -1243,7 +1255,9 @@ fn setup_vmcs(
     w(GUEST_SYSENTER_EIP, 0);
     w(GUEST_ACTIVITY_STATE, 0);
     w(GUEST_INTERRUPTIBILITY, 0);
-    w(GUEST_SMBASE, 0x30000);
+    // no guest smbase: only smi delivery reads it, we never inject smis,
+    // and kvm's vmcs12 rejects the field outright (root cause of the
+    // v0.10.0 "vmcs setup failed" on -enable-kvm hosts)
     w(GUEST_SYSENTER_CS, 0);
     w(GUEST_DEBUGCTL, 0);
     w(GUEST_EFER, 0);
@@ -1277,10 +1291,20 @@ fn setup_vmcs(
     w(GUEST_TR_AR, 0x8B);
     w(GUEST_TR_BASE, 0);
 
-    // ept pointer: wb memory type, 4-level walk
-    let eptp = ept_pml4.start_address().as_u64() | 0x06 | (3 << 3);
+    // ept pointer: bits 2:0 = page-walk length 3 (4-level walk), bits 5:3
+    // = memory type wb (6)
+    let eptp = ept_pml4.start_address().as_u64() | 3 | (6 << 3);
     w(VMX_EPTP, eptp);
-    ok
+    if failed.is_empty() {
+        return true;
+    }
+    let ierr = vmread(VM_INSTRUCTION_ERROR);
+    serial_println!(
+        "[vmx] vmcs write failed: fields {:?} (vm-instruction error {})",
+        failed,
+        ierr
+    );
+    false
 }
 
 // two-way exit buffer in user memory: the kernel writes 20 u64 of exit
@@ -1609,6 +1633,10 @@ pub fn guest_destroy(owner_pid: u64, gid: u64) -> i64 {
             freed += 1;
         }
     }
+    // clear the vmcs before its frame returns to the pool: the stale
+    // current-vmcs pointer must not reference freed memory when the next
+    // guest's vmptrld lands
+    let _ = vmclear(g.vmcs.start_address().as_u64());
     if memory::dealloc_frame(g.vmcs) {
         freed += 1;
     }
