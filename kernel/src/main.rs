@@ -37,7 +37,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         memory::frames_used()
     );
 
-    println!("shizoley / paparaci v0.7.0 (vmcs/ept, console process, qid caps)");
+    println!("shizoley v0.9.1 (kernel paparaci: vmcs/ept, console process, qid caps)");
 
     vmx::init();
     syscall::init();

@@ -665,12 +665,26 @@ fn enter_root() -> Result<u32, &'static str> {
         if fc & 1 != 0 && fc & 0b110 == 0 {
             return Err("feature control locked without vmx (bios)");
         }
-        let mut cr4 = Cr4::read();
-        if cr4.contains(x86_64::registers::control::Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS) {
+        // nothing locked the msr yet: act as our own firmware and lock it
+        // with vmx enabled. kvm boots an l1 with feature control = 0 and
+        // its vmxon demands lock|vmx-on (0x5) — bare metal behaves the
+        // same when firmware left the msr unlocked
+        if fc & 1 == 0 {
+            Msr::new(IA32_FEATURE_CONTROL).write(0b101);
+        }
+        // cr0/cr4 must satisfy the vmx fixed msrs before vmxon (kvm checks
+        // them right at vmxon — cr0.ne is the bit firmware usually forgets;
+        // real cpus check at vm-entry): force must-be-1, clear must-be-0
+        let c0f0 = Msr::new(IA32_VMX_CR0_FIXED0).read();
+        let c0f1 = Msr::new(IA32_VMX_CR0_FIXED1).read();
+        Cr0::write_raw((Cr0::read_raw() | c0f0) & c0f1);
+        let cr4 = Cr4::read_raw();
+        if cr4 & (1 << 13) != 0 {
             return Err("vmxe already set");
         }
-        cr4.insert(x86_64::registers::control::Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS);
-        Cr4::write(cr4);
+        let c4f0 = Msr::new(IA32_VMX_CR4_FIXED0).read();
+        let c4f1 = Msr::new(IA32_VMX_CR4_FIXED1).read();
+        Cr4::write_raw((cr4 | c4f0 | (1 << 13)) & c4f1);
     }
 
     let basic = unsafe { Msr::new(IA32_VMX_BASIC).read() };

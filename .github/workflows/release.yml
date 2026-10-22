@@ -50,7 +50,7 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           cp kernel/target/x86_64-paparaci/debug/bootimage-paparaci.bin "paparaci-${TAG}.bin"
           {
-            echo "## Paparaci (Shizoley kernel) ${TAG}"
+            echo "## Shizoley (Paparaci kernel) ${TAG}"
             echo
             echo "Bootable disk image (bootloader 0.9, BIOS). Run it:"
             echo
@@ -70,4 +70,4 @@ jobs:
             echo "- eq v2: producer-chained chunks, error channel, eq_alert"
             echo "- VMX P2: MSR bitmap, vAPIC, VPID, GUEST_MAP, two-way VcpuExit (KVM hosts: \`-enable-kvm -cpu host\`)"
           } > notes.md
-          gh release create "$TAG" "paparaci-${TAG}.bin" --title "Paparaci ${TAG}" --notes-file notes.md
+          gh release create "$TAG" "paparaci-${TAG}.bin" --title "Shizoley ${TAG}" --notes-file notes.md
