@@ -1,0 +1,73 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  bootimage:
+    name: boot image artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kernel
+
+      - name: install bootimage
+        run: cargo install bootimage
+
+      - name: build boot image
+        working-directory: kernel
+        run: cargo bootimage
+
+      - name: smoke test in qemu
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-system-x86
+          set +e
+          timeout 120 qemu-system-x86_64 \
+            -drive format=raw,file=kernel/target/x86_64-paparaci/debug/bootimage-paparaci.bin \
+            -display none -serial stdio -no-reboot -no-shutdown \
+            > serial.log 2>&1
+          set -e
+          grep -qF "[init] drained 100 events, bye" serial.log
+          grep -qF "[console] up: kernel sink attached" serial.log
+          grep -qF "[eq] wait: alerted (wait canceled)" serial.log
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          cp kernel/target/x86_64-paparaci/debug/bootimage-paparaci.bin "paparaci-${TAG}.bin"
+          {
+            echo "## Paparaci (Shizoley kernel) ${TAG}"
+            echo
+            echo "Bootable disk image (bootloader 0.9, BIOS). Run it:"
+            echo
+            echo '```bash'
+            echo "# full hypervisor round trip (needs nested VMX on the host):"
+            echo "qemu-system-x86_64 -enable-kvm -cpu host -drive format=raw,file=paparaci-${TAG}.bin -serial stdio"
+            echo
+            echo "# plain TCG (kernel boots, hypervisor reports gracefully):"
+            echo "qemu-system-x86_64 -drive format=raw,file=paparaci-${TAG}.bin -serial stdio"
+            echo '```'
+            echo
+            echo "The image also boots from a USB stick: \`dd if=paparaci-${TAG}.bin of=/dev/sdX\`."
+            echo
+            echo "### Что внутри / What is inside"
+            echo
+            echo "- microkernel Paparaci + ring-3 init/hello/fsd/rtcd/consoled/gdemo from the embedded initrd"
+            echo "- eq v2: producer-chained chunks, error channel, eq_alert"
+            echo "- VMX P2: MSR bitmap, vAPIC, VPID, GUEST_MAP, two-way VcpuExit (KVM hosts: \`-enable-kvm -cpu host\`)"
+          } > notes.md
+          gh release create "$TAG" "paparaci-${TAG}.bin" --title "Paparaci ${TAG}" --notes-file notes.md
