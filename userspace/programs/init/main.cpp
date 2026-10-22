@@ -8,7 +8,7 @@ static unsigned char stack1[8192] __attribute__((aligned(16)));
 static unsigned char stack2[8192] __attribute__((aligned(16)));
 
 // the initrd queue memory: 4 chunks x 512 bytes
-static unsigned char eqmem[40 + 4 * 512] __attribute__((aligned(8)));
+static unsigned char eqmem[48 + 4 * 512] __attribute__((aligned(8)));
 
 // user thread entry: the kernel puts arg in rdi, so this matches the SysV ABI
 extern "C" void worker(u64 arg) {
@@ -112,6 +112,13 @@ int main() {
     println("[init] event queue ", static_cast<u64>(q));
     // hello may post into our queue: hand it the POST capability
     eq_grant(q, static_cast<u64>(hello), EQ_RIGHT_POST);
+
+    // alert semantics: eq_alert cancels a parked eq_wait (fast path here —
+    // the ALERT bit is up before we ever park, wait returns 2 right away)
+    eq_alert(q);
+    if (eq_wait(q) == 2) {
+        println("[eq] wait: alerted (wait canceled)");
+    }
 
     char msg[32];
     u64 mn = 0;

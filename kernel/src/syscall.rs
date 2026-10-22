@@ -198,6 +198,10 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         19 => crate::eq::grant(a1, a2, a3 as u32) as u64,
         // 20: eq_revoke(qid, pid) -> 0 | -1; owner takes rights back
         20 => crate::eq::revoke(a1, a2) as u64,
+        // 21: guest_map(handle, count) -> new size | -1; grow guest ram + ept
+        21 => crate::vmx::guest_map(cur.proc.id, a1, a2) as u64,
+        // 22: eq_alert(qid) -> 0 | -1; cancel parked eq_wait (SIGNAL right)
+        22 => crate::eq::alert(a1) as u64,
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);

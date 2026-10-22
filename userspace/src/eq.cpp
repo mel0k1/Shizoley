@@ -24,6 +24,12 @@ inline void st64(volatile u8* p, u64 v) {
     }
 }
 
+inline void st32(volatile u8* p, u32 v) {
+    for (int i = 0; i < 4; ++i) {
+        p[i] = static_cast<u8>(v >> (8 * i));
+    }
+}
+
 inline volatile u8* head(u8* base) {
     return base;
 }
@@ -54,6 +60,10 @@ long eq_wait(long qid) {
     return syscall(Sys::eq_wait, static_cast<u64>(qid));
 }
 
+long eq_alert(long qid) {
+    return syscall(Sys::eq_alert, static_cast<u64>(qid));
+}
+
 long eq_kick(long qid) {
     return syscall(Sys::eq_kick, static_cast<u64>(qid));
 }
@@ -78,12 +88,13 @@ u32 eq_drive(long qid, void* base, void (*cb)(const EqEvent&)) {
     u32 nchunks = ld32(h + 8);
     u64 cons = ld64(h + 24);
     u32 processed = 0;
+    u32 idx = static_cast<u32>(cons % nchunks);
 
     for (;;) {
-        volatile u8* ch = chunk(b, chunk_size, cons % nchunks);
+        volatile u8* ch = chunk(b, chunk_size, idx);
         u32 progress = ld32(ch + 4);
         u32 valid = progress & ~EQ_FULL;
-        u32 off = static_cast<u32>(ld64(h + 32));
+        u32 off = static_cast<u32>(ld64(h + 40));
         bool closed = (progress & EQ_FULL) != 0;
 
         while (off + EQ_ELEM_HDR <= valid) {
@@ -102,19 +113,40 @@ u32 eq_drive(long qid, void* base, void (*cb)(const EqEvent&)) {
         }
 
         if (closed && off == valid) {
-            // chunk fully consumed: release credit, then wake the producer
+            // chunk fully consumed: return it to the pool, release credit,
+            // then follow the producer's chain to the next chunk
+            u32 next = ld32(ch + 0);
             ++cons;
             st64(h + 24, cons);
-            st64(h + 32, 0);
+            st64(h + 40, 0);
+            st32(ch + 4, 0);
             eq_kick(qid);
-            continue; // the next chunk may already hold data
+            if (next >= nchunks) {
+                break; // broken chain: stop, the kernel flags the channel
+            }
+            idx = next;
+            continue;
         }
         // open chunk with no new bytes: remember the read position and let
         // the caller sleep on the doorbell
-        st64(h + 32, off);
+        st64(h + 40, off);
         break;
     }
     return processed;
+}
+
+u32 eq_errors(void* base, u32* code) {
+    volatile u8* h = static_cast<volatile u8*>(base);
+    u32 notify = ld32(h + 12);
+    if ((notify & EQ_NOTIFY_ERROR) == 0) {
+        return ld32(h + 36);
+    }
+    if (code != nullptr) {
+        *code = ld32(h + 32);
+    }
+    // consumer clears the bit after reading; the count keeps history
+    st32(h + 12, notify & ~EQ_NOTIFY_ERROR);
+    return ld32(h + 36);
 }
 
 }

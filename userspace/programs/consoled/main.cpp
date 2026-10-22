@@ -11,7 +11,7 @@ using namespace shz;
 namespace {
 
 // 8 chunks x 256 bytes is plenty for key events
-static unsigned char eqmem[40 + 8 * 256] __attribute__((aligned(8)));
+static unsigned char eqmem[48 + 8 * 256] __attribute__((aligned(8)));
 
 void on_event(const EqEvent& ev) {
     if (ev.opcode == EQ_OP_BOOT) {
@@ -52,6 +52,10 @@ int main() {
     println("[consoled] queue ", static_cast<u64>(q), " is the kernel sink");
     for (;;) {
         eq_drive(q, eqmem, on_event);
+        u32 ecode = 0;
+        if (eq_errors(eqmem, &ecode) > 0) {
+            println("[console] eq error channel: code ", static_cast<u64>(ecode));
+        }
         if (eq_wait(q) < 0) {
             // queue gone or spurious wake: pause, then retry
             for (int i = 0; i < 1000; ++i) {

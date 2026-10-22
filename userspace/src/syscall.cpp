@@ -40,9 +40,13 @@ long guest_create(u64 pages) {
     return syscall(Sys::guest_create, pages);
 }
 
-long vcpu_run(long handle, u64* out) {
+long guest_map(long handle, u64 count) {
+    return syscall(Sys::guest_map, static_cast<u64>(handle), count);
+}
+
+long vcpu_run(long handle, VcpuExit* ve) {
     return syscall(Sys::vcpu_run, static_cast<u64>(handle),
-                   reinterpret_cast<u64>(out));
+                   reinterpret_cast<u64>(ve));
 }
 
 long guest_destroy(long handle) {

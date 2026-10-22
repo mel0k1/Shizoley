@@ -252,13 +252,34 @@ guest_destroy` за syscalls 15/16/17.
 - [x] P1: FEATURE_CONTROL (0x3A) read/lock-check в `enter_root` — v0.8.0.
 - [x] P1: gate на `IA32_VMX_BASIC[55]` перед `adjust_ctl` — v0.8.0.
 - [x] P1: timer-exit → stop гостя → планировщик (справедливость) — v0.8.0.
-- [ ] P2: MSR bitmap + passthrough; vAPIC; preemption timer; VPID;
-      GUEST_MAP/GUEST_UNMAP + invept; двусторонний контракт выхода.
+- [x] P2: MSR bitmap (все доступы — выход; чтение TSC — passthrough;
+      RDMSR/WRMSR эмулируются для APIC-base/EFER, остальное — #GP с длиной
+      сбойной инструкции из `VM_EXIT_INSTRUCTION_LEN`) — v0.9.0.
+- [x] P2: vAPIC — GPA `0xFEE00000` мапится в EPT на apic-access кадр,
+      VMCS: `VIRTUAL_APIC 0x2012` + `APIC_ACCESS 0x2014` + TPR-threshold;
+      proc2: virtualize-APIC-accesses + APIC-register-virtualization,
+      proc: TPR-shadow (зависимости битов согласованы с adjust_ctl) — v0.9.0.
+- [x] P2: VPID — тег = id гостя (никогда не 0), гейт по
+      `IA32_VMX_EPT_VPID_CAP[32]`, all-context INVVPID на destroy;
+      INVEPT all-context после GUEST_MAP и destroy — v0.9.0.
+- [x] P2: GUEST_MAP (syscall 21) — рост живого гостя: кадры + EPT-листья
+      (+новые PT при переходе 512-границы) + окно создателя, откат на
+      любом сбое — v0.9.0. GUEST_UNMAP — не делался (не просилось).
+- [x] P2: двусторонний VcpuExit — буфер 40×u64: ядро пишет 20×u64 выхода,
+      ring 3 пишет флаги/инжекцию (raw vm-entry interruption-info + err +
+      len с валидацией)/16 GPR; vmcall поглощается (rip advance) — v0.9.0.
+      gdemo: загрузка GPR + инжекция int 0x20 с IVT-обработчиком.
+- [ ] P3: preemption timer, 2 MiB-листья EPT, posted interrupts.
 
 **eq.rs / caps**
-- [ ] P2: отдельный error-канал + alert-бит отмены ожидания (по образцу
-      `kUserNotifyError`/`kHelAlertQueue`).
-- [ ] P2: чанковая очередь v2 (снимает класс багов lap/FULL).
+- [x] P2: error-канал — head+32 error_code (первый код: E_DROP/E_CLOSED/
+      E_PROTO), head+36 err_count, notify-бит ERROR; eq_wait -> 3 при
+      ошибке без событий — v0.9.0.
+- [x] P2: alert — eq_alert(22) с правом SIGNAL (0x10): notify-бит ALERT,
+      все припаркованные wait просыпаются с 2; fast-path в wait — v0.9.0.
+- [x] P2: чанковая очередь v2 — producer-chain (FULL + next), консьюмер
+      идёт по цепочке и возвращает чанки (progress=0); класс багов
+      lap/FULL снят — v0.9.0 (заголовок 48 Б, магия "ZHv2").
 - [ ] P2: zero-copy больших событий: общие кадры + handle в событии.
 - [ ] P2: слить права caps с capability-qid планом (per-op права).
 

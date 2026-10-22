@@ -139,7 +139,7 @@ cd kernel && cargo run
 qemu-system-x86_64 -drive format=raw,file=target/x86_64-paparaci/debug/bootimage-paparaci.bin -serial stdio
 ```
 
-Полный круг гипервизора проверяется только под KVM: `make run-kvm` (это `-enable-kvm -cpu host` — VMX/EPT пробрасываются в Paparaci, гость L2 печатает «VEDA VMX OK» в serial). Под чистым TCG ядро честно рапортует `vmx unavailable` — этот graceful-путь и проверяет CI. Изоляция гостя (по итогам сравнения с managarm/Veda, см. `docs/`): порты гостя перехватываются полностью, VMXE под маской, таймер-выход отдаёт cpu планировщику. Подробное сравнение нашей реализации с managarm/Veda: `docs/managarm-veda-vs-paparaci.md`.
+Полный круг гипервизора проверяется только под KVM: `make run-kvm` (это `-enable-kvm -cpu host` — VMX/EPT пробрасываются в Paparaci, гость L2 печатает «VEDA VMX OK» в serial). Под чистым TCG ядро честно рапортует `vmx unavailable` — этот graceful-путь и проверяет CI. Слой P2: MSR bitmap (чтение TSC проходит напрямую, остальное — выход; RDMSR/WRMSR эмулируются для APIC-base/EFER, остальное — #GP с корректной длиной сбойной инструкции), vAPIC (GPA `0xFEE00000` гостя — virtual-APIC страница за EPT: TPR-shadow и APIC-register virtualization без реального LAPIC), VPID (тегированный TLB на гостя, INVVPID/INVEPT на разрушении/росте), `GUEST_MAP` растит живого гостя (+EPT+окно, INVEPT), а `vcpu_run` **двусторонний**: ядро пишет 20×u64 выходной информации, ring 3 перед следующим входом может переопределить GPR и инжектировать событие (extint/NMI/исключение) — gdemo доказывает это загрузкой GPR и инжекцией int 0x20 с обработчиком в IVT. Изоляция гостя (по итогам сравнения с managarm/Veda, см. `docs/`): порты гостя перехватываются полностью, VMXE под маской, таймер-выход отдаёт cpu планировщику. Подробное сравнение нашей реализации с managarm/Veda: `docs/managarm-veda-vs-paparaci.md`.
 
 Ядро бутится, поднимает heap и MSR, затем планировщик: `main` становится задачей 0, рядом стартует kernel-поток `heartbeat` (доказывает, что вытеснение живёт, пока init блокирован в IPC). Параллельно build.rs кладёт все `programs/*` в ustar-initrd, вшитый в ядро; `spawn_process("init")` находит образ, `elf.rs` раскладывает его в **свежее адресное пространство** (свой CR3) и ставит процесс в очередь. Дальше init в ring 3:
 
@@ -165,19 +165,21 @@ Page fault из ring 3 убивает только провинившуюся з
 | 7  | `gettid`        | —                                      | tid текущего потока                        |
 | 8  | `eq_setup`      | `rdi`: база, `rsi`: размер             | зарегистрировать event queue, -> qid       |
 | 9  | `eq_post`       | `rdi`: qid, `rsi`: opcode, `rdx`: buf, `r10`: len | элемент в очередь + doorbell      |
-| 10 | `eq_wait`       | `rdi`: qid                             | спать до doorbell, -> 1                    |
+| 10 | `eq_wait`       | `rdi`: qid                             | спать до doorbell, -> 1 события \| 2 alert \| 3 ошибка канала |
 | 11 | `eq_kick`       | `rdi`: qid                             | отдать chunk-кредит припаркованным постерам |
 | 12 | `initrd_size`   | —                                      | размер initrd (RO-маппинг на 0x20000000)   |
 | 13 | `write`         | `rdi`: buf, `rsi`: len                 | атомарная строка в консоль (vga+serial)    |
 | 14 | `kill`          | `rdi`: pid                             | погасить все потоки процесса, -> 0 \| -1   |
 | 15 | `guest_create`  | `rdi`: страницы                        | VMCS + EPT + окно RAM, -> handle           |
-| 16 | `vcpu_run`      | `rdi`: handle, `rsi`: out (20×u64)     | войти в гостя, -> причина vmexit (1 = внешнее прерывание, просто перезапустите vcpu_run) |
+| 16 | `vcpu_run`      | `rdi`: handle, `rsi`: буфер (40×u64)   | войти в гостя, -> причина vmexit; ядро пишет 20×u64 (reason/rip/qual/gpa/gprs), ring 3 пишет управляющую половину (флаги, инжекция события, gprs) |
 | 17 | `guest_destroy` | `rdi`: handle                          | освободить RAM/EPT/VMCS, -> 0              |
 | 18 | `eq_listen`     | `rdi`: qid                             | сделать очередь приёмником событий ядра (LISTEN) |
 | 19 | `eq_grant`      | `rdi`: qid, `rsi`: pid, `rdx`: права   | владелец выдаёт права на qid               |
 | 20 | `eq_revoke`     | `rdi`: qid, `rsi`: pid                 | владелец забирает права                    |
+| 21 | `guest_map`     | `rdi`: handle, `rsi`: страницы         | вырастить RAM гостя (+EPT+окно), -> новый размер |
+| 22 | `eq_alert`      | `rdi`: qid                             | отменить припаркованный eq_wait (SIGNAL), -> 0 |
 
-Права на qid (bitmask): `POST=1`, `WAIT=2`, `KICK=4`, `LISTEN=8`; владелец очереди держит их все неявно.
+Права на qid (bitmask): `POST=1`, `WAIT=2`, `KICK=4`, `LISTEN=8`, `SIGNAL=16`; владелец очереди держит их все неявно.
 
 Конвенция: номер в `rax`, аргументы в `rdi`, `rsi`, `rdx`, результат в `rax`.
 
@@ -278,6 +280,7 @@ The kernel is named after paparazzi for a reason: Paparaci watches everything ha
 - [x] initrd: ustar archive built by build.rs from programs/*, spawn by name
 - [x] Mailbox IPC: ipc_send/ipc_recv with blocking receiver and direct handoff
 - [x] Event queue: managarm-style kernel->process queue in user memory (doorbell, chunk credits, eq_wait/eq_kick)
+- [x] Event queue v2: producer-chained chunks (FULL + next, no lap/FULL ambiguity), error channel in the head (drop/closed/proto codes + count), eq_alert(22) cancels a parked eq_wait (SIGNAL right)
 - [x] Ring 3 services: fsd (initrd files over mailbox) and rtcd (CMOS clock via ports 0x70/0x71, IOPL=3)
 - [x] initrd shared read-only into every process (0x20000000), parsed in user space
 - [x] Safe user-memory handling: read/write copies check USER/WRITABLE on every leaf; kernel frames (initrd) carry BIT_9 and are never handed out
@@ -286,10 +289,11 @@ The kernel is named after paparazzi for a reason: Paparaci watches everything ha
 - [x] ELF error handling: full header/bounds/segment-overlap/entry validation; on failure the loader rolls back and returns every frame
 - [x] IPC edge cases: an undeliverable message fails the syscall instead of parking forever; kick is owner-only; queue memory ranges may not overlap
 - [x] Keyboard/console as processes: kbd IRQ -> event queue (eq_listen), consoled renders in ring 3
-- [x] Capability rights on qid: POST/WAIT/KICK/LISTEN, granted by the owner via eq_grant(19)/eq_revoke(20)
+- [x] Capability rights on qid: POST/WAIT/KICK/LISTEN/SIGNAL, granted by the owner via eq_grant(19)/eq_revoke(20)
 - [x] Hypervisor the Veda way: VMCS + vcpu + EPT, GUEST_CREATE/VCPU_RUN/GUEST_DESTROY syscalls (unrestricted real-mode guest, vmcall as the exit door)
 - [x] Guest isolation: UNCONDITIONAL_IO_EXITING — guest in/out never reach the real PIC/PIT/keyboard, IO exits go to the monitor (port in out[3]); CR4.VMXE behind a guest/host mask — a guest cannot drop VMXE and escape the EPT walk; FEATURE_CONTROL and true-CTLS MSRs are checked before vmxon
 - [x] Scheduler fairness under a guest: a timer exit stops the guest and hands the cpu back to the scheduler, the monitor simply re-enters via vcpu_run (vmresume)
+- [x] P2 virtualization: MSR bitmap (TSC pass-through, emulated APIC-base/EFER, #GP with fault length), vAPIC (virtual-APIC page behind EPT at 0xFEE00000, TPR shadow, APIC-register virtualization), VPID (per-guest tag, INVVPID/INVEPT on teardown), GUEST_MAP(21) grows a live guest (EPT + window + INVEPT), two-way VcpuExit (ring 3 loads GPRs and injects extint/NMI/exception back into the guest)
 
 ### Build & run
 
@@ -306,7 +310,7 @@ cmake --build userspace/build
 cd kernel && cargo run   # boot in QEMU
 ```
 
-The full hypervisor round trip only works under KVM: `make run-kvm` (that is `-enable-kvm -cpu host` — VMX/EPT are passed through to Paparaci, the L2 guest prints "VEDA VMX OK" on serial). Under plain TCG the kernel honestly reports `vmx unavailable` — that graceful path is what CI checks. A detailed comparison of our implementation against managarm/Veda: `docs/managarm-veda-vs-paparaci.md`.
+The full hypervisor round trip only works under KVM: `make run-kvm` (that is `-enable-kvm -cpu host` — VMX/EPT are passed through to Paparaci, the L2 guest prints "VEDA VMX OK" on serial). Under plain TCG the kernel honestly reports `vmx unavailable` — that graceful path is what CI checks. P2 hypervisor layer: MSR bitmap (TSC read passes through, everything else exits — RDMSR/WRMSR are emulated for APIC-base/EFER, unknown MSR gets a #GP with the correct fault length), vAPIC (guest GPA `0xFEE00000` is a virtual-APIC page behind EPT: TPR-shadow and APIC-register virtualization serve mmio without a real LAPIC), VPID (tagged TLB per guest, all-context INVVPID/INVEPT on destroy/map), `GUEST_MAP` grows a live guest (+EPT+window, INVEPT after), and `vcpu_run` is **two-way**: the kernel writes 20×u64 of exit info, ring 3 writes back GPR overrides and an event injection (extint/NMI/exception) for the next entry — gdemo proves it by loading a GPR and injecting int 0x20 with a real-mode IVT handler. A detailed comparison of our implementation against managarm/Veda: `docs/managarm-veda-vs-paparaci.md`.
 
 The kernel boots, sets up the heap and MSRs, then hands control to the scheduler: `main` becomes task 0, and a kernel thread `heartbeat` starts next to it (proving preemption keeps running while init blocks in IPC). Meanwhile build.rs packs every `programs/*` into a ustar initrd embedded into the kernel; `spawn_process("init")` looks the image up, `elf.rs` lays it out into a **fresh address space** (its own CR3) and queues the process. Then init runs in ring 3:
 
@@ -314,7 +318,7 @@ The kernel boots, sets up the heap and MSRs, then hands control to the scheduler
 - calls `spawn("hello")` — the kernel loads the second ELF from the initrd into a separate process (pid 2) and runs a mailbox ping-pong with it;
 - brings up **ring 3 services**: `fsd` (serves the `motd` file from the read-only initrd mapping over the mailbox) and `rtcd` (reads the CMOS clock through ports 0x70/0x71 — IOPL=3);
 - starts **consoled** — the keyboard/console as a process: it registers its queue as the kernel event sink (`eq_listen`), the kbd IRQ posts `[scancode, ascii]` events, and the boot ping proves the pipe;
-- runs **gdemo** — the Veda-approach smoke: `guest_create` builds VMCS + EPT + a 1 MiB ram window, a 16-bit blob writes text into its own "VGA" through the EPT and stops itself with a `vmcall`; on machines without VT-x the kernel refuses politely;
+- runs **gdemo** — the Veda-approach smoke: `guest_create` builds VMCS + EPT + a 1 MiB ram window, `guest_map` grows it by one page, a 16-bit blob writes text into its own "VGA" through the EPT, reads the mapped page after a GPR override and takes an injected int 0x20; on machines without VT-x the kernel refuses politely;
 - grants hello the `POST` right on its queue (`eq_grant`) and consumes hello's 100 events with plain loads, sleeping on the doorbell between batches;
 - when the last thread of a process exits, the reaper tears the process down: address-space frames go back to the bitmap pool, its queues close, its capability grants vanish.
 
@@ -334,19 +338,21 @@ A page fault (or #GP/#UD) from ring 3 kills only the offending process — the k
 | 7  | `gettid`        | —                                           | tid of the current thread                          |
 | 8  | `eq_setup`      | `rdi`: base, `rsi`: size                    | register an event queue, -> qid                    |
 | 9  | `eq_post`       | `rdi`: qid, `rsi`: opcode, `rdx`: buf, `r10`: len | element into the queue + doorbell             |
-| 10 | `eq_wait`       | `rdi`: qid                                  | sleep until the doorbell, -> 1                     |
+| 10 | `eq_wait`       | `rdi`: qid                                  | sleep until the doorbell, -> 1 events \| 2 alert \| 3 channel error |
 | 11 | `eq_kick`       | `rdi`: qid                                  | hand chunk credit to parked posters                |
 | 12 | `initrd_size`   | —                                           | initrd size (RO-mapped at 0x20000000)              |
 | 13 | `write`         | `rdi`: buf, `rsi`: len                      | atomic console line (vga+serial)                   |
 | 14 | `kill`          | `rdi`: pid                                  | end every thread of the process, -> 0 \| -1        |
 | 15 | `guest_create`  | `rdi`: pages                                | VMCS + EPT + ram window, -> handle                 |
-| 16 | `vcpu_run`      | `rdi`: handle, `rsi`: out (20×u64)          | enter the guest, -> vmexit reason (1 = external interrupt, just re-enter) |
+| 16 | `vcpu_run`      | `rdi`: handle, `rsi`: buffer (40×u64)       | enter the guest, -> vmexit reason; the kernel writes 20×u64 (reason/rip/qual/gpa/gprs), ring 3 writes the control half (flags, event injection, gprs) |
 | 17 | `guest_destroy` | `rdi`: handle                               | free ram/ept/vmcs, -> 0                            |
 | 18 | `eq_listen`     | `rdi`: qid                                  | make the queue the kernel event sink (LISTEN)      |
 | 19 | `eq_grant`      | `rdi`: qid, `rsi`: pid, `rdx`: rights       | the owner hands out qid rights                     |
 | 20 | `eq_revoke`     | `rdi`: qid, `rsi`: pid                      | the owner takes rights back                        |
+| 21 | `guest_map`     | `rdi`: handle, `rsi`: pages                 | grow guest ram (+EPT+window), -> new size          |
+| 22 | `eq_alert`      | `rdi`: qid                                  | cancel a parked eq_wait (SIGNAL), -> 0             |
 
-qid rights (bitmask): `POST=1`, `WAIT=2`, `KICK=4`, `LISTEN=8`; the queue owner holds all of them implicitly.
+qid rights (bitmask): `POST=1`, `WAIT=2`, `KICK=4`, `LISTEN=8`, `SIGNAL=16`; the queue owner holds all of them implicitly.
 
 Convention: number in `rax`, args in `rdi`, `rsi`, `rdx`, result in `rax`.
 
@@ -376,7 +382,7 @@ Apache-2.0 — see [LICENSE](LICENSE).
 
 ## Event queue (managarm's HelQueue, adapted)
 
-The queue lives in **user memory**: a ring of chunks with the kernel as producer and the process as consumer. Elements (opcode, sender, payload) are written straight into the chunks through the physmap; the consumer reads them with **plain loads, no syscall per element**, entering the kernel only to sleep on the doorbell (`eq_wait`) or to hand back chunk credit (`eq_kick` after `cons_seq++`). A producer that runs a full lap ahead of the consumer parks until the kick — backpressure without spinning. The data path between doorbells costs zero syscalls, exactly how HelQueue carries async syscall completions in managarm.
+The queue lives in **user memory** (v2): a chain of chunks with the kernel as producer and the process as consumer. Elements (opcode, sender, payload) are written straight into the chunks through the physmap; the producer chains a closed chunk to the next one (FULL + `next`), the consumer follows the chain with **plain loads, no syscall per element**, and returns chunks by zeroing their progress word. The head carries a notify word (`EVENT`/`ALERT`/`ERROR` bits) and an error channel (first error code + count: dropped kernel events, closed queue, producer protocol violations). `eq_alert` (SIGNAL right) cancels a parked `eq_wait` — the waiter wakes with 2 instead of blocking until real events show up. A producer that runs a full lap ahead of the consumer parks until the kick — backpressure without spinning. The data path between doorbells costs zero syscalls, exactly how HelQueue carries async syscall completions in managarm.
 
 ## Services in ring 3
 
@@ -386,7 +392,7 @@ The queue lives in **user memory**: a ring of chunks with the kernel as producer
 
 ## Hypervisor begin (Veda-style)
 
-`vmx.rs` is the Veda-style heart: after `vmxon` the kernel arms `GUEST_CREATE(15)`/`VCPU_RUN(16)`/`GUEST_DESTROY(17)`. `guest_create` builds a VMCS (unrestricted real-mode entry, external-int/NMI exiting, #UD/#GP interception, MSR exits answered with #GP), a 4-level EPT shadowing freshly allocated guest ram, and maps that ram into the creator's address space at `0x30000000` so ring 3 can load images and read results. `vcpu_run` launches/resumes the vcpu on the task's kernel stack; the exit stub saves guest GPRs, EOIs host interrupts that were acked by the cpu, injects #GP for MSR snoopers and returns reportable exits (vmcall, hlt, cpuid, io, ept violation, exceptions) to ring 3 with 20 u64s of exit info. `guest_destroy` unmaps the window and returns every frame to the pool. Guest isolation (found by the managarm/Veda comparison, see `docs/`): all guest `in`/`out` exits unconditionally (the real PIC/PIT/keyboard are unreachable), `CR4.VMXE` sits behind a guest/host mask with the read shadow set, and `enter_root` validates `IA32_FEATURE_CONTROL` and gates the true-CTLS MSRs on `IA32_VMX_BASIC[55]`. A timer exit stops the guest instead of resuming it in vmx-root, so the scheduler stays fair. Under QEMU TCG VT-x is not exposed — the demo honestly reports "vmx unavailable"; with `-enable-kvm -cpu host` the full round trip works.
+`vmx.rs` is the Veda-style heart: after `vmxon` the kernel arms `GUEST_CREATE(15)`/`VCPU_RUN(16)`/`GUEST_MAP(21)`/`GUEST_DESTROY(17)`. `guest_create` builds a VMCS (unrestricted real-mode entry, external-int/NMI exiting, #UD/#GP interception), a 4-level EPT shadowing freshly allocated guest ram plus a virtual-APIC page at GPA `0xFEE00000`, and maps that ram into the creator's address space at `0x30000000` so ring 3 can load images and read results. Controls: MSR bitmap (TSC read passes through, other MSR access exits; RDMSR/WRMSR are emulated for APIC-base/EFER, anything else takes a #GP with the faulting-instruction length so guest handlers can skip it), VPID (unique per guest, INVVPID/INVEPT all-context on teardown), TPR shadow + APIC-register virtualization behind capability checks. `vcpu_run` launches/resumes the vcpu on the task's kernel stack; the exit stub saves guest GPRs, EOIs host interrupts that were acked by the cpu, and returns reportable exits (vmcall — rip advanced, hlt, io, ept violation, apic access, exceptions) to ring 3 with 20×u64 of exit info; before the next entry ring 3 may **override GPRs and inject an event** (extint/NMI/exception with error code and length) — the two-way exit. `guest_map` grows a live guest (new frames + EPT leaves + window, INVEPT after); `guest_destroy` unmaps the window and returns every frame to the pool. Guest isolation (found by the managarm/Veda comparison, see `docs/`): all guest `in`/`out` exits unconditionally (the real PIC/PIT/keyboard are unreachable), `CR4.VMXE` sits behind a guest/host mask with the read shadow set, and `enter_root` validates `IA32_FEATURE_CONTROL` and gates the true-CTLS MSRs on `IA32_VMX_BASIC[55]`. A timer exit stops the guest instead of resuming it in vmx-root, so the scheduler stays fair. Under QEMU TCG VT-x is not exposed — the demo honestly reports "vmx unavailable"; with `-enable-kvm -cpu host` the full round trip works.
 
 ### Roadmap
 

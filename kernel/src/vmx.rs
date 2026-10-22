@@ -32,6 +32,16 @@ const IA32_VMX_TRUE_PIN: u32 = 0x48D;
 const IA32_VMX_TRUE_PROC: u32 = 0x48E;
 const IA32_VMX_TRUE_EXIT: u32 = 0x48F;
 const IA32_VMX_TRUE_ENTRY: u32 = 0x490;
+const IA32_VMX_EPT_VPID_CAP: u32 = 0x48C;
+
+// ept_vpid_cap bits: 32 = invvpid exists (vpid usable), 26 = all-context invept
+const EPTVPID_VPID: u64 = 1 << 32;
+const EPTVPID_INVEPT_ALL: u64 = 1 << 26;
+
+// gpr slots in the Vcpu layout (see OFF_G_* below; rsp lives in the vmcs)
+const IDX_RAX: usize = 0;
+const IDX_RCX: usize = 2;
+const IDX_RDX: usize = 3;
 
 // vmcs field encodings (sdm vol 3d tables 25-x)
 const GUEST_ES_SEL: u64 = 0x0800;
@@ -87,6 +97,11 @@ const VMX_EXCEPTION_BITMAP: u64 = 0x4004;
 const VMX_EXIT_CTLS: u64 = 0x400C;
 const VMX_ENTRY_CTLS: u64 = 0x4012;
 const VMX_MSR_BITMAPS: u64 = 0x2004;
+const VMX_VPID: u64 = 0x0000;
+const VMX_VIRTUAL_APIC: u64 = 0x2012;
+const VMX_APIC_ACCESS: u64 = 0x2014;
+const VMX_TPR_THRESHOLD: u64 = 0x401E;
+const VM_EXIT_INSTRUCTION_LEN: u64 = 0x440C;
 const VMX_CR4_GUEST_HOST_MASK: u64 = 0x4002;
 const VMX_CR4_READ_SHADOW: u64 = 0x4006;
 const VMX_EPTP: u64 = 0x201A;
@@ -126,11 +141,22 @@ const HOST_RIP: u64 = 0x6C16;
 
 // exit reasons we act on
 const R_EXTERNAL_INT: u64 = 1;
+const R_VMCALL: u64 = 18;
 const R_RDMSR: u64 = 31;
 const R_WRMSR: u64 = 32;
 const R_IO: u64 = 30;
+const R_APIC_ACCESS: u64 = 44;
 const R_EPT_VIOLATION: u64 = 49;
 const R_EPT_MISCONFIG: u64 = 50;
+
+// guest-visible apic page (the vAPIC shadow the cpu serves mmio from)
+const APIC_GPA: u64 = 0xFEE0_0000;
+const APIC_BASE_MSR: u32 = 0x1B;
+const GUEST_EFER_MSR: u32 = 0xC000_0080;
+
+// msr bitmap: 4 pages — read low / read high / write low / write high;
+// bit set = vm exit, bit clear = pass straight through to the real msr
+const MSR_BM_RD_LOW: usize = 0x000;
 
 // ---------------------------------------------------------------- vcpu
 
@@ -153,7 +179,7 @@ struct Guest {
     id: u64,
     owner_pid: u64,
     ram: Vec<PhysFrame<Size4KiB>>,
-    tables: Vec<PhysFrame<Size4KiB>>, // ept pml4 + pdpt + pd + pts
+    tables: Vec<PhysFrame<Size4KiB>>, // ept pml4+pdpt+pd+pts + apic pd/pt/access/vapic
     vmcs: PhysFrame<Size4KiB>,
     exit_stack: Box<ExitStack>,
     vcpu: Vcpu,
@@ -162,6 +188,12 @@ struct Guest {
 
 static GUESTS: Mutex<Vec<Guest>> = Mutex::new(Vec::new());
 static NEXT_GUEST: AtomicU64 = AtomicU64::new(1);
+
+// p2 machinery, probed once at init:
+// msr bitmap phys (tsc reads pass through, everything else exits)
+static MSR_BM: Once<u64> = Once::new();
+static VPID_OK: AtomicBool = AtomicBool::new(false);
+static INVEPT_OK: AtomicBool = AtomicBool::new(false);
 
 // asm-visible state (single core: one guest runs at a time)
 #[no_mangle]
@@ -340,10 +372,39 @@ extern "C" fn vmx_after_exit(vcpu: *mut Vcpu) -> u64 {
             }
             0
         }
-        R_RDMSR | R_WRMSR => {
-            // the guest may not touch msrs: inject #gp
-            inject_gp();
+        R_RDMSR => {
+            let msr = (vcpu.gprs[IDX_RCX] & 0xFFFF_FFFF) as u32;
+            match emulate_rdmsr(msr) {
+                Some(val) => {
+                    vcpu.gprs[IDX_RAX] = val & 0xFFFF_FFFF;
+                    vcpu.gprs[IDX_RDX] = val >> 32;
+                    advance_rip();
+                }
+                None => inject_gp(),
+            }
             0
+        }
+        R_WRMSR => {
+            let msr = (vcpu.gprs[IDX_RCX] & 0xFFFF_FFFF) as u32;
+            let val = (vcpu.gprs[IDX_RDX] << 32) | (vcpu.gprs[IDX_RAX] & 0xFFFF_FFFF);
+            if emulate_wrmsr(msr, val) {
+                advance_rip();
+            } else {
+                inject_gp();
+            }
+            0
+        }
+        R_VMCALL => {
+            // hypercall: consumed, not re-executed — rip moves past it so a
+            // re-enter continues the guest instead of looping on vmcall
+            advance_rip();
+            let qual = 0;
+            vcpu.out[0] = reason;
+            vcpu.out[1] = vmread(GUEST_RIP);
+            vcpu.out[2] = qual;
+            vcpu.out[3] = 0;
+            vcpu.out[4..20].copy_from_slice(&vcpu.gprs);
+            1
         }
         _ => {
             let qual = vmread(VM_EXIT_QUALIFICATION);
@@ -356,6 +417,9 @@ extern "C" fn vmx_after_exit(vcpu: *mut Vcpu) -> u64 {
                 // io exit: the guest tried a real port; it stays blocked —
                 // qualification bits 31:16 carry the port number
                 (qual >> 16) & 0xFFFF
+            } else if reason == R_APIC_ACCESS {
+                // apic-access exit: the offset inside the apic page
+                qual
             } else {
                 0
             };
@@ -365,11 +429,39 @@ extern "C" fn vmx_after_exit(vcpu: *mut Vcpu) -> u64 {
     }
 }
 
+// ring-3 visible msr reads; everything else is the guest's problem (#gp)
+fn emulate_rdmsr(msr: u32) -> Option<u64> {
+    match msr {
+        APIC_BASE_MSR => Some(APIC_GPA | 0x800), // enabled, at the standard page
+        GUEST_EFER_MSR => Some(vmread(GUEST_EFER)),
+        _ => None,
+    }
+}
+
+// efer is the one msr a guest may set; only the benign bits pass, the
+// rest is masked off so lma/lme games cannot break vm-entry state
+fn emulate_wrmsr(msr: u32, val: u64) -> bool {
+    if msr != GUEST_EFER_MSR {
+        return false;
+    }
+    vmwrite(GUEST_EFER, val & 0x801); // sce | nxe
+    true
+}
+
+fn advance_rip() {
+    let len = vmread(VM_EXIT_INSTRUCTION_LEN);
+    let rip = vmread(GUEST_RIP);
+    vmwrite(GUEST_RIP, rip + len);
+}
+
 fn inject_gp() {
-    // hardware exception #gp, error code valid, value 0
+    // hardware exception #gp, error code valid, value 0; the faulting
+    // instruction length travels along so the guest handler can skip it
+    // instead of iret'ing right back into the same rdmsr/wrmsr
+    let len = vmread(VM_EXIT_INSTRUCTION_LEN);
     vmwrite(VM_ENTRY_INTR_INFO, 0x8000_0B0D);
     vmwrite(VM_ENTRY_EXCEPTION_ERR_CODE, 0);
-    vmwrite(VM_ENTRY_INSTRUCTION_LEN, 0);
+    vmwrite(VM_ENTRY_INSTRUCTION_LEN, len);
 }
 
 // ---------------------------------------------------------------- vmcs io
@@ -478,16 +570,40 @@ pub fn init() {
         Ok(rev) => {
             let (ept, ept_cap, urg) = probe_ept();
             if ept && ept_cap && urg {
+                // msr bitmap: start all-ones (every access exits), then let
+                // exactly one benign read through — the tsc. writes never
+                // pass: a guest must not reach the host's real msrs
+                let mut msr_armed = false;
+                if let Some(f) = memory::alloc_frame() {
+                    let v = memory::phys_to_virt(f.start_address());
+                    unsafe {
+                        core::ptr::write_bytes(v.as_mut_ptr::<u8>(), 0xFF, 0x1000);
+                        // rdmsr(0x10): page 0 (read low), byte 2, bit 0
+                        let p = v.as_mut_ptr::<u8>();
+                        *p.add(MSR_BM_RD_LOW + 2) &= !1;
+                    }
+                    MSR_BM.call_once(|| f.start_address().as_u64());
+                    msr_armed = true;
+                }
+                let caps = unsafe { Msr::new(IA32_VMX_EPT_VPID_CAP).read() };
+                VPID_OK.store(caps & EPTVPID_VPID != 0, Ordering::Relaxed);
+                INVEPT_OK.store(caps & EPTVPID_INVEPT_ALL != 0, Ordering::Relaxed);
                 VMX_READY.call_once(|| {});
                 serial_println!(
-                    "[vmx] on: rev {:#x} ept {} urg {} — guest_create/vcpu_run armed",
+                    "[vmx] on: rev {:#x} ept {} urg {} msrbm {} vpid {} — guest_create/vcpu_run armed",
                     rev,
                     ept,
-                    urg
+                    urg,
+                    msr_armed,
+                    VPID_OK.load(Ordering::Relaxed)
                 );
                 println!(
-                    "[vmx] on: rev {:#x} ept {} urg {} — vm armed",
-                    rev, ept, urg
+                    "[vmx] on: rev {:#x} ept {} urg {} msrbm {} vpid {} — vm armed",
+                    rev,
+                    ept,
+                    urg,
+                    msr_armed,
+                    VPID_OK.load(Ordering::Relaxed)
                 );
             } else {
                 serial_println!(
@@ -596,6 +712,44 @@ fn vmxon(region_phys: u64) -> bool {
     cf == 0
 }
 
+// all-context tlb invalidations; best-effort: a missing capability leaves
+// the flag clear and the callers skip the call entirely
+#[repr(C, align(16))]
+struct InveptDesc([u64; 2]);
+
+fn invept_all(eptp: u64) {
+    if !INVEPT_OK.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut d = InveptDesc([eptp & !0xFFF, 0]);
+    unsafe {
+        asm!(
+            "invept {t}, [{p}]",
+            t = in(reg) 2u64, // all-context
+            p = in(reg) &mut d as *mut InveptDesc,
+            options(nostack)
+        );
+    }
+}
+
+#[repr(C, align(16))]
+struct InvvpidDesc([u64; 2]);
+
+fn invvpid_all() {
+    if !VPID_OK.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut d = InvvpidDesc([0, 0]);
+    unsafe {
+        asm!(
+            "invvpid {t}, [{p}]",
+            t = in(reg) 2u64, // all-context
+            p = in(reg) &mut d as *mut InvvpidDesc,
+            options(nostack)
+        );
+    }
+}
+
 // ---------------------------------------------------------------- ept
 
 const EPT_R: u64 = 1;
@@ -625,6 +779,8 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
     if cur.proc.id != owner_pid {
         return -1;
     }
+    // reserved up front: the id doubles as the non-zero vpid
+    let id = NEXT_GUEST.fetch_add(1, Ordering::AcqRel);
 
     // guest ram
     let mut ram = Vec::new();
@@ -640,10 +796,11 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
         }
     }
 
-    // ept tables: pml4 + pdpt + pd + pts
+    // ept tables: pml4 + pdpt + pd + pts, then 2 pages for the apic page
+    // tables and 2 data pages (apic-access + virtual-apic)
     let mut tables = Vec::new();
     let npts = pages.div_ceil(512);
-    for _ in 0..(3 + npts) {
+    for _ in 0..(3 + npts + 4) {
         match memory::alloc_frame() {
             Some(f) => {
                 unsafe { zero_frame(f) };
@@ -663,7 +820,11 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
     let ept_pml4 = tables[0];
     let ept_pdpt = tables[1];
     let ept_pd = tables[2];
-    let pts = &tables[3..];
+    let pts = &tables[3..3 + npts as usize];
+    let apic_pd = tables[3 + npts as usize];
+    let apic_pt = tables[3 + npts as usize + 1];
+    let apic_access = tables[3 + npts as usize + 2];
+    let virtual_apic = tables[3 + npts as usize + 3];
 
     unsafe {
         let wr = |frame: PhysFrame<Size4KiB>, idx: usize, val: u64| {
@@ -682,6 +843,24 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
                 rf.start_address().as_u64() | EPT_LEAF,
             );
         }
+        // the guest apic page: gpa APIC_GPA lands on the access frame (rw,
+        // no x); with "virtualize apic accesses" the cpu serves mmio reads
+        // from the virtual-apic page instead of a real lapic
+        wr(
+            ept_pdpt,
+            (APIC_GPA >> 30) as usize,
+            apic_pd.start_address().as_u64() | EPT_TABLE,
+        );
+        wr(
+            apic_pd,
+            ((APIC_GPA >> 21) & 0x1FF) as usize,
+            apic_pt.start_address().as_u64() | EPT_TABLE,
+        );
+        wr(
+            apic_pt,
+            ((APIC_GPA >> 12) & 0x1FF) as usize,
+            apic_access.start_address().as_u64() | EPT_R | EPT_W | EPT_WB,
+        );
     }
 
     // map guest ram into the creator: flat window, rw, no exec
@@ -753,7 +932,14 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
         }
         return -1;
     }
-    if !setup_vmcs(vmcs, ept_pml4, &ram) {
+    if !setup_vmcs(
+        vmcs,
+        ept_pml4,
+        MSR_BM.get().copied().unwrap_or(0),
+        id,
+        apic_access.start_address().as_u64(),
+        virtual_apic.start_address().as_u64(),
+    ) {
         serial_println!("[vmx] vmcs setup failed");
         let _ = vmclear(vmcs.start_address().as_u64());
         memory::dealloc_frame(vmcs);
@@ -767,7 +953,6 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
     }
     let _ = vmclear(vmcs.start_address().as_u64());
 
-    let id = NEXT_GUEST.fetch_add(1, Ordering::AcqRel);
     let vcpu = Vcpu {
         _vmcs: vmcs.start_address().as_u64(),
         _launched: 0,
@@ -788,17 +973,25 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
         launched: false,
     });
     serial_println!(
-        "[vmx] guest {} created: pid {} pages {} eptp {:#x}",
+        "[vmx] guest {} created: pid {} pages {} eptp {:#x} vpid {}",
         id,
         owner_pid,
         pages,
-        ept_pml4.start_address().as_u64()
+        ept_pml4.start_address().as_u64(),
+        id & 0xFFFF
     );
     id as i64
 }
 
 // write every field a real-mode unrestricted guest needs
-fn setup_vmcs(vmcs: PhysFrame<Size4KiB>, ept_pml4: PhysFrame<Size4KiB>, ram: &[PhysFrame]) -> bool {
+fn setup_vmcs(
+    vmcs: PhysFrame<Size4KiB>,
+    ept_pml4: PhysFrame<Size4KiB>,
+    msr_bm: u64,
+    vpid: u64,
+    apic_access: u64,
+    virtual_apic: u64,
+) -> bool {
     let _ = vmcs;
     let mut ok = true;
     let mut w = |f: u64, v: u64| {
@@ -821,18 +1014,31 @@ fn setup_vmcs(vmcs: PhysFrame<Size4KiB>, ept_pml4: PhysFrame<Size4KiB>, ram: &[P
         1 | (1 << 3), // external interrupt exiting | nmi exiting
     );
     w(VMX_PIN_CTLS, pin);
-    let proc = adjust_ctl(
-        m_proc,
-        (1 << 7) | (1 << 24) | (1 << 31), // hlt | unconditional io | secondary;
-                                          // io exiting keeps guest ports away
-                                          // from the real pic/pit/keyboard
-    );
-    w(VMX_PROC_CTLS, proc);
-    let proc2 = adjust_ctl(
-        0x48B,
-        (1 << 1) | (1 << 7), // enable ept | unrestricted guest
-    );
+    // secondary first: ept | unrestricted guest | apic-access virtualization
+    // | apic-register virtualization; dependent primary bits are added only
+    // when the secondary ones actually survived the capability clamp
+    let proc2 = adjust_ctl(0x48B, (1 << 1) | (1 << 7) | (1 << 5) | (1 << 8));
+    let apic_virt = proc2 & (1 << 5) != 0;
+    let proc2 = if apic_virt {
+        proc2
+    } else {
+        proc2 & !(1 << 8) // reg-virt cannot stand without access-virt
+    };
     w(VMX_PROC_CTLS2, proc2);
+    let mut proc_desired = (1 << 7) | (1 << 24) | (1 << 31); // hlt | unconditional io | secondary;
+                                                             // io exiting keeps guest ports away
+                                                             // from the real pic/pit/keyboard
+    if VPID_OK.load(Ordering::Relaxed) {
+        proc_desired |= 1 << 5; // vpid: tagged tlb, no flush between entries
+    }
+    if apic_virt {
+        proc_desired |= 1 << 21; // tpr/cr8 shadow through the virtual-apic page
+    }
+    if msr_bm != 0 {
+        proc_desired |= 1 << 28; // use the msr bitmap
+    }
+    let proc = adjust_ctl(m_proc, proc_desired);
+    w(VMX_PROC_CTLS, proc);
     let exit_ctl = adjust_ctl(
         m_exit,
         (1 << 9)    // host address-space size (64-bit)
@@ -844,7 +1050,15 @@ fn setup_vmcs(vmcs: PhysFrame<Size4KiB>, ept_pml4: PhysFrame<Size4KiB>, ram: &[P
     let entry_ctl = adjust_ctl(m_entry, 1 << 15); // load ia32_efer
     w(VMX_ENTRY_CTLS, entry_ctl);
     w(VMX_EXCEPTION_BITMAP, (1 << 6) | (1 << 13)); // #ud, #gp exit to host
-    w(VMX_MSR_BITMAPS, 0); // all msr access exits
+    w(VMX_MSR_BITMAPS, msr_bm); // 0 = all msr access exits (bitmap not armed)
+    if proc & (1 << 5) != 0 {
+        w(VMX_VPID, vpid & 0xFFFF); // guest ids start at 1: never zero
+    }
+    if apic_virt {
+        w(VMX_APIC_ACCESS, apic_access);
+        w(VMX_VIRTUAL_APIC, virtual_apic);
+        w(VMX_TPR_THRESHOLD, 0);
+    }
 
     // host state
     w(HOST_CR0, Cr0::read_raw());
@@ -935,13 +1149,25 @@ fn setup_vmcs(vmcs: PhysFrame<Size4KiB>, ept_pml4: PhysFrame<Size4KiB>, ram: &[P
     // ept pointer: wb memory type, 4-level walk
     let eptp = ept_pml4.start_address().as_u64() | 0x06 | (3 << 3);
     w(VMX_EPTP, eptp);
-    let _ = ram;
     ok
 }
+
+// two-way exit buffer in user memory: the kernel writes 20 u64 of exit
+// info (guest→host), ring 3 writes the control half back before the next
+// run (host→guest): flags, an optional event injection and gpr overrides
+const OFF_IN_FLAGS: usize = 20; // bit0 = load gprs, bit1 = inject event
+const OFF_IN_INJECT: usize = 21; // raw vm-entry interruption-info field
+const OFF_IN_ERR: usize = 22; // exception error code (inject bit 11)
+const OFF_IN_LEN: usize = 23; // instruction length for exceptions
+const OFF_IN_GPRS: usize = 24; // 16 u64 loaded when flags bit0
+const EXIT_BUF_BYTES: usize = 320; // 40 u64 total
 
 // enter the guest until a reportable exit; returns the reason
 pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
     if !vmx_ready() {
+        return -1;
+    }
+    if out_buf & 7 != 0 || out_buf + EXIT_BUF_BYTES as u64 > 0x0000_8000_0000_0000 {
         return -1;
     }
     let cur = match crate::sched::current() {
@@ -959,6 +1185,11 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
         return -1;
     };
 
+    // host→guest control half: must be read while the caller's address
+    // space is still live (the launch switches to kernel cr3)
+    let mut ctl = [0u8; EXIT_BUF_BYTES - 160];
+    let have_ctl = cur.proc.aspace.lock().read_bytes(out_buf + 160, &mut ctl);
+
     // park the active vmcs and point host rsp at this guest's exit stack
     if !vmptrld(g.vmcs.start_address().as_u64()) {
         return -1;
@@ -966,6 +1197,40 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
     g.vcpu._exit_stack_top = g.exit_stack.0.as_ptr() as u64 + 4096;
     // host rsp must point at the stack top when the exit lands
     let _ = vmwrite(HOST_RSP, g.vcpu._exit_stack_top);
+
+    // apply the ring-3 requests: gpr overrides first, then the injection
+    if have_ctl {
+        let flags = u64::from_le_bytes(ctl[(OFF_IN_FLAGS * 8 - 160)..][..8].try_into().unwrap());
+        if flags & 1 != 0 {
+            for (i, slot) in g.vcpu.gprs.iter_mut().enumerate() {
+                let b = &ctl[OFF_IN_GPRS * 8 - 160 + i * 8..][..8];
+                *slot = u64::from_le_bytes(b.try_into().unwrap());
+            }
+        }
+        if flags & 2 != 0 {
+            let inj = u64::from_le_bytes(ctl[(OFF_IN_INJECT * 8 - 160)..][..8].try_into().unwrap());
+            let typ = (inj >> 8) & 7;
+            if inj & 0x8000_0000 != 0 && (typ == 0 || typ == 2 || typ == 3) {
+                vmwrite(VM_ENTRY_INTR_INFO, inj);
+                if inj & (1 << 11) != 0 {
+                    let err =
+                        u64::from_le_bytes(ctl[(OFF_IN_ERR * 8 - 160)..][..8].try_into().unwrap());
+                    vmwrite(VM_ENTRY_EXCEPTION_ERR_CODE, err);
+                }
+                let mut ilen =
+                    u64::from_le_bytes(ctl[(OFF_IN_LEN * 8 - 160)..][..8].try_into().unwrap());
+                if typ == 3 && ilen == 0 {
+                    ilen = 1; // intercepted faults need a non-zero length
+                }
+                vmwrite(VM_ENTRY_INSTRUCTION_LEN, ilen);
+            } else {
+                vmwrite(VM_ENTRY_INTR_INFO, 0); // bad field: enter clean
+                serial_println!("[vmx] bad injection request {:#x} — ignored", inj);
+            }
+        } else {
+            vmwrite(VM_ENTRY_INTR_INFO, 0);
+        }
+    }
 
     // run with kernel cr3: the stub and handler live in the higher half
     unsafe {
@@ -989,7 +1254,8 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
         return -1;
     }
     let reason = g.vcpu.out[0];
-    // 20 u64 = 160 bytes of exit info for ring 3
+    // the out half only: the user's control fields stay untouched for the
+    // next vcpu_run call
     let mut buf = [0u8; 160];
     for (i, v) in g.vcpu.out.iter().enumerate() {
         buf[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
@@ -999,6 +1265,134 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
         return -1;
     }
     reason as i64
+}
+
+// grow a guest at runtime: `count` fresh pages append to guest phys memory
+// (flat gpa layout), the ept and the creator's window; returns the new size
+pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
+    if !vmx_ready() || count == 0 {
+        return -1;
+    }
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    if cur.proc.id != owner_pid {
+        return -1;
+    }
+    let mut guests = GUESTS.lock();
+    let Some(g) = guests
+        .iter_mut()
+        .find(|g| g.id == gid && g.owner_pid == owner_pid)
+    else {
+        return -1;
+    };
+    let old_len = g.ram.len() as u64;
+    if old_len + count > GUEST_MAX_PAGES {
+        return -1;
+    }
+
+    // fresh ram frames, rolled back on any failure below
+    let mut new_ram: Vec<PhysFrame<Size4KiB>> = Vec::new();
+    for _ in 0..count {
+        match memory::alloc_frame() {
+            Some(f) => new_ram.push(f),
+            None => {
+                for f in &new_ram {
+                    memory::dealloc_frame(*f);
+                }
+                return -1;
+            }
+        }
+    }
+
+    // page tables for the gpa range the new pages land in
+    let old_npts = old_len.div_ceil(512);
+    let new_npts = (old_len + count).div_ceil(512);
+    let mut new_pts: Vec<PhysFrame<Size4KiB>> = Vec::new();
+    for _ in old_npts..new_npts {
+        match memory::alloc_frame() {
+            Some(f) => {
+                unsafe { zero_frame(f) };
+                new_pts.push(f);
+            }
+            None => {
+                for f in &new_ram {
+                    memory::dealloc_frame(*f);
+                }
+                for f in &new_pts {
+                    memory::dealloc_frame(*f);
+                }
+                return -1;
+            }
+        }
+    }
+    let ept_pd = g.tables[2];
+    unsafe {
+        for (k, pt) in new_pts.iter().enumerate() {
+            let p = memory::phys_to_virt(ept_pd.start_address()).as_mut_ptr::<u64>();
+            p.add(old_npts as usize + k)
+                .write_volatile(pt.start_address().as_u64() | EPT_TABLE);
+        }
+        for (i, rf) in new_ram.iter().enumerate() {
+            let gi = old_len as usize + i;
+            let p =
+                memory::phys_to_virt(g.tables[3 + gi / 512].start_address()).as_mut_ptr::<u64>();
+            p.add(gi % 512)
+                .write_volatile(rf.start_address().as_u64() | EPT_LEAF);
+        }
+    }
+
+    // extend the creator's window; unmap on partial failure
+    let mut mapped: u64 = 0;
+    {
+        let mut aspace = cur.proc.aspace.lock();
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        for (i, rf) in new_ram.iter().enumerate() {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                GUEST_WINDOW + (old_len as usize + i) as u64 * 0x1000,
+            ));
+            if aspace.map_user_page(page, *rf, flags).is_err() {
+                mapped = i as u64;
+                break;
+            }
+            mapped = i as u64 + 1;
+        }
+    }
+    if mapped < count {
+        let mut aspace = cur.proc.aspace.lock();
+        for i in 0..mapped {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                GUEST_WINDOW + (old_len + i) * 0x1000,
+            ));
+            aspace.unmap_user_page(page);
+        }
+        drop(aspace);
+        for f in &new_ram {
+            memory::dealloc_frame(*f);
+        }
+        for f in &new_pts {
+            memory::dealloc_frame(*f);
+        }
+        return -1;
+    }
+
+    // commit: new cacheable translations appeared — flush the ept caches
+    g.ram.extend(new_ram);
+    g.tables.extend(new_pts);
+    let eptp = g.tables[0].start_address().as_u64();
+    drop(guests);
+    invept_all(eptp);
+    serial_println!(
+        "[vmx] guest {} mapped: +{} pages -> {} total",
+        gid,
+        count,
+        old_len + count
+    );
+    (old_len + count) as i64
 }
 
 pub fn guest_destroy(owner_pid: u64, gid: u64) -> i64 {
@@ -1041,6 +1435,10 @@ pub fn guest_destroy(owner_pid: u64, gid: u64) -> i64 {
     if memory::dealloc_frame(g.vmcs) {
         freed += 1;
     }
+    // the frames go back to the pool: stale vpid/ept translations must not
+    // survive a future guest that reuses the numbers
+    invvpid_all();
+    invept_all(g.tables[0].start_address().as_u64());
     serial_println!(
         "[vmx] guest {} destroyed: {} ram frames, {} ept/vmcs frames freed",
         gid,

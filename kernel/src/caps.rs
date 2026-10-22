@@ -9,6 +9,7 @@ pub const QPOST: u32 = 1; // eq_post into the queue
 pub const QWAIT: u32 = 2; // eq_wait on the doorbell
 pub const QKICK: u32 = 4; // eq_kick to release chunk credit
 pub const QLISTEN: u32 = 8; // eq_listen: make it the kernel event sink
+pub const QSIGNAL: u32 = 16; // eq_alert: cancel parked waiters
 
 #[derive(Clone, Copy)]
 struct Grant {
@@ -32,7 +33,7 @@ pub fn check(qid: u64, pid: u64, owner_pid: u64, bit: u32) -> bool {
 
 // grant rights; returns false if the pid already has a grant entry
 pub fn grant(qid: u64, pid: u64, bits: u32) -> bool {
-    if bits & !(QPOST | QWAIT | QKICK | QLISTEN) != 0 || bits == 0 {
+    if bits & !(QPOST | QWAIT | QKICK | QLISTEN | QSIGNAL) != 0 || bits == 0 {
         return false;
     }
     let mut grants = GRANTS.lock();

@@ -8,31 +8,48 @@ use crate::caps;
 use crate::serial_println;
 use crate::task::{Process, Task, TaskState, USER_LIMIT};
 
-// managarm-style event queue: a ring of chunks in USER memory the kernel
-// writes into directly; the consumer reads elements with plain loads (no
-// syscall), releases chunk credit by bumping cons_seq and only enters the
-// kernel to sleep on the doorbell (eq_wait) or to release credit (eq_kick).
+// managarm-style event queue v2: a chain of chunks in USER memory the
+// kernel writes into directly; the consumer reads elements with plain
+// loads (no syscall), returns chunks by zeroing their progress word and
+// only enters the kernel to sleep on the doorbell (eq_wait), to release
+// credit (eq_kick) or to cancel a parked wait (eq_alert).
 //
-// head (32 bytes at base):
+// head (48 bytes at base):
 //   +0  u32 magic       +4 u32 chunk_size   +8 u32 nchunks
-//   +12 u32 user_notify (kernel ORs 1, user ANDs out)
-//   +16 u64 prod_seq    (kernel-owned)
-//   +24 u64 cons_seq    (consumer-owned: full chunks fully drained)
-//   +32 u64 cons_off    (consumer-owned: bytes read in the open chunk)
-// chunk i at base + 32 + i*chunk_size:
-//   +0 u32 reserved     +4 u32 progress (bytes valid | FULL)   +8 data[]
+//   +12 u32 user_notify (kernel ORs EVENT|ALERT|ERROR, user ANDs out)
+//   +16 u64 prod_seq    (kernel-owned: chunks opened)
+//   +24 u64 cons_seq    (consumer-owned: chunks drained and returned)
+//   +32 u32 error_code  (kernel: first channel error, 0 = none)
+//   +36 u32 err_count   (kernel: errors raised so far)
+//   +40 u64 cons_off    (consumer-owned: bytes read in the open chunk)
+// chunk i at base + 48 + i*chunk_size:
+//   +0 u32 next      (producer: index of the following chunk, set at FULL)
+//   +4 u32 progress  (bytes valid | FULL; consumer zeroes it on return)
+//   +8 data[]
 // element in data (8-aligned):
 //   +0 u32 len (16+payload) +4 u32 opcode +8 u64 sender pid +16 payload
 //
+// v2 removes the lap/FULL ambiguity: the consumer follows the producer's
+// `next` chain instead of assuming index order, so a chunk is only ever
+// read while FULL, and only ever reused after the consumer zeroed it.
+//
 // access is capability-guarded: the creator holds every right implicitly,
-// anyone else needs an eq_grant (POST/WAIT/KICK/LISTEN).
+// anyone else needs an eq_grant (POST/WAIT/KICK/LISTEN/SIGNAL).
 
-pub const EQ_MAGIC: u32 = 0x5A48_5345;
+pub const EQ_MAGIC: u32 = 0x5A48_5632; // "ZHv2"
 pub const EQ_FULL: u32 = 0x8000_0000;
-pub const EQ_HDR: u64 = 40;
+pub const EQ_HDR: u64 = 48;
 pub const EQ_ELEM_HDR: usize = 16;
 pub const EQ_MAX_PAYLOAD: usize = 2048;
-// opcodes used by the kernel side
+// user_notify bits (kernel sets, consumer clears)
+pub const NOTIFY_EVENT: u32 = 1;
+pub const NOTIFY_ALERT: u32 = 2;
+pub const NOTIFY_ERROR: u32 = 4;
+// error_code values: the kernel-side channel state, read + cleared by the consumer
+pub const E_DROP: u32 = 1; // kernel dropped an event (credit/lock shortage)
+pub const E_CLOSED: u32 = 2; // queue closed, owner gone
+pub const E_PROTO: u32 = 3; // producer protocol violation
+                            // opcodes used by the kernel side
 pub const OP_KERNEL_EVENT: u32 = 1; // keyboard scancode+ascii pair
 pub const OP_BOOT: u32 = 2; // "queue is listening" ping
 
@@ -93,7 +110,19 @@ fn wr64(proc: &Process, base: u64, off: u64, v: u64) -> bool {
 
 fn doorbell(eq: &Eq) {
     let cur = rd32(&eq.owner, eq.base, 12).unwrap_or(0);
-    let _ = wr32(&eq.owner, eq.base, 12, cur | 1);
+    let _ = wr32(&eq.owner, eq.base, 12, cur | NOTIFY_EVENT);
+}
+
+// mark the channel broken: the first error code wins, the count ticks and
+// the consumer learns about it through the ERROR notify bit
+fn raise_error(eq: &Eq, code: u32) {
+    if rd32(&eq.owner, eq.base, 32).unwrap_or(E_DROP) == 0 {
+        let _ = wr32(&eq.owner, eq.base, 32, code);
+    }
+    let cnt = rd32(&eq.owner, eq.base, 36).unwrap_or(0);
+    let _ = wr32(&eq.owner, eq.base, 36, cnt.wrapping_add(1));
+    let n = rd32(&eq.owner, eq.base, 12).unwrap_or(0);
+    let _ = wr32(&eq.owner, eq.base, 12, n | NOTIFY_ERROR);
 }
 
 fn wake_drivers(eq: &Eq) {
@@ -153,18 +182,21 @@ pub fn setup(base: u64, size: u64) -> i64 {
         }
     }
     let proc = &cur.proc;
-    // doorbell + all chunk progress words start at zero
-    if !wr32(proc, base, 12, 0) {
+    // doorbell + seqs + error channel + cons_off + all chunk words start at zero
+    if !wr32(proc, base, 12, 0)
+        || !wr64(proc, base, 16, 0)
+        || !wr64(proc, base, 24, 0)
+        || !wr32(proc, base, 32, 0)
+        || !wr32(proc, base, 36, 0)
+        || !wr64(proc, base, 40, 0)
+    {
         return -1;
     }
     for i in 0..nchunks {
-        let off = EQ_HDR + i as u64 * chunk_size as u64 + 4;
-        if !wr32(proc, base, off, 0) {
+        let off = EQ_HDR + i as u64 * chunk_size as u64;
+        if !wr32(proc, base, off, 0) || !wr32(proc, base, off + 4, 0) {
             return -1;
         }
-    }
-    if !wr64(proc, base, 16, 0) || !wr64(proc, base, 24, 0) || !wr64(proc, base, 32, 0) {
-        return -1;
     }
 
     let eq = Arc::new(Eq {
@@ -281,17 +313,20 @@ pub fn post(qid: u64, opcode: u32, buf: u64, len: u64) -> i64 {
             // BEFORE writing elements, so the consumer cannot re-read the
             // old flag and double-count the whole chunk
             if !wr32(&eq.owner, eq.base, chunk - eq.base + 4, 0) {
+                raise_error(&eq, E_PROTO);
                 return -1;
             }
         }
         if prod.woff + elem_len as u32 <= data_cap {
             let dst = chunk + 8 + prod.woff as u64;
             if !eq.owner.aspace.lock().write_bytes(dst, &elem) {
+                raise_error(&eq, E_PROTO);
                 return -1;
             }
             prod.woff += elem_len as u32;
             // publish: progress tells the consumer how many bytes are valid
             if !wr32(&eq.owner, eq.base, chunk - eq.base + 4, prod.woff) {
+                raise_error(&eq, E_PROTO);
                 return -1;
             }
             drop(prod);
@@ -299,9 +334,15 @@ pub fn post(qid: u64, opcode: u32, buf: u64, len: u64) -> i64 {
             wake_drivers(&eq);
             return 0;
         }
-        // element does not fit: close the chunk and hand over the next one
+        // element does not fit: close the chunk, chain it to the next one
+        // and hand that one over; the consumer follows the chain instead of
+        // assuming index order
         if prod.woff > 0 {
-            if !wr32(&eq.owner, eq.base, chunk - eq.base + 4, prod.woff | EQ_FULL) {
+            let next = ((chunk_idx as u64 + 1) % eq.nchunks as u64) as u32;
+            if !wr32(&eq.owner, eq.base, chunk - eq.base, next)
+                || !wr32(&eq.owner, eq.base, chunk - eq.base + 4, prod.woff | EQ_FULL)
+            {
+                raise_error(&eq, E_PROTO);
                 return -1;
             }
             prod.seq += 1;
@@ -342,6 +383,24 @@ pub fn post_nb(qid: u64, opcode: u32, payload: &[u8]) -> bool {
     let Some(mut aspace) = eq.owner.aspace.try_lock() else {
         return false;
     };
+    // error-channel writer for the paths below; we already hold the aspace,
+    // and from an irq context this is the only legal way to record state
+    let mark_err = |aspace: &mut crate::task::AddressSpace, code: u32| {
+        let mut b = [0u8; 4];
+        if aspace.read_bytes(eq.base + 32, &mut b) && u32::from_le_bytes(b) == 0 {
+            let _ = aspace.write_bytes(eq.base + 32, &code.to_le_bytes());
+        }
+        let mut b = [0u8; 4];
+        if aspace.read_bytes(eq.base + 36, &mut b) {
+            let c = u32::from_le_bytes(b).wrapping_add(1);
+            let _ = aspace.write_bytes(eq.base + 36, &c.to_le_bytes());
+        }
+        let mut b = [0u8; 4];
+        if aspace.read_bytes(eq.base + 12, &mut b) {
+            let n = u32::from_le_bytes(b) | NOTIFY_ERROR;
+            let _ = aspace.write_bytes(eq.base + 12, &n.to_le_bytes());
+        }
+    };
     let mut b = [0u8; 8];
     if !aspace.read_bytes(eq.base + 24, &mut b) {
         return false;
@@ -351,13 +410,19 @@ pub fn post_nb(qid: u64, opcode: u32, payload: &[u8]) -> bool {
         prod.seq = cons;
     }
     if prod.seq - cons >= eq.nchunks as u64 {
-        return false; // no credit: drop rather than park (we may be in an irq)
+        // no credit: the event is dropped — say so on the error channel
+        mark_err(&mut aspace, E_DROP);
+        return false;
     }
     // close the open chunk first when the element does not fit
     let mut chunk_idx = (prod.seq % eq.nchunks as u64) as u32;
     let mut chunk = eq.base + EQ_HDR + chunk_idx as u64 * eq.chunk_size as u64;
     let data_cap = eq.chunk_size - 8;
     if prod.woff > 0 && prod.woff as usize + elem_len > data_cap as usize {
+        let next = ((chunk_idx as u64 + 1) % eq.nchunks as u64) as u32;
+        if !aspace.write_bytes(chunk, &next.to_le_bytes()) {
+            return false;
+        }
         if !aspace.write_bytes(chunk + 4, &(prod.woff | EQ_FULL).to_le_bytes()) {
             return false;
         }
@@ -390,7 +455,8 @@ pub fn post_nb(qid: u64, opcode: u32, payload: &[u8]) -> bool {
     true
 }
 
-// block the current thread until the doorbell has bits; returns 1
+// block the current thread until the doorbell has bits; returns 1 =
+// events, 2 = alerted (a parked wait was canceled), -1 = closed or bad
 pub fn wait(qid: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
@@ -404,9 +470,14 @@ pub fn wait(qid: u64) -> i64 {
         return -1;
     }
     interrupts::without_interrupts(|| {
-        let n = rd32(&eq.owner, eq.base, 12).unwrap_or(0);
-        if n != 0 {
+        let bits = rd32(&eq.owner, eq.base, 12).unwrap_or(0);
+        if bits & (NOTIFY_EVENT | NOTIFY_ERROR) != 0 {
             return 1i64;
+        }
+        if bits & NOTIFY_ALERT != 0 {
+            // consume the alert: one wait, one cancellation
+            let _ = wr32(&eq.owner, eq.base, 12, bits & !NOTIFY_ALERT);
+            return 2;
         }
         {
             let t = cur.inner();
@@ -422,6 +493,30 @@ pub fn wait(qid: u64) -> i64 {
             eq.drivers.lock().retain(|t| !Arc::ptr_eq(t, &cur));
             -1
         }
+    })
+}
+
+// cancel waiters: any SIGNAL holder may ring the alert bit; every parked
+// eq_wait wakes with 2 instead of blocking until real events show up
+pub fn alert(qid: u64) -> i64 {
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    let eq = match find(qid) {
+        Some(e) => e,
+        None => return -1,
+    };
+    if !caps::check(qid, cur.proc.id, eq.owner.id, caps::QSIGNAL) {
+        return -1;
+    }
+    interrupts::without_interrupts(|| {
+        let n = rd32(&eq.owner, eq.base, 12).unwrap_or(0);
+        let _ = wr32(&eq.owner, eq.base, 12, n | NOTIFY_ALERT);
+        for t in core::mem::take(&mut *eq.drivers.lock()) {
+            crate::sched::wake_parked(&t, 2);
+        }
+        0
     })
 }
 
@@ -538,6 +633,9 @@ pub fn close_process(pid: u64) {
         if qid == *SINK_QID.lock() {
             *SINK_QID.lock() = 0;
         }
+        // the head is in the dying owner's memory: best-effort write so a
+        // consumer polling the channel sees why events stopped
+        raise_error(&eq, E_CLOSED);
         interrupts::without_interrupts(|| {
             for t in core::mem::take(&mut *eq.drivers.lock()) {
                 crate::sched::wake_parked(&t, (-1i64) as u64);
