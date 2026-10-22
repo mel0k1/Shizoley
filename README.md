@@ -59,9 +59,14 @@
 - [x] event queue: managarm-подобная очередь ядро->процесс в памяти пользователя (doorbell, chunk-кредиты, eq_wait/eq_kick)
 - [x] сервисы в ring 3: fsd (файлы из initrd по mailbox) и rtcd (CMOS-часы через порты 0x70/0x71, IOPL=3)
 - [x] initrd разделяется в каждый процесс read-only (0x20000000), парсится прямо в user space
-- [x] begin гипервизора: probe VT-x, CR4.VMXE, VMXON, чтение capability-MSR (vmx.rs)
-- [ ] драйверы: клавиатура/консоль в user space через event queue
-- [ ] гипервизор: VMCS, vcpu, guest по Veda-рецепту (GUEST_CREATE/VCPU_RUN)
+- [x] безопасная работа с памятью пользователя: копии read/write проверяют USER/WRITABLE на каждом листе, kernel-кадры (initrd) помечены BIT_9 и не отдаются
+- [x] освобождение физических страниц: bitmap-аллокатор кадров с dealloc; reaper разбирает адресное пространство умершего процесса до кадра
+- [x] корректное завершение процессов: выход последнего потока гасит процесс, освобождает кадры, закрывает его очереди и права; kill(14) гасит весь процесс сразу
+- [x] обработка ошибок ELF: валидация заголовков, границ, пересечений сегментов, точки входа; при ошибке — откат с возвратом кадров
+- [x] граничные случаи IPC: недоставляемое сообщение -> ошибка вместо вечной парковки; kick только у владельца; защита от пересечения очередей в памяти
+- [x] клавиатура/консоль как процессы: kbd IRQ -> event queue (eq_listen), consoled рендерит в ring 3
+- [x] capability-права на qid: POST/WAIT/KICK/LISTEN, владелец выдаёт их через eq_grant(19)/eq_revoke(20)
+- [x] гипервизор по Veda-рецепту: VMCS + vcpu + EPT, syscalls GUEST_CREATE/VCPU_RUN/GUEST_DESTROY (unrestricted real-mode guest, vmcall как выход)
 
 ## Структура
 
@@ -85,7 +90,8 @@ Shizoley/
 │   │   ├── elf.rs           # ELF64-загрузчик: PT_LOAD, флаги R/W/X, BSS
 │   │   ├── syscall.rs       # MSR + asm-трамплин syscall/sysret + диспетчер
 │   │   ├── user.rs          # spawn процесса из initrd, RO-маппинг initrd, вход в ring 3
-│   │   └── vmx.rs           # гипервизор begin: VT-x probe, VMXON, capability MSRs
+│   │   ├── caps.rs          # capability-права на qid (POST/WAIT/KICK/LISTEN)
+│   │   └── vmx.rs           # гипервизор: VMXON, VMCS, vcpu, EPT, GUEST_CREATE/VCPU_RUN
 │   ├── x86_64-paparaci.json # кастомный target (без red zone)
 │   └── .cargo/config.toml
 ├── userspace/               # окружение на C++20 (freestanding)
@@ -159,6 +165,15 @@ Page fault из ring 3 убивает только провинившуюся з
 | 11 | `eq_kick`       | `rdi`: qid                             | отдать chunk-кредит припаркованным постерам |
 | 12 | `initrd_size`   | —                                      | размер initrd (RO-маппинг на 0x20000000)   |
 | 13 | `write`         | `rdi`: buf, `rsi`: len                 | атомарная строка в консоль (vga+serial)    |
+| 14 | `kill`          | `rdi`: pid                             | погасить все потоки процесса, -> 0 \| -1   |
+| 15 | `guest_create`  | `rdi`: страницы                        | VMCS + EPT + окно RAM, -> handle           |
+| 16 | `vcpu_run`      | `rdi`: handle, `rsi`: out (20×u64)     | войти в гостя, -> причина vmexit           |
+| 17 | `guest_destroy` | `rdi`: handle                          | освободить RAM/EPT/VMCS, -> 0              |
+| 18 | `eq_listen`     | `rdi`: qid                             | сделать очередь приёмником событий ядра (LISTEN) |
+| 19 | `eq_grant`      | `rdi`: qid, `rsi`: pid, `rdx`: права   | владелец выдаёт права на qid               |
+| 20 | `eq_revoke`     | `rdi`: qid, `rsi`: pid                 | владелец забирает права                    |
+
+Права на qid (bitmask): `POST=1`, `WAIT=2`, `KICK=4`, `LISTEN=8`; владелец очереди держит их все неявно.
 
 Конвенция: номер в `rax`, аргументы в `rdi`, `rsi`, `rdx`, результат в `rax`.
 
@@ -184,9 +199,9 @@ Page fault из ring 3 убивает только провинившуюся з
 
 ## Дорожная карта
 
-1. Гипервизор: VMCS + vcpu + EPT, syscalls GUEST_CREATE/VCPU_RUN (Veda-style driver VM).
-2. Клавиатурный/консольный драйверы в user space на event queue; права на qid как capability (вместо сырых номеров).
-3. Подсматриваем дальше: managarm (universe-хэндлы, UAR/STAC-копии) и Veda (would_cycle-детект capability-каналов, IOMMU для гостевых устройств).
+1. Гость подальше: 64-битный guest через unrestricted guest -> long mode, laps-таймер на vcpu, VMCALL-гиперсозвон как канал ядро<->гость.
+2. Подсматриваем дальше: managarm (universe-хэндлы, UAR/STAC-копии, kernel->process данные) и Veda (would_cycle-детект capability-каналов, IOMMU для гостевых устройств).
+3. Больше сервисов в ring 3: таймер-сервис, ps/kill-обвязка над pid, передача handle'ов очередей через capability.
 
 ## Лицензия
 
@@ -261,9 +276,14 @@ The kernel is named after paparazzi for a reason: Paparaci watches everything ha
 - [x] Event queue: managarm-style kernel->process queue in user memory (doorbell, chunk credits, eq_wait/eq_kick)
 - [x] Ring 3 services: fsd (initrd files over mailbox) and rtcd (CMOS clock via ports 0x70/0x71, IOPL=3)
 - [x] initrd shared read-only into every process (0x20000000), parsed in user space
-- [x] Hypervisor begin: VT-x probe, CR4.VMXE, VMXON, capability MSRs (vmx.rs)
-- [ ] Drivers: keyboard/console in user space over the event queue
-- [ ] Hypervisor: VMCS, vcpu, guest the Veda way (GUEST_CREATE/VCPU_RUN)
+- [x] Safe user-memory handling: read/write copies check USER/WRITABLE on every leaf; kernel frames (initrd) carry BIT_9 and are never handed out
+- [x] Freeing physical pages: bitmap frame allocator with dealloc; the reaper tears a dead process's address space down frame by frame
+- [x] Correct process termination: the last thread's exit kills the process, frees its frames, closes its queues and grants; kill(14) takes the whole process down at once
+- [x] ELF error handling: full header/bounds/segment-overlap/entry validation; on failure the loader rolls back and returns every frame
+- [x] IPC edge cases: an undeliverable message fails the syscall instead of parking forever; kick is owner-only; queue memory ranges may not overlap
+- [x] Keyboard/console as processes: kbd IRQ -> event queue (eq_listen), consoled renders in ring 3
+- [x] Capability rights on qid: POST/WAIT/KICK/LISTEN, granted by the owner via eq_grant(19)/eq_revoke(20)
+- [x] Hypervisor the Veda way: VMCS + vcpu + EPT, GUEST_CREATE/VCPU_RUN/GUEST_DESTROY syscalls (unrestricted real-mode guest, vmcall as the exit door)
 
 ### Build & run
 
@@ -285,10 +305,12 @@ The kernel boots, sets up the heap and MSRs, then hands control to the scheduler
 - creates **two user threads** (`thread_create`) — both share the process address space, print ticks and finish;
 - calls `spawn("hello")` — the kernel loads the second ELF from the initrd into a separate process (pid 2) and runs a mailbox ping-pong with it;
 - brings up **ring 3 services**: `fsd` (serves the `motd` file from the read-only initrd mapping over the mailbox) and `rtcd` (reads the CMOS clock through ports 0x70/0x71 — IOPL=3);
-- registers an **event queue** (`eq_setup`); hello posts 100 events via `eq_post` — init consumes them with plain loads (no syscall per element), sleeping on the doorbell (`eq_wait`) between batches;
-- when the last thread of a process exits, the process is done and the reaper prints the exit codes.
+- starts **consoled** — the keyboard/console as a process: it registers its queue as the kernel event sink (`eq_listen`), the kbd IRQ posts `[scancode, ascii]` events, and the boot ping proves the pipe;
+- runs **gdemo** — the Veda-approach smoke: `guest_create` builds VMCS + EPT + a 1 MiB ram window, a 16-bit blob writes text into its own "VGA" through the EPT and stops itself with a `vmcall`; on machines without VT-x the kernel refuses politely;
+- grants hello the `POST` right on its queue (`eq_grant`) and consumes hello's 100 events with plain loads, sleeping on the doorbell between batches;
+- when the last thread of a process exits, the reaper tears the process down: address-space frames go back to the bitmap pool, its queues close, its capability grants vanish.
 
-A page fault from ring 3 kills only the offending task — the kernel lives on. The keyboard still works — keypresses are echoed from the interrupt handler.
+A page fault (or #GP/#UD) from ring 3 kills only the offending process — the kernel lives on. The keyboard no longer echoes in the kernel: keys are events that consoled renders.
 
 ### Syscall ABI
 
@@ -308,6 +330,15 @@ A page fault from ring 3 kills only the offending task — the kernel lives on. 
 | 11 | `eq_kick`       | `rdi`: qid                                  | hand chunk credit to parked posters                |
 | 12 | `initrd_size`   | —                                           | initrd size (RO-mapped at 0x20000000)              |
 | 13 | `write`         | `rdi`: buf, `rsi`: len                      | atomic console line (vga+serial)                   |
+| 14 | `kill`          | `rdi`: pid                                  | end every thread of the process, -> 0 \| -1        |
+| 15 | `guest_create`  | `rdi`: pages                                | VMCS + EPT + ram window, -> handle                 |
+| 16 | `vcpu_run`      | `rdi`: handle, `rsi`: out (20×u64)          | enter the guest, -> vmexit reason                  |
+| 17 | `guest_destroy` | `rdi`: handle                               | free ram/ept/vmcs, -> 0                            |
+| 18 | `eq_listen`     | `rdi`: qid                                  | make the queue the kernel event sink (LISTEN)      |
+| 19 | `eq_grant`      | `rdi`: qid, `rsi`: pid, `rdx`: rights       | the owner hands out qid rights                     |
+| 20 | `eq_revoke`     | `rdi`: qid, `rsi`: pid                      | the owner takes rights back                        |
+
+qid rights (bitmask): `POST=1`, `WAIT=2`, `KICK=4`, `LISTEN=8`; the queue owner holds all of them implicitly.
 
 Convention: number in `rax`, args in `rdi`, `rsi`, `rdx`, result in `rax`.
 
@@ -343,14 +374,14 @@ The queue lives in **user memory**: a ring of chunks with the kernel as producer
 
 - **fsd** — the file service: the kernel shares the initrd read-only into every process address space (0x20000000, page-aligned blob, the same physical frames), fsd parses ustar right in ring 3 and serves file contents to clients over the mailbox;
 - **rtcd** — a hardware driver: owns the CMOS ports 0x70/0x71 (ring 3 entered with IOPL=3), waits out the update-in-progress flag, decodes BCD and answers with a time string. A real user-space driver: the kernel knows nothing about the RTC;
-- next: keyboard/console drivers as processes fed by the kernel through the event queue.
+- the keyboard and console already live in a ring-3 process fed by the kernel through the event queue.
 
 ## Hypervisor begin (Veda-style)
 
-`vmx.rs` lays the foundation: a CPUID check for VT-x, setting `CR4.VMXE`, preparing an aligned VMXON region (revision from IA32_VMX_BASIC), entering VMX root operation via `vmxon` and reading the capability MSRs (pin/procbased/secondary, EPT). Under QEMU TCG VT-x is not exposed — the banner honestly prints "not supported by cpu"; with KVM or on real hardware the kernel enters VMX root and reports the revision. Next, the Veda way: VMCS, vcpu objects, EPT and `GUEST_CREATE`/`VCPU_RUN`-style syscalls — to run a Linux driver VM like Veda does.
+`vmx.rs` is the Veda-style heart: after `vmxon` the kernel arms `GUEST_CREATE(15)`/`VCPU_RUN(16)`/`GUEST_DESTROY(17)`. `guest_create` builds a VMCS (unrestricted real-mode entry, external-int/NMI exiting, #UD/#GP interception, MSR exits answered with #GP), a 4-level EPT shadowing freshly allocated guest ram, and maps that ram into the creator's address space at `0x30000000` so ring 3 can load images and read results. `vcpu_run` launches/resumes the vcpu on the task's kernel stack; the exit stub saves guest GPRs, EOIs host interrupts that were acked by the cpu, injects #GP for MSR snoopers and returns reportable exits (vmcall, hlt, cpuid, io, ept violation, exceptions) to ring 3 with 20 u64s of exit info. `guest_destroy` unmaps the window and returns every frame to the pool. Under QEMU TCG VT-x is not exposed — the demo honestly reports "vmx unavailable"; with `-enable-kvm -cpu host` the full round trip works.
 
 ### Roadmap
 
-1. Hypervisor: VMCS + vcpu + EPT, GUEST_CREATE/VCPU_RUN syscalls (Veda-style driver VM).
-2. Keyboard/console drivers in user space on the event queue; qid rights as a capability instead of raw numbers.
-3. Keep peeking: managarm (universe handles, UAR/STAC copies) and Veda (would_cycle detection for capability channels, IOMMU for guest devices).
+1. Farther guests: unrestricted guest -> long mode, a vcpu lap timer, VMCALL as the kernel<->guest channel (Veda-style driver VM).
+2. Keep peeking: managarm (universe handles, UAR/STAC copies, kernel->process data transfer) and Veda (would_cycle detection for capability channels, IOMMU for guest devices).
+3. More ring 3 services: a timer service, ps/kill tooling over pids, queue handles passed around as capabilities.

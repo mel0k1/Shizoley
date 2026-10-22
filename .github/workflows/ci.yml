@@ -55,6 +55,11 @@ jobs:
           grep -qF "[init] drained 100 events, bye" serial.log
           grep -qF "process 'init' (1) finished" serial.log
           grep -qF "[vmx]" serial.log
+          grep -qF "[console] up: kernel sink attached" serial.log
+          grep -qF "[gdemo] vmx unavailable (guest_create refused)" serial.log
+          grep -qF "[eq] granted 0x1 on queue 2 to pid 2" serial.log
+          grep -qF "[eq] queue 2 closed (owner 1 gone)" serial.log
+          grep -qE "process 'init' \(1\) torn down, [0-9]+ frames freed" serial.log
 
   userspace:
     name: userspace (c++)
