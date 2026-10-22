@@ -33,10 +33,12 @@ const IA32_VMX_TRUE_PROC: u32 = 0x48E;
 const IA32_VMX_TRUE_EXIT: u32 = 0x48F;
 const IA32_VMX_TRUE_ENTRY: u32 = 0x490;
 const IA32_VMX_EPT_VPID_CAP: u32 = 0x48C;
+const IA32_VMX_MISC: u32 = 0x485;
 
 // ept_vpid_cap bits: 32 = invvpid exists (vpid usable), 26 = all-context invept
 const EPTVPID_VPID: u64 = 1 << 32;
 const EPTVPID_INVEPT_ALL: u64 = 1 << 26;
+const EPTVPID_EPT2M: u64 = 1 << 16;
 
 // gpr slots in the Vcpu layout (see OFF_G_* below; rsp lives in the vmcs)
 const IDX_RAX: usize = 0;
@@ -98,6 +100,7 @@ const VMX_EXIT_CTLS: u64 = 0x400C;
 const VMX_ENTRY_CTLS: u64 = 0x4012;
 const VMX_MSR_BITMAPS: u64 = 0x2004;
 const VMX_VPID: u64 = 0x0000;
+const VMX_PREEMPT_TIMER: u64 = 0x482E;
 const VMX_VIRTUAL_APIC: u64 = 0x2012;
 const VMX_APIC_ACCESS: u64 = 0x2014;
 const VMX_TPR_THRESHOLD: u64 = 0x401E;
@@ -148,6 +151,7 @@ const R_IO: u64 = 30;
 const R_APIC_ACCESS: u64 = 44;
 const R_EPT_VIOLATION: u64 = 49;
 const R_EPT_MISCONFIG: u64 = 50;
+const R_PREEMPT_TIMER: u64 = 52;
 
 // guest-visible apic page (the vAPIC shadow the cpu serves mmio from)
 const APIC_GPA: u64 = 0xFEE0_0000;
@@ -194,6 +198,12 @@ static NEXT_GUEST: AtomicU64 = AtomicU64::new(1);
 static MSR_BM: Once<u64> = Once::new();
 static VPID_OK: AtomicBool = AtomicBool::new(false);
 static INVEPT_OK: AtomicBool = AtomicBool::new(false);
+static EPT2M_OK: AtomicBool = AtomicBool::new(false);
+// p3 preemption timer: armed = pin-ctl bit 6 allowed, rate = vmx_misc[4:0]
+// (the timer decrements once per 2^rate tsc ticks)
+static PREEMPT_ARMED: AtomicBool = AtomicBool::new(false);
+static PREEMPT_RATE: AtomicU64 = AtomicU64::new(0);
+static SLICE_TICKS: Once<u64> = Once::new();
 
 // asm-visible state (single core: one guest runs at a time)
 #[no_mangle]
@@ -406,6 +416,16 @@ extern "C" fn vmx_after_exit(vcpu: *mut Vcpu) -> u64 {
             vcpu.out[4..20].copy_from_slice(&vcpu.gprs);
             1
         }
+        R_PREEMPT_TIMER => {
+            // p3: the slice ended — never resume in root, the scheduler
+            // decides who owns the cpu next; reportable so ring 3 re-enters
+            vcpu.out[0] = reason;
+            vcpu.out[1] = vmread(GUEST_RIP);
+            vcpu.out[2] = 0;
+            vcpu.out[3] = 0;
+            vcpu.out[4..20].copy_from_slice(&vcpu.gprs);
+            1
+        }
         _ => {
             let qual = vmread(VM_EXIT_QUALIFICATION);
             vcpu.out[0] = reason;
@@ -588,22 +608,41 @@ pub fn init() {
                 let caps = unsafe { Msr::new(IA32_VMX_EPT_VPID_CAP).read() };
                 VPID_OK.store(caps & EPTVPID_VPID != 0, Ordering::Relaxed);
                 INVEPT_OK.store(caps & EPTVPID_INVEPT_ALL != 0, Ordering::Relaxed);
+                EPT2M_OK.store(caps & EPTVPID_EPT2M != 0, Ordering::Relaxed);
+                // p3: preemption timer — pin-ctl bit 6 must be allowed-1;
+                // the tick rate lives in vmx_misc[4:0]
+                let pin_msr = if TRUE_CTLS.load(Ordering::Relaxed) {
+                    IA32_VMX_TRUE_PIN
+                } else {
+                    IA32_VMX_PIN
+                };
+                let pin_allowed1 = unsafe { Msr::new(pin_msr).read() } >> 32;
+                if pin_allowed1 & (1 << 6) != 0 {
+                    let rate = unsafe { Msr::new(IA32_VMX_MISC).read() } & 0x1F;
+                    PREEMPT_RATE.store(rate, Ordering::Relaxed);
+                    PREEMPT_ARMED.store(true, Ordering::Relaxed);
+                }
                 VMX_READY.call_once(|| {});
                 serial_println!(
-                    "[vmx] on: rev {:#x} ept {} urg {} msrbm {} vpid {} — guest_create/vcpu_run armed",
+                    "[vmx] on: rev {:#x} ept {} urg {} msrbm {} vpid {} ept2m {} preempt {}(rate {}) — guest_create/vcpu_run armed",
                     rev,
                     ept,
                     urg,
                     msr_armed,
-                    VPID_OK.load(Ordering::Relaxed)
+                    VPID_OK.load(Ordering::Relaxed),
+                    EPT2M_OK.load(Ordering::Relaxed),
+                    PREEMPT_ARMED.load(Ordering::Relaxed),
+                    PREEMPT_RATE.load(Ordering::Relaxed)
                 );
                 println!(
-                    "[vmx] on: rev {:#x} ept {} urg {} msrbm {} vpid {} — vm armed",
+                    "[vmx] on: rev {:#x} ept {} urg {} msrbm {} vpid {} ept2m {} preempt {} — vm armed",
                     rev,
                     ept,
                     urg,
                     msr_armed,
-                    VPID_OK.load(Ordering::Relaxed)
+                    VPID_OK.load(Ordering::Relaxed),
+                    EPT2M_OK.load(Ordering::Relaxed),
+                    PREEMPT_ARMED.load(Ordering::Relaxed)
                 );
             } else {
                 serial_println!(
@@ -621,6 +660,40 @@ pub fn init() {
             println!("[vmx] enter failed: {}", e);
         }
     }
+}
+
+// p3: tsc ticks per scheduler timer tick, measured over two ticks on the
+// first guest (the timer is certainly running by then); a quiet timer
+// falls back to 32 m tsc ticks so the slice stays bounded
+#[inline]
+fn rdtsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    unsafe {
+        asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack, nomem));
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+fn calibrate_slice_ticks() -> u64 {
+    let t0 = crate::interrupts::tick_count();
+    let c0 = rdtsc();
+    let mut spins = 0u64;
+    while crate::interrupts::tick_count() < t0 + 2 {
+        spins += 1;
+        if spins > 50_000_000 {
+            return 1 << 25;
+        }
+        core::hint::spin_loop();
+    }
+    let per_tick = (rdtsc() - c0) / 2;
+    per_tick.clamp(1 << 20, 1 << 30)
+}
+
+// preemption timer ticks for a ~one-scheduler-tick guest slice; the value
+// field is 32-bit and counts down once per 2^rate tsc ticks
+fn preempt_slice(rate: u64) -> u64 {
+    let per_tick = SLICE_TICKS.call_once(calibrate_slice_ticks);
+    (*per_tick >> rate).clamp(1, u32::MAX as u64)
 }
 
 fn probe_ept() -> (bool, bool, bool) {
@@ -772,6 +845,9 @@ const EPT_X: u64 = 4;
 const EPT_WB: u64 = 6 << 3;
 const EPT_TABLE: u64 = EPT_R | EPT_W | EPT_X;
 const EPT_LEAF: u64 = EPT_R | EPT_W | EPT_X | EPT_WB;
+const EPT_PS_2M: u64 = 1 << 7;
+const EPT_LEAF_2M: u64 = EPT_LEAF | EPT_PS_2M;
+const TWO_MIB: u64 = 2 * 1024 * 1024;
 
 // guest phys window inside the creator's address space
 pub const GUEST_WINDOW: u64 = 0x3000_0000;
@@ -796,19 +872,32 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
     // reserved up front: the id doubles as the non-zero vpid
     let id = NEXT_GUEST.fetch_add(1, Ordering::AcqRel);
 
-    // guest ram
-    let mut ram = Vec::new();
-    for _ in 0..pages {
-        match memory::alloc_frame() {
-            Some(f) => ram.push(f),
-            None => {
-                for f in &ram {
-                    memory::dealloc_frame(*f);
+    // guest ram: prefer one aligned run — 2 mib ept leaves cover a whole
+    // 2 mib region, so the run base must carry the alignment; fall back to
+    // per-frame allocs (4k leaves) when unsupported or the pool is shredded
+    let aligned = if EPT2M_OK.load(Ordering::Relaxed) {
+        memory::alloc_frames_aligned(pages, TWO_MIB)
+    } else {
+        None
+    };
+    let ram = match aligned {
+        Some(v) => v, // alloc_run is atomic: all or nothing
+        None => {
+            let mut v = Vec::new();
+            for _ in 0..pages {
+                match memory::alloc_frame() {
+                    Some(f) => v.push(f),
+                    None => {
+                        for f in &v {
+                            memory::dealloc_frame(*f);
+                        }
+                        return -1;
+                    }
                 }
-                return -1;
             }
+            v
         }
-    }
+    };
 
     // ept tables: pml4 + pdpt + pd + pts, then 2 pages for the apic page
     // tables and 2 data pages (apic-access + virtual-apic)
@@ -850,12 +939,31 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
         for (k, pt) in pts.iter().enumerate() {
             wr(ept_pd, k, pt.start_address().as_u64() | EPT_TABLE);
         }
-        for (i, rf) in ram.iter().enumerate() {
-            wr(
-                pts[i / 512],
-                i % 512,
-                rf.start_address().as_u64() | EPT_LEAF,
-            );
+        // 2 mib leaves for full, physically aligned regions; the pt frame
+        // stays allocated (uniform indexing) but unreferenced. everything
+        // else keeps the 4k-leaf path
+        let two_m = EPT2M_OK.load(Ordering::Relaxed);
+        let mut i = 0usize;
+        while i < ram.len() {
+            let base = ram[i].start_address().as_u64();
+            if two_m
+                && i.is_multiple_of(512)
+                && i + 512 <= ram.len()
+                && base.is_multiple_of(TWO_MIB)
+            {
+                wr(ept_pd, i / 512, base | EPT_LEAF_2M);
+                i += 512;
+            } else {
+                let end = (((i / 512) + 1) * 512).min(ram.len());
+                for (j, rf) in ram[i..end].iter().enumerate() {
+                    wr(
+                        pts[i / 512],
+                        i % 512 + j,
+                        rf.start_address().as_u64() | EPT_LEAF,
+                    );
+                }
+                i = end;
+            }
         }
         // the guest apic page: gpa APIC_GPA lands on the access frame (rw,
         // no x); with "virtualize apic accesses" the cpu serves mmio reads
@@ -1023,11 +1131,20 @@ fn setup_vmcs(
     } else {
         (IA32_VMX_PIN, IA32_VMX_PROC, IA32_VMX_EXIT, IA32_VMX_ENTRY)
     };
-    let pin = adjust_ctl(
-        m_pin,
-        1 | (1 << 3), // external interrupt exiting | nmi exiting
-    );
+    let mut pin_desired = 1 | (1 << 3); // external interrupt exiting | nmi exiting
+    if PREEMPT_ARMED.load(Ordering::Relaxed) {
+        pin_desired |= 1 << 6; // p3: preemption timer bounds every guest slice
+    }
+    let pin = adjust_ctl(m_pin, pin_desired);
     w(VMX_PIN_CTLS, pin);
+    if PREEMPT_ARMED.load(Ordering::Relaxed) {
+        // must be non-zero before the first entry: an armed timer at 0
+        // would exit instantly. vcpu_run reloads it on every entry
+        w(
+            VMX_PREEMPT_TIMER,
+            preempt_slice(PREEMPT_RATE.load(Ordering::Relaxed)),
+        );
+    }
     // secondary first: ept | unrestricted guest | apic-access virtualization
     // | apic-register virtualization; dependent primary bits are added only
     // when the secondary ones actually survived the capability clamp
@@ -1211,6 +1328,14 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
     g.vcpu._exit_stack_top = g.exit_stack.0.as_ptr() as u64 + 4096;
     // host rsp must point at the stack top when the exit lands
     let _ = vmwrite(HOST_RSP, g.vcpu._exit_stack_top);
+    // p3: reload the preemption timer on every entry — the countdown
+    // persists across exits, a stale value would shorten the next slice
+    if PREEMPT_ARMED.load(Ordering::Relaxed) {
+        let _ = vmwrite(
+            VMX_PREEMPT_TIMER,
+            preempt_slice(PREEMPT_RATE.load(Ordering::Relaxed)),
+        );
+    }
 
     // apply the ring-3 requests: gpr overrides first, then the injection
     if have_ctl {
@@ -1306,16 +1431,26 @@ pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
         return -1;
     }
 
-    // fresh ram frames, rolled back on any failure below
+    // fresh ram frames, rolled back on any failure below; aligned runs
+    // preferred so completed regions can collapse into 2 mib leaves
     let mut new_ram: Vec<PhysFrame<Size4KiB>> = Vec::new();
-    for _ in 0..count {
-        match memory::alloc_frame() {
-            Some(f) => new_ram.push(f),
-            None => {
-                for f in &new_ram {
-                    memory::dealloc_frame(*f);
+    let aligned = if EPT2M_OK.load(Ordering::Relaxed) {
+        memory::alloc_frames_aligned(count, TWO_MIB)
+    } else {
+        None
+    };
+    if let Some(v) = aligned {
+        new_ram = v; // atomic: all or nothing
+    } else {
+        for _ in 0..count {
+            match memory::alloc_frame() {
+                Some(f) => new_ram.push(f),
+                None => {
+                    for f in &new_ram {
+                        memory::dealloc_frame(*f);
+                    }
+                    return -1;
                 }
-                return -1;
             }
         }
     }
@@ -1343,17 +1478,45 @@ pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
     }
     let ept_pd = g.tables[2];
     unsafe {
+        let pd_ptr = memory::phys_to_virt(ept_pd.start_address()).as_mut_ptr::<u64>();
         for (k, pt) in new_pts.iter().enumerate() {
-            let p = memory::phys_to_virt(ept_pd.start_address()).as_mut_ptr::<u64>();
-            p.add(old_npts as usize + k)
+            pd_ptr
+                .add(old_npts as usize + k)
                 .write_volatile(pt.start_address().as_u64() | EPT_TABLE);
         }
+        // pt for guest frame index gi: an existing tail pt or one of the
+        // fresh ones — new pts are appended to g.tables only at commit, so
+        // indexing g.tables here would land in the apic frames
         for (i, rf) in new_ram.iter().enumerate() {
             let gi = old_len as usize + i;
-            let p =
-                memory::phys_to_virt(g.tables[3 + gi / 512].start_address()).as_mut_ptr::<u64>();
+            let pt = if gi / 512 < old_npts as usize {
+                g.tables[3 + gi / 512]
+            } else {
+                new_pts[gi / 512 - old_npts as usize]
+            };
+            let p = memory::phys_to_virt(pt.start_address()).as_mut_ptr::<u64>();
             p.add(gi % 512)
                 .write_volatile(rf.start_address().as_u64() | EPT_LEAF);
+        }
+        // p3: collapse completed, physically aligned regions into 2 mib
+        // leaves — the old tail finished by this growth and full new
+        // regions; pt frames stay allocated for uniform indexing
+        if EPT2M_OK.load(Ordering::Relaxed) {
+            let total = old_len as usize + new_ram.len();
+            for k in 0..total.div_ceil(512) {
+                let start = k * 512;
+                if start + 512 <= total {
+                    let rf = if start < old_len as usize {
+                        g.ram[start]
+                    } else {
+                        new_ram[start - old_len as usize]
+                    };
+                    let base = rf.start_address().as_u64();
+                    if base.is_multiple_of(TWO_MIB) {
+                        pd_ptr.add(k).write_volatile(base | EPT_LEAF_2M);
+                    }
+                }
+            }
         }
     }
 

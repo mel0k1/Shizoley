@@ -269,7 +269,17 @@ guest_destroy` за syscalls 15/16/17.
       ring 3 пишет флаги/инжекцию (raw vm-entry interruption-info + err +
       len с валидацией)/16 GPR; vmcall поглощается (rip advance) — v0.9.0.
       gdemo: загрузка GPR + инжекция int 0x20 с IVT-обработчиком.
-- [ ] P3: preemption timer, 2 MiB-листья EPT, posted interrupts.
+- [x] P3: preemption timer — pin-ctl bit 6 (allowed-1 гейт), VMCS 0x482E
+      перезаряжается на каждом входе; срез ≈ один тик планировщика
+      (калибровка TSC по двум тикам при первом госте, VMX_MISC[4:0] —
+      ставка декремента); exit 52 = reportable, never resume in root — v0.10.0.
+- [x] P3: 2 MiB-листья EPT — гейт EPT_VPID_CAP[16], `alloc_frames_aligned`
+      (атомарный выровненный запуск кадров), коллапс полных физически
+      выровненных регионов в pd-лист 0xB7 (PT остаётся выделенным для
+      единообразной индексации), работает и на росте через GUEST_MAP —
+      v0.10.0. Заодно закрыт латентный баг индексации новых PT в
+      guest_map (листья попадали в apic_pd при переходе через 512-границу).
+- [ ] P3+: posted interrupts (needs vAPIC story).
 
 **eq.rs / caps**
 - [x] P2: error-канал — head+32 error_code (первый код: E_DROP/E_CLOSED/

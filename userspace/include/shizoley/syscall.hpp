@@ -38,6 +38,7 @@ enum class VmxExit : long {
     apic_access = 44,  // guest hit the virtual apic page (out[3]=offset)
     ept_violation = 49,
     ept_misconfig = 50,
+    preempt_timer = 52, // vmx preemption timer expired: re-enter
     hlt = 12,
 };
 

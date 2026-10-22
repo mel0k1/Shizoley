@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use bootloader::bootinfo::{BootInfo, MemoryMap, MemoryRegionType};
 use spin::{Mutex, Once};
 use x86_64::registers::control::Cr3;
@@ -69,6 +70,47 @@ impl BitmapFrames {
             self.cursor = (i + 1) % total;
             let addr = (self.base / FRAME_SIZE + i as u64) * FRAME_SIZE;
             return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
+        }
+        None
+    }
+
+    // a contiguous run of `count` free frames with the first frame's
+    // physical address `align`-aligned; atomic (all or nothing). used for
+    // 2 mib ept leaves — a leaf maps its whole 2 mib region, so the run
+    // base must carry the alignment
+    fn alloc_run(&mut self, count: u64, align: u64) -> Option<Vec<PhysFrame<Size4KiB>>> {
+        if count == 0 || align == 0 || !align.is_multiple_of(FRAME_SIZE) {
+            return None;
+        }
+        let total = self.total_bits();
+        let first_fno = self.base / FRAME_SIZE;
+        let step = (align / FRAME_SIZE).max(1);
+        // first candidate frame number that can satisfy the alignment
+        let off0 = (step - (first_fno % step)) % step;
+        let mut cand = off0;
+        while cand < total {
+            if cand + count <= total {
+                let mut taken = false;
+                for k in 0..count {
+                    let i = (cand + k) as usize;
+                    if self.bits[i / 64] & (1 << (i % 64)) != 0 {
+                        taken = true;
+                        break;
+                    }
+                }
+                if !taken {
+                    let mut v = Vec::new();
+                    for k in 0..count {
+                        let i = (cand + k) as usize;
+                        self.bits[i / 64] |= 1 << (i % 64);
+                        let addr = (first_fno + cand + k) * FRAME_SIZE;
+                        v.push(PhysFrame::containing_address(PhysAddr::new(addr)));
+                    }
+                    self.cursor = ((cand + count) % total) as usize;
+                    return Some(v);
+                }
+            }
+            cand += step;
         }
         None
     }
@@ -204,6 +246,14 @@ unsafe impl FrameAllocator<Size4KiB> for GlobalFrames {
 pub fn alloc_frame() -> Option<PhysFrame<Size4KiB>> {
     let mut guard = FRAMES.lock();
     guard.as_mut()?.alloc()
+}
+
+// `count` consecutive frames whose first frame's physical address is
+// `align`-aligned; atomic. falls back to per-frame allocs at the caller
+// when the pool is too fragmented for the run
+pub fn alloc_frames_aligned(count: u64, align: u64) -> Option<Vec<PhysFrame<Size4KiB>>> {
+    let mut guard = FRAMES.lock();
+    guard.as_mut()?.alloc_run(count, align)
 }
 
 // hand a frame back to the pool; returns false for unknown/already-free

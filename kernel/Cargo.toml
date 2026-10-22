@@ -1,6 +1,6 @@
 [package]
 name = "paparaci"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 description = "Paparaci microkernel of the Shizoley OS"
 license = "Apache-2.0"

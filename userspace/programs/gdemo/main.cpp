@@ -120,8 +120,9 @@ int main() {
             guest_destroy(g);
             return 1;
         }
-        if (reason == static_cast<long>(VmxExit::ext_int)) {
-            continue; // timer took the cpu back: re-enter
+        if (reason == static_cast<long>(VmxExit::ext_int) ||
+            reason == static_cast<long>(VmxExit::preempt_timer)) {
+            continue; // host took the cpu back (tick or p3 timer): re-enter
         }
         if (reason == static_cast<long>(VmxExit::vmcall) && stage == 0) {
             // host -> guest: gpr override, the guest branches on rax
