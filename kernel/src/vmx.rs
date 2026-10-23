@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,7 +10,8 @@ use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::serial_println;
-use crate::{gdt, memory, println};
+use crate::task::Process;
+use crate::{caps, gdt, memory, println};
 
 // the Veda-style heart: VMCS + vcpu + EPT behind GUEST_CREATE/VCPU_RUN
 // syscalls. one vcpu per guest, unrestricted real-mode entry, EPT shadows
@@ -209,7 +211,7 @@ struct ExitStack([u8; 4096]);
 
 struct Guest {
     id: u64,
-    owner_pid: u64,
+    owner: Arc<Process>, // creator: the ram window lives in its space
     ram: Vec<PhysFrame<Size4KiB>>,
     tables: Vec<PhysFrame<Size4KiB>>, // ept pml4+pdpt+pd+pts + apic pd/pt/access/vapic (+pi desc)
     vmcs: PhysFrame<Size4KiB>,
@@ -987,7 +989,7 @@ fn region_contiguous(ram: &[PhysFrame<Size4KiB>], start: usize) -> bool {
         .all(|(k, f)| f.start_address().as_u64() == base + k as u64 * 0x1000)
 }
 
-pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
+pub fn guest_create(pages: u64) -> i64 {
     if !vmx_ready() {
         return -1;
     }
@@ -998,9 +1000,6 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
         Some(c) => c,
         None => return -1,
     };
-    if cur.proc.id != owner_pid {
-        return -1;
-    }
     // reserved up front: the id doubles as the non-zero vpid
     let id = NEXT_GUEST.fetch_add(1, Ordering::AcqRel);
 
@@ -1250,7 +1249,7 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
     }
     GUESTS.lock().push(Guest {
         id,
-        owner_pid,
+        owner: cur.proc.clone(),
         ram,
         tables,
         vmcs,
@@ -1264,13 +1263,15 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
     serial_println!(
         "[vmx] guest {} created: pid {} pages {} eptp {:#x} vpid {} pi {}",
         id,
-        owner_pid,
+        cur.proc.id,
         pages,
         ept_pml4.start_address().as_u64(),
         id & 0xFFFF,
         pi_desc_phys != 0
     );
-    id as i64
+    // the caller's root capability on the guest: unguessable, every right
+    let root = caps::install_root(caps::Obj::guest(id), cur.proc.id);
+    root as i64
 }
 
 // write every field a real-mode unrestricted guest needs; any field the
@@ -1498,8 +1499,8 @@ fn setup_vmcs(
 // switch a guest to the long-mode preset (mode 1): the monitor preloads
 // page tables / gdt / 64-bit code into guest ram through its window and
 // points rip/rsp/cr3 at them via the vcpu_run control half (flags bit2).
-// real-mode guests are unaffected; the switch is idempotent.
-pub fn guest_mode(owner_pid: u64, gid: u64, mode: u64) -> i64 {
+// real-mode guests are unaffected; the switch is idempotent (GMODE right)
+pub fn guest_mode(handle: u64, mode: u64) -> i64 {
     if !vmx_ready() || mode != 1 {
         return -1;
     }
@@ -1507,14 +1508,11 @@ pub fn guest_mode(owner_pid: u64, gid: u64, mode: u64) -> i64 {
         Some(c) => c,
         None => return -1,
     };
-    if cur.proc.id != owner_pid {
+    let Some(obj) = caps::lookup(handle, cur.proc.id, caps::K_GUEST, caps::GMODE) else {
         return -1;
-    }
+    };
     let mut guests = GUESTS.lock();
-    let Some(g) = guests
-        .iter_mut()
-        .find(|g| g.id == gid && g.owner_pid == owner_pid)
-    else {
+    let Some(g) = guests.iter_mut().find(|g| g.id == obj.id) else {
         return -1;
     };
     if g.mode == 1 {
@@ -1598,8 +1596,9 @@ const OFF_IN_CR3: usize = 26; // entry cr3 (guest phys, validated)
 const OFF_IN_GPRS: usize = 28; // 16 u64 loaded when flags bit0
 const EXIT_BUF_BYTES: usize = 352; // 44 u64 total
 
-// enter the guest until a reportable exit; returns the reason
-pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
+// enter the guest until a reportable exit; returns the reason.
+// `handle` is the caller's guest capability (GRUN right)
+pub fn vcpu_run(handle: u64, out_buf: u64) -> i64 {
     if !vmx_ready() {
         return -1;
     }
@@ -1610,14 +1609,16 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
         Some(c) => c,
         None => return -1,
     };
-    if cur.proc.id != owner_pid {
+    let Some(obj) = caps::lookup(handle, cur.proc.id, caps::K_GUEST, caps::GRUN) else {
+        serial_println!(
+            "[vmx] vcpu_run denied: pid {} holds no guest capability {:#x}",
+            cur.proc.id,
+            handle
+        );
         return -1;
-    }
+    };
     let mut guests = GUESTS.lock();
-    let Some(g) = guests
-        .iter_mut()
-        .find(|g| g.id == gid && g.owner_pid == owner_pid)
-    else {
+    let Some(g) = guests.iter_mut().find(|g| g.id == obj.id) else {
         return -1;
     };
 
@@ -1736,7 +1737,8 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
 
 // grow a guest at runtime: `count` fresh pages append to guest phys memory
 // (flat gpa layout), the ept and the creator's window; returns the new size
-pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
+// (GMAP right)
+pub fn guest_map(handle: u64, count: u64) -> i64 {
     if !vmx_ready() || count == 0 {
         return -1;
     }
@@ -1744,14 +1746,11 @@ pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
         Some(c) => c,
         None => return -1,
     };
-    if cur.proc.id != owner_pid {
+    let Some(obj) = caps::lookup(handle, cur.proc.id, caps::K_GUEST, caps::GMAP) else {
         return -1;
-    }
+    };
     let mut guests = GUESTS.lock();
-    let Some(g) = guests
-        .iter_mut()
-        .find(|g| g.id == gid && g.owner_pid == owner_pid)
-    else {
+    let Some(g) = guests.iter_mut().find(|g| g.id == obj.id) else {
         return -1;
     };
     let old_len = g.ram.len() as u64;
@@ -1809,7 +1808,7 @@ pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
     // must never leave stale translations behind
     let mut mapped: u64 = 0;
     {
-        let mut aspace = cur.proc.aspace.lock();
+        let mut aspace = g.owner.aspace.lock();
         let flags = PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::USER_ACCESSIBLE
@@ -1826,7 +1825,7 @@ pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
         }
     }
     if mapped < count {
-        let mut aspace = cur.proc.aspace.lock();
+        let mut aspace = g.owner.aspace.lock();
         for i in 0..mapped {
             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
                 GUEST_WINDOW + (old_len + i) * 0x1000,
@@ -1886,7 +1885,7 @@ pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
     invept_all(eptp);
     serial_println!(
         "[vmx] guest {} mapped: +{} pages -> {} total",
-        gid,
+        obj.id,
         count,
         old_len + count
     );
@@ -1898,7 +1897,7 @@ pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
 // it instead of reporting it to ring 3, and virtual-interrupt delivery
 // injects it into the guest without further exits. vector 0 clears every
 // routing. needs apicv (pin bit 7 + vid allowed); refused elsewhere.
-pub fn guest_pi(owner_pid: u64, gid: u64, vector: u64) -> i64 {
+pub fn guest_pi(handle: u64, vector: u64) -> i64 {
     if !vmx_ready() || vector > 255 {
         return -1;
     }
@@ -1910,14 +1909,11 @@ pub fn guest_pi(owner_pid: u64, gid: u64, vector: u64) -> i64 {
         Some(c) => c,
         None => return -1,
     };
-    if cur.proc.id != owner_pid {
+    let Some(obj) = caps::lookup(handle, cur.proc.id, caps::K_GUEST, caps::GPI) else {
         return -1;
-    }
+    };
     let mut guests = GUESTS.lock();
-    let Some(g) = guests
-        .iter_mut()
-        .find(|g| g.id == gid && g.owner_pid == owner_pid)
-    else {
+    let Some(g) = guests.iter_mut().find(|g| g.id == obj.id) else {
         return -1;
     };
     if vector == 0 {
@@ -1935,27 +1931,26 @@ pub fn guest_pi(owner_pid: u64, gid: u64, vector: u64) -> i64 {
     0
 }
 
-pub fn guest_destroy(owner_pid: u64, gid: u64) -> i64 {
+pub fn guest_destroy(handle: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
         None => return -1,
     };
-    if cur.proc.id != owner_pid {
+    let Some(obj) = caps::lookup(handle, cur.proc.id, caps::K_GUEST, caps::GDESTROY) else {
         return -1;
-    }
+    };
     let mut guests = GUESTS.lock();
-    let Some(pos) = guests
-        .iter()
-        .position(|g| g.id == gid && g.owner_pid == owner_pid)
-    else {
+    let Some(pos) = guests.iter().position(|g| g.id == obj.id) else {
         return -1;
     };
     let g = guests.remove(pos);
+    drop(guests);
+    caps::drop_obj(caps::Obj::guest(g.id));
     let nram = g.ram.len();
     // detach the window from the creator's space, then free everything
     let mut freed: u64 = 0;
     {
-        let mut aspace = cur.proc.aspace.lock();
+        let mut aspace = g.owner.aspace.lock();
         for i in 0..nram as u64 {
             let page =
                 Page::<Size4KiB>::containing_address(VirtAddr::new(GUEST_WINDOW + i * 0x1000));
@@ -1985,11 +1980,46 @@ pub fn guest_destroy(owner_pid: u64, gid: u64) -> i64 {
     invept_all(g.tables[0].start_address().as_u64());
     serial_println!(
         "[vmx] guest {} destroyed: {} ram frames, {} ept/vmcs frames freed",
-        gid,
+        g.id,
         nram,
         freed
     );
     0
+}
+
+// a process died: its guests go with it — the window dies with the space,
+// every ram/ept/vmcs frame goes back to the pool. runs before aspace
+// teardown so the window mappings are gone before the sweep reaches them.
+// without this the GUESTS entry leaked tables/vmcs on every kill (and the
+// teardown would free the ram frames through the window a second time)
+pub fn close_process(proc: &Arc<Process>) {
+    let dead: Vec<Guest> = {
+        let mut guests = GUESTS.lock();
+        let (mine, rest): (Vec<_>, Vec<_>) = guests.drain(..).partition(|g| g.owner.id == proc.id);
+        *guests = rest;
+        mine
+    };
+    for g in dead {
+        caps::drop_obj(caps::Obj::guest(g.id));
+        let mut aspace = proc.aspace.lock();
+        for i in 0..g.ram.len() as u64 {
+            let page =
+                Page::<Size4KiB>::containing_address(VirtAddr::new(GUEST_WINDOW + i * 0x1000));
+            aspace.unmap_user_page(page);
+        }
+        drop(aspace);
+        for f in &g.ram {
+            memory::dealloc_frame(*f);
+        }
+        for f in &g.tables {
+            memory::dealloc_frame(*f);
+        }
+        let _ = vmclear(g.vmcs.start_address().as_u64());
+        memory::dealloc_frame(g.vmcs);
+        invvpid_all();
+        invept_all(g.tables[0].start_address().as_u64());
+        serial_println!("[vmx] guest {} closed (owner {} gone)", g.id, proc.id);
+    }
 }
 
 unsafe fn zero_frame(frame: PhysFrame<Size4KiB>) {

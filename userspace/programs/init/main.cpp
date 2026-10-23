@@ -100,6 +100,10 @@ int main() {
     long caps = spawn("capsdemo", 8);
     println("[init] spawned capsdemo (", static_cast<u64>(caps), ")");
 
+    // futex over the doorbell: threads synchronize on a plain u32 word
+    long fux = spawn("fuxdemo", 7);
+    println("[init] spawned fuxdemo (", static_cast<u64>(fux), ")");
+
     // services in ring 3: fsd owns the initrd, rtcd owns the cmos ports
     long fsd = spawn("fsd", 3);
     long rtcd = spawn("rtcd", 4);

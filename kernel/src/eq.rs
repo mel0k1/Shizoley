@@ -223,8 +223,8 @@ pub fn setup(base: u64, size: u64) -> i64 {
     *nid += 1;
     drop(nid);
     reg.push((qid, eq));
-    // the caller's root capability: unguessable, every right
-    let root = caps::install_root(qid, cur.proc.id);
+    // the caller's root capability: unguessable, every right of the kind
+    let root = caps::install_root(caps::Obj::eq(qid), cur.proc.id);
     serial_println!(
         "[eq] queue {} registered: pid {} base {:#x} chunk {} x {} root {:#x}",
         qid,
@@ -241,8 +241,8 @@ pub fn setup(base: u64, size: u64) -> i64 {
 // denial carries the right that was missing so the serial log tells the
 // whole story
 fn resolve(token: u64, pid: u64, need: u32, what: &str) -> Option<u64> {
-    match caps::lookup(token, pid, need) {
-        Some(qid) => Some(qid),
+    match caps::lookup(token, pid, caps::K_EQ, need) {
+        Some(obj) => Some(obj.id),
         None => {
             serial_println!(
                 "[eq] {} denied: pid {} holds no capability {:#x} (need {:#x})",
@@ -662,75 +662,6 @@ pub fn timer_tick(t: u64) {
     }
 }
 
-// hand out rights: derives a child capability from the caller's instance
-// (subset of its bits; delegation needs QGRANT) bound to target_pid and
-// returns the child's token — the granter passes those 8 bytes over ipc.
-// would_cycle refuses grants that would hand the queue back to a holder
-// of an ancestor (Veda-style cycle in the derivation forest)
-pub fn grant(handle: u64, target_pid: u64, bits: u32) -> i64 {
-    let cur = match crate::sched::current() {
-        Some(c) => c,
-        None => return -1,
-    };
-    let Some(qid) = caps::lookup(handle, cur.proc.id, 0) else {
-        serial_println!(
-            "[caps] grant denied: pid {} holds no capability {:#x}",
-            cur.proc.id,
-            handle
-        );
-        return -1;
-    };
-    match caps::grant(handle, cur.proc.id, target_pid, bits) {
-        Ok(child) => {
-            serial_println!(
-                "[caps] granted {:#x} on queue {} to pid {} (handle {:#x})",
-                bits,
-                qid,
-                target_pid,
-                child
-            );
-            child as i64
-        }
-        Err(caps::GrantErr::Cycle) => {
-            serial_println!(
-                "[caps] would_cycle refused: grant on queue {} to pid {} (chain reaches the holder)",
-                qid,
-                target_pid
-            );
-            -1
-        }
-        Err(caps::GrantErr::NoRight) => {
-            serial_println!(
-                "[caps] grant denied: pid {} lacks QGRANT or the bits on queue {}",
-                cur.proc.id,
-                qid
-            );
-            -1
-        }
-        Err(caps::GrantErr::Bad) => -1,
-    }
-}
-
-// take a derivation subtree back: the caller's instance stays, everything
-// derived from it (transitively) is removed; returns the count
-pub fn revoke(handle: u64) -> i64 {
-    let cur = match crate::sched::current() {
-        Some(c) => c,
-        None => return -1,
-    };
-    match caps::revoke(handle, cur.proc.id) {
-        Ok(n) => {
-            serial_println!(
-                "[caps] revoked handle {:#x}: {} derived handles died",
-                handle,
-                n
-            );
-            n as i64
-        }
-        Err(_) => -1,
-    }
-}
-
 // ------------------------------------------------------- zero-copy gifts
 //
 // big events travel as PAGES, not bytes: eq_zpost detaches the frames
@@ -746,7 +677,7 @@ const ZSLOTS: u64 = 16;
 const ZMAX_PAGES: usize = 64; // one gift <= 256 KiB
 
 struct ZGift {
-    handle: u64,
+    gid: u64,            // kernel-internal id; the token lives in caps
     owner: Arc<Process>, // queue owner = the receiver
     from_pid: u64,       // the poster who gave the pages away
     frames: Vec<PhysFrame<Size4KiB>>,
@@ -815,54 +746,54 @@ pub fn zpost(handle: u64, uaddr: u64, len: u64) -> i64 {
             aspace.unmap_user_page(page);
         }
     }
-    let handle = NEXT_GIFT.fetch_add(1, Ordering::AcqRel);
+    let gid = NEXT_GIFT.fetch_add(1, Ordering::AcqRel);
+    // the receiver's root capability on the gift: unguessable, ZMAP|ZDONE
+    let token = caps::install_root(caps::Obj::gift(gid), eq.owner.id);
     GIFTS.lock().push(ZGift {
-        handle,
+        gid,
         owner: eq.owner.clone(),
         from_pid: cur.proc.id,
         frames,
         bytes: len,
         mapped_va: 0,
     });
-    // announce: 16-byte payload — handle + byte count
+    // announce: 16-byte payload — capability token + byte count
     let mut payload = [0u8; 16];
-    payload[0..8].copy_from_slice(&handle.to_le_bytes());
+    payload[0..8].copy_from_slice(&token.to_le_bytes());
     payload[8..16].copy_from_slice(&len.to_le_bytes());
     if post_bytes(qid, OP_ZMSG, &payload) != 0 {
         // queue died mid-post: the gift is void, the pages go back to the
         // pool (the poster's buffer is gone — that is the transfer contract)
-        zdrop_handle(handle);
+        zdrop_handle(gid);
         return -1;
     }
     serial_println!(
         "[eq] zcopy: pid {} gave handle {} ({} pages) to queue {}",
         cur.proc.id,
-        handle,
+        gid,
         npages,
         qid
     );
-    handle as i64
+    token as i64
 }
 
 // receiver side: map the gift into the owner's address space, one slot
-// each; the mapping is plain RW user pages — reads are direct loads
+// each; the mapping is plain RW user pages — reads are direct loads.
+// `handle` is the gift's capability token (ZMAP right)
 pub fn zmap(handle: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
         None => return -1,
     };
-    let mut gifts = GIFTS.lock();
-    // immutable passes first: existence, ownership, idempotency, slot usage
-    let state = gifts
-        .iter()
-        .find(|g| g.handle == handle)
-        .map(|g| (g.owner.id == cur.proc.id, g.mapped_va));
-    let Some((is_owner, mapped)) = state else {
+    let Some(obj) = caps::lookup(handle, cur.proc.id, caps::K_GIFT, caps::ZMAP) else {
         return -1;
     };
-    if !is_owner {
+    let mut gifts = GIFTS.lock();
+    // immutable pass first: existence, idempotency, slot usage
+    let mapped = gifts.iter().find(|g| g.gid == obj.id).map(|g| g.mapped_va);
+    let Some(mapped) = mapped else {
         return -1;
-    }
+    };
     if mapped != 0 {
         return mapped as i64; // idempotent
     }
@@ -880,10 +811,10 @@ pub fn zmap(handle: u64) -> i64 {
         }
     }
     if va == 0 {
-        serial_println!("[eq] zmap: no free slot for handle {}", handle);
+        serial_println!("[eq] zmap: no free slot for gid {}", obj.id);
         return -1;
     }
-    let Some(g) = gifts.iter_mut().find(|g| g.handle == handle) else {
+    let Some(g) = gifts.iter_mut().find(|g| g.gid == obj.id) else {
         return -1;
     };
 
@@ -921,7 +852,7 @@ pub fn zmap(handle: u64) -> i64 {
     g.mapped_va = va;
     serial_println!(
         "[eq] zcopy: handle {} -> {:#x} for pid {} ({} bytes)",
-        handle,
+        obj.id,
         va,
         cur.proc.id,
         g.bytes
@@ -929,21 +860,23 @@ pub fn zmap(handle: u64) -> i64 {
     va as i64
 }
 
-// receiver side: consumed — unmap and free the frames
+// receiver side: consumed — unmap and free the frames (ZDONE right)
 pub fn zdone(handle: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
         None => return -1,
     };
+    let obj = match caps::lookup(handle, cur.proc.id, caps::K_GIFT, caps::ZDONE) {
+        Some(o) => o,
+        None => return -1,
+    };
     let mut gifts = GIFTS.lock();
-    let Some(pos) = gifts.iter().position(|g| g.handle == handle) else {
+    let Some(pos) = gifts.iter().position(|g| g.gid == obj.id) else {
         return -1;
     };
-    if gifts[pos].owner.id != cur.proc.id {
-        return -1;
-    }
     let g = gifts.remove(pos);
     drop(gifts);
+    caps::drop_obj(caps::Obj::gift(g.gid));
     zfree_gift(&g, "consumed");
     0
 }
@@ -963,15 +896,16 @@ fn zfree_gift(g: &ZGift, why: &str) {
     for f in g.frames.iter() {
         memory::dealloc_frame(*f);
     }
-    serial_println!("[eq] zcopy: gift {} {} ({} pages freed)", g.handle, why, n);
+    serial_println!("[eq] zcopy: gift {} {} ({} pages freed)", g.gid, why, n);
 }
 
 // abort a gift that never got announced (post failure)
-fn zdrop_handle(handle: u64) {
+fn zdrop_handle(gid: u64) {
     let mut gifts = GIFTS.lock();
-    if let Some(pos) = gifts.iter().position(|g| g.handle == handle) {
+    if let Some(pos) = gifts.iter().position(|g| g.gid == gid) {
         let g = gifts.remove(pos);
         drop(gifts);
+        caps::drop_obj(caps::Obj::gift(g.gid));
         zfree_gift(&g, "aborted");
     }
 }
@@ -988,6 +922,7 @@ fn zdrop_process(pid: u64) {
         dead
     };
     for g in dead {
+        caps::drop_obj(caps::Obj::gift(g.gid));
         zfree_gift(&g, "dropped");
     }
 }
@@ -1011,7 +946,7 @@ pub fn close_process(pid: u64) {
         mine
     };
     for (qid, eq) in dead {
-        caps::drop_queue(qid);
+        caps::drop_obj(caps::Obj::eq(qid));
         if qid == *SINK_QID.lock() {
             *SINK_QID.lock() = 0;
         }

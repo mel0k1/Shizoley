@@ -114,4 +114,12 @@ long tsleep(u64 ms) {
     return 0;
 }
 
+long futex_wait(u32* uaddr, u32 expected) {
+    return syscall(Sys::futex_wait, reinterpret_cast<u64>(uaddr), expected);
+}
+
+long futex_wake(u32* uaddr, u64 n) {
+    return syscall(Sys::futex_wake, reinterpret_cast<u64>(uaddr), n);
+}
+
 }

@@ -68,16 +68,17 @@ long eq_listen(long handle);
 // one OP_TICK with the tick count whenever the tm_arm deadline passes
 long eq_tlisten(long handle);
 // derive a child capability for pid (subset of the caller's rights; the
-// caller's handle must carry GRANT) and return its token — pass it to pid
-// over ipc; refused when the derivation chain would cycle (would_cycle)
+// caller's handle must carry the kind's grant right) and return its token
+// — pass it to pid over ipc; works on any object kind (queues, guests,
+// gifts), refused when the derivation chain would cycle (would_cycle)
 long eq_grant(long handle, u64 pid, u32 rights);
 // take the whole derivation subtree back; returns how many handles died
 long eq_revoke(long handle);
 
 // zero-copy big events: the poster gives away the pages behind a
-// page-aligned buffer (eq_zpost -> handle), the queue owner maps them with
-// eq_zmap (plain loads, no copies) and frees them with eq_zdone. a gift
-// dies with either side of the queue.
+// page-aligned buffer (eq_zpost -> unguessable token), the queue owner
+// maps them with eq_zmap (plain loads, no copies) and frees them with
+// eq_zdone. a gift dies with either side of the queue.
 long eq_zpost(long handle, const void* buf, u64 len);
 long eq_zmap(long handle);
 long eq_zdone(long handle);

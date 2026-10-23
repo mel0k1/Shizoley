@@ -54,7 +54,7 @@ jobs:
           grep -qF "[eq] 100 events in" serial.log
           grep -qF "[init] drained 101 events, bye" serial.log
           grep -qF "[hello] wait denied (no WAIT right): per-op caps ok" serial.log
-          grep -qF "[eq] zcopy: 8192 bytes via handle 1: pattern ok" serial.log
+          grep -qE "\[eq\] zcopy: 8192 bytes via handle [0-9]+: pattern ok" serial.log
           grep -qF "[eq] zcopy: gift 1 consumed (2 pages freed)" serial.log
           grep -qF "[gdemo64] vmx unavailable (guest_create refused)" serial.log
           grep -qF "process 'init' (1) finished" serial.log
@@ -78,6 +78,9 @@ jobs:
           grep -qE "\[ps\] [0-9]+ run [0-9]+ sleeper" serial.log
           grep -qE "\[kill\] target [0-9]+ terminated \(by [0-9]+\)" serial.log
           grep -qF "[init] kill ok" serial.log
+          grep -qF "[futex] mismatch returned 1 (no sleep)" serial.log
+          grep -qF "[futex] woke, word 42" serial.log
+          grep -qF "[futex] all ok" serial.log
 
   userspace:
     name: userspace (c++)

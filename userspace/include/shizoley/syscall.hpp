@@ -20,13 +20,13 @@ enum class Sys : u64 {
     initrd_size = 12,  // () -> bytes (initrd mapped ro at INITRD_BASE)
     write = 13,        // (buf, len) -> len; atomic console line
     kill = 14,         // (pid) -> 0 | -1; end every thread of the process
-    guest_create = 15, // (pages) -> handle; vmcs + ept + ram window
-    vcpu_run = 16,     // (handle, out u64[20]) -> exit reason
-    guest_destroy = 17,// (handle) -> 0 | -1; frees ram, ept, vmcs
+    guest_create = 15, // (pages) -> root capability handle; vmcs + ept + ram window
+    vcpu_run = 16,     // (handle, out u64[20]) -> exit reason (GRUN)
+    guest_destroy = 17,// (handle) -> 0 | -1; frees ram, ept, vmcs (GDESTROY)
     eq_listen = 18,    // (handle) -> 0 | -1; register kernel event sink
-    eq_grant = 19,     // (handle, pid, rights) -> child handle | -1
+    eq_grant = 19,     // (handle, pid, rights) -> child handle | -1; any kind
     eq_revoke = 20,    // (handle) -> n revoked | -1; cascade the subtree
-    guest_map = 21,    // (handle, count) -> new size | -1; grow guest ram+ept
+    guest_map = 21,    // (handle, count) -> new size | -1; grow guest ram+ept (GMAP)
     eq_alert = 22,     // (handle) -> 0 | -1; cancel a parked eq_wait
     eq_zpost = 23,     // (handle, buf, len) -> gift handle | -1; zero-copy
     eq_zmap = 24,      // (handle) -> va | -1; map the gift into the owner
@@ -38,6 +38,8 @@ enum class Sys : u64 {
     ticks = 29,        // () -> scheduler tick count (PIT clock)
     tm_arm = 30,       // (deadline_ticks) -> 0 | -1; one-shot timer fire
                        // into the timer sink (owner only; 0 disarms)
+    futex_wait = 31,   // (uaddr, expected) -> 0 slept | 1 mismatch | -1
+    futex_wake = 32,   // (uaddr, n) -> threads woken
 };
 
 // ps(28) record, filled by the kernel (name is NUL-padded)
@@ -113,6 +115,12 @@ u64 ticks();
 long tm_arm(u64 deadline_ticks);
 long ps_find(const char* name);
 long tsleep(u64 ms);
+
+// futex over the doorbell: sleep on a u32 word until another thread of
+// the same process changes it and calls futex_wake. wait sleeps only when
+// the word still equals expected (else 1, linux -EAGAIN shape)
+long futex_wait(u32* uaddr, u32 expected);
+long futex_wake(u32* uaddr, u64 n);
 
 inline long syscall(Sys nr) {
     u64 ret = static_cast<u64>(nr);

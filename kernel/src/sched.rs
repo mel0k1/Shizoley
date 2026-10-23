@@ -260,8 +260,10 @@ fn maybe_destroy_process(proc: &Arc<Process>) {
         return;
     }
     crate::ipc::unregister(proc.id);
+    crate::vmx::close_process(proc);
     crate::eq::close_process(proc.id);
     crate::caps::drop_process(proc.id);
+    crate::futex::drop_process(proc.id);
     let freed = proc.aspace.lock().teardown();
     serial_println!(
         "[sched] process '{}' ({}) torn down, {} frames freed",
@@ -309,6 +311,8 @@ pub fn kill_process(target: u64) -> i64 {
         }
         // parked in event-queue wait/producer lists
         killed.extend(crate::eq::detach_process(target));
+        // parked on futex words
+        killed.extend(crate::futex::detach_process(target));
         // parked in the target's own recv waiters
         if let Some(proc) = crate::ipc::find(target) {
             killed.extend(proc.waiters.lock().drain(..));

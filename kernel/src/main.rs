@@ -8,6 +8,7 @@ mod allocator;
 mod caps;
 mod elf;
 mod eq;
+mod futex;
 mod gdt;
 mod initrd;
 mod interrupts;

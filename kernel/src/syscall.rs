@@ -187,22 +187,74 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         }
         // 14: kill(pid) -> 0 | -1; ends every thread of the process
         14 => sched::kill_process(a1) as u64,
-        // 15: guest_create(pages) -> handle | -1; vmcs + ept + ram window
-        15 => crate::vmx::guest_create(cur.proc.id, a1) as u64,
-        // 16: vcpu_run(handle, out16x u64) -> exit reason | -1
-        16 => crate::vmx::vcpu_run(cur.proc.id, a1, a2) as u64,
+        // 15: guest_create(pages) -> root capability handle | -1; vmcs +
+        //     ept + ram window behind an unguessable token
+        15 => crate::vmx::guest_create(a1) as u64,
+        // 16: vcpu_run(handle, out16x u64) -> exit reason | -1 (GRUN)
+        16 => crate::vmx::vcpu_run(a1, a2) as u64,
         // 17: guest_destroy(handle) -> 0 | -1; frees ram, ept, vmcs
-        17 => crate::vmx::guest_destroy(cur.proc.id, a1) as u64,
+        //     (GDESTROY; every capability on the guest dies with it)
+        17 => crate::vmx::guest_destroy(a1) as u64,
         // 18: eq_listen(qid, which) -> 0 | -1; register a kernel event sink
         //     (LISTEN right): which 0 = keyboard, 1 = timer fires
         18 => crate::eq::listen(a1, a2) as u64,
-        // 19: eq_grant(handle, pid, rights) -> child handle | -1; derives a
-        //     capability for pid (would_cycle-checked delegation)
-        19 => crate::eq::grant(a1, a2, a3 as u32) as u64,
-        // 20: eq_revoke(handle) -> n revoked | -1; cascade the subtree
-        20 => crate::eq::revoke(a1) as u64,
-        // 21: guest_map(handle, count) -> new size | -1; grow guest ram + ept
-        21 => crate::vmx::guest_map(cur.proc.id, a1, a2) as u64,
+        // 19: cap_grant(handle, pid, rights) -> child handle | -1; derive
+        //     a capability for pid on ANY object kind (would_cycle-checked
+        //     delegation; the granter must hold the kind's grant right)
+        19 => {
+            let target = a2;
+            let bits = a3 as u32;
+            match crate::caps::grant(a1, cur.proc.id, target, bits) {
+                Ok(child) => {
+                    let obj = crate::caps::obj_of(a1, cur.proc.id);
+                    let what = match obj.map(|o| o.kind).unwrap_or(0) {
+                        crate::caps::K_EQ => "queue",
+                        crate::caps::K_GUEST => "guest",
+                        _ => "gift",
+                    };
+                    serial_println!(
+                        "[caps] granted {:#x} on {} {} to pid {} (handle {:#x})",
+                        bits,
+                        what,
+                        obj.map(|o| o.id).unwrap_or(0),
+                        target,
+                        child
+                    );
+                    child as i64 as u64
+                }
+                Err(crate::caps::GrantErr::Cycle) => {
+                    serial_println!(
+                        "[caps] would_cycle refused: grant to pid {} (chain reaches the holder)",
+                        target
+                    );
+                    ERR
+                }
+                Err(crate::caps::GrantErr::NoRight) => {
+                    serial_println!(
+                        "[caps] grant denied: pid {} lacks the grant right or the bits",
+                        cur.proc.id
+                    );
+                    ERR
+                }
+                Err(crate::caps::GrantErr::Bad) => ERR,
+            }
+        }
+        // 20: cap_revoke(handle) -> n revoked | -1; cascade the subtree on
+        //     any object kind
+        20 => match crate::caps::revoke(a1, cur.proc.id) {
+            Ok(n) => {
+                serial_println!(
+                    "[caps] revoked handle {:#x}: {} derived handles died",
+                    a1,
+                    n
+                );
+                n as u64
+            }
+            Err(_) => ERR,
+        },
+        // 21: guest_map(handle, count) -> new size | -1; grow guest ram +
+        //     ept (GMAP)
+        21 => crate::vmx::guest_map(a1, a2) as u64,
         // 22: eq_alert(qid) -> 0 | -1; cancel parked eq_wait (SIGNAL right)
         22 => crate::eq::alert(a1) as u64,
         // 23: eq_zpost(qid, buf, len) -> handle | -1; zero-copy page gift
@@ -212,10 +264,12 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         // 25: eq_zdone(handle) -> 0 | -1; consume the gift, free the frames
         25 => crate::eq::zdone(a1) as u64,
         // 26: guest_mode(handle, mode) -> 0 | -1; mode 1 = long-mode guest
-        26 => crate::vmx::guest_mode(cur.proc.id, a1, a2) as u64,
+        //     (GMODE)
+        26 => crate::vmx::guest_mode(a1, a2) as u64,
         // 27: guest_pi(handle, vector) -> 0 | -1; route a host irq vector
-        //     into the guest's posted-interrupt descriptor (0 = clear all)
-        27 => crate::vmx::guest_pi(cur.proc.id, a1, a2) as u64,
+        //     into the guest's posted-interrupt descriptor (0 = clear all;
+        //     GPI)
+        27 => crate::vmx::guest_pi(a1, a2) as u64,
         // 28: ps(buf, max_entries) -> n; 40-byte records (pid, threads,
         //     state 0=run/1=dead, name[16])
         28 => crate::ipc::ps(a1, a2) as u64,
@@ -224,6 +278,11 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         // 30: timer_arm(deadline_ticks) -> 0 | -1; one-shot deadline for
         //     the timer sink (only its owner may arm; 0 disarms)
         30 => crate::eq::arm(a1) as u64,
+        // 31: futex_wait(uaddr, expected) -> 0 = slept, 1 = value mismatch
+        //     (no sleep), -1 = bad address
+        31 => crate::futex::wait(a1, a2 as u32) as u64,
+        // 32: futex_wake(uaddr, n) -> threads woken
+        32 => crate::futex::wake(a1, a2) as u64,
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);
