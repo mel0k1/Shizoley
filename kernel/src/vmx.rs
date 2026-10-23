@@ -32,6 +32,7 @@ const IA32_VMX_TRUE_PIN: u32 = 0x48D;
 const IA32_VMX_TRUE_PROC: u32 = 0x48E;
 const IA32_VMX_TRUE_EXIT: u32 = 0x48F;
 const IA32_VMX_TRUE_ENTRY: u32 = 0x490;
+const IA32_VMX_PROC2: u32 = 0x48B; // secondary proc-based ctl caps (no true variant)
 const IA32_VMX_EPT_VPID_CAP: u32 = 0x48C;
 const IA32_VMX_MISC: u32 = 0x485;
 
@@ -120,9 +121,11 @@ const PI_VECTOR: u64 = 0xF0;
 // vAPIC register offsets (sdm 29.1): isr 0x100, irr 0x200, 32 bytes each
 const VAPIC_ISR: u64 = 0x100;
 const VAPIC_IRR: u64 = 0x200;
-// 0x401c is the tpr threshold; 0x401e is secondary proc ctls — off by one
-// pair and one of them silently eats the other
-const VMX_TPR_THRESHOLD: u64 = 0x401C;
+// sdm table b-9 (32-bit control fields): 0x401e is the tpr threshold,
+// 0x4022 is secondary proc ctls — the pair 0x401c/0x401e would put proc2
+// into the tpr-threshold slot (reserved bits set -> vm-entry fails) and
+// leave secondary controls disabled entirely (no ept/urg/vid on real hw)
+const VMX_TPR_THRESHOLD: u64 = 0x401E;
 const VM_EXIT_INSTRUCTION_LEN: u64 = 0x440C;
 // cr4 mask/shadow are natural-width control fields (0x6002/0x6006); the
 // 0x40xx slot aliases are 32-bit control fields — writing there clobbers
@@ -130,7 +133,7 @@ const VM_EXIT_INSTRUCTION_LEN: u64 = 0x440C;
 const VMX_CR4_GUEST_HOST_MASK: u64 = 0x6002;
 const VMX_CR4_READ_SHADOW: u64 = 0x6006;
 const VMX_EPTP: u64 = 0x201A;
-const VMX_PROC_CTLS2: u64 = 0x401E;
+const VMX_PROC_CTLS2: u64 = 0x4022;
 const GUEST_PHYSICAL_ADDR: u64 = 0x2400;
 const VMCS_LINK_PTR: u64 = 0x2800;
 const GUEST_DEBUGCTL: u64 = 0x2802;
@@ -1293,7 +1296,12 @@ fn setup_vmcs(
     if PREEMPT_ARMED.load(Ordering::Relaxed) {
         pin_desired |= 1 << 6; // p3: preemption timer bounds every guest slice
     }
-    if pi_desc != 0 {
+    // p4: posted interrupts ride on the apic-virt suite — pin bit 7 needs
+    // vid (proc2 bit 9), vid needs the tpr shadow and access-virt (proc2
+    // bit 0). without access-virt the whole stack must stay off, or vm
+    // entry fails the control dependency checks on real hardware
+    let apicv_allowed = adjust_ctl(IA32_VMX_PROC2, 1 << 0) & (1 << 0) != 0;
+    if pi_desc != 0 && apicv_allowed {
         pin_desired |= PIN_POSTED; // p4: process posted interrupts (needs vid)
     }
     let pin = adjust_ctl(m_pin, pin_desired);
@@ -1306,19 +1314,29 @@ fn setup_vmcs(
             preempt_slice(PREEMPT_RATE.load(Ordering::Relaxed)),
         );
     }
-    // secondary first: ept | unrestricted guest | apic-access virtualization
-    // | apic-register virtualization | virtual-interrupt delivery (p4, when
-    // a descriptor exists); dependent primary bits are added only when the
-    // secondary ones actually survived the capability clamp
-    let proc2_desired =
-        (1 << 1) | (1 << 7) | (1 << 5) | (1 << 8) | if pi_desc != 0 { PROC2_VID } else { 0 };
-    let proc2 = adjust_ctl(0x48B, proc2_desired);
-    let apic_virt = proc2 & (1 << 5) != 0;
-    let proc2 = if apic_virt {
-        proc2
-    } else {
-        proc2 & !(1 << 8) // reg-virt cannot stand without access-virt
-    };
+    // secondary first: ept | unrestricted guest | virtualize apic accesses
+    // (bit 0 — NOT bit 5, which is vpid) | apic-register virtualization
+    // (bit 8 is only legal under bit 0) | virtual-interrupt delivery (p4,
+    // when a descriptor exists); dependent primary bits are added only when
+    // the secondary ones actually survived the capability clamp
+    let mut proc2_desired = (1 << 1)
+        | (1 << 7)
+        | (1 << 0)
+        | (1 << 8)
+        | if pi_desc != 0 && apicv_allowed {
+            PROC2_VID
+        } else {
+            0
+        };
+    if VPID_OK.load(Ordering::Relaxed) {
+        proc2_desired |= 1 << 5; // vpid: tagged tlb, no flush between entries
+    }
+    let mut proc2 = adjust_ctl(IA32_VMX_PROC2, proc2_desired);
+    let apic_virt = proc2 & (1 << 0) != 0;
+    if !apic_virt {
+        // reg-virt and vid cannot stand without access-virt
+        proc2 &= !((1 << 8) | (1 << 9));
+    }
     w(VMX_PROC_CTLS2, proc2);
     if pi_desc != 0 && proc2 & PROC2_VID != 0 {
         // the pair survived the clamp: wire the descriptor and the
@@ -1330,14 +1348,12 @@ fn setup_vmcs(
     let mut proc_desired = (1 << 7) | (1 << 24) | (1 << 31); // hlt | unconditional io | secondary;
                                                              // io exiting keeps guest ports away
                                                              // from the real pic/pit/keyboard
-    if VPID_OK.load(Ordering::Relaxed) {
-        proc_desired |= 1 << 5; // vpid: tagged tlb, no flush between entries
-    }
-    if apic_virt {
-        proc_desired |= 1 << 21; // tpr/cr8 shadow through the virtual-apic page
-    }
     if msr_bm != 0 {
         proc_desired |= 1 << 28; // use the msr bitmap
+    }
+    // tpr/cr8 shadow rides with apic-virt and is mandatory under vid
+    if apic_virt || proc2 & PROC2_VID != 0 {
+        proc_desired |= 1 << 21;
     }
     let proc = adjust_ctl(m_proc, proc_desired);
     w(VMX_PROC_CTLS, proc);
@@ -1353,7 +1369,8 @@ fn setup_vmcs(
     w(VMX_ENTRY_CTLS, entry_ctl);
     w(VMX_EXCEPTION_BITMAP, (1 << 6) | (1 << 13)); // #ud, #gp exit to host
     w(VMX_MSR_BITMAPS, msr_bm); // 0 = all msr access exits (bitmap not armed)
-    if proc & (1 << 5) != 0 {
+    if proc2 & (1 << 5) != 0 {
+        // vpid is secondary proc-ctl bit 5 (primary bit 5 is not vpid)
         w(VMX_VPID, vpid & 0xFFFF); // guest ids start at 1: never zero
     }
     if apic_virt {

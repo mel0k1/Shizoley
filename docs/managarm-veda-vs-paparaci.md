@@ -286,7 +286,23 @@ guest_destroy` за syscalls 15/16/17.
       «печать строки» + обратный канал хост→гость через GPR. Заодно закрыт
       латентный баг `mark_user_ancestors` (USER-бит на отсутствующем предке
       = «used» для крейта → прогулка по phys 0 как по таблице).
-- [ ] P3+: posted interrupts (needs vAPIC story).
+- [x] P3+/P4: posted interrupts (v0.12.0) — при доступном apicv (pin bit 7
+      + VID proc2 бит 9, оба allowed-1) каждый гость получает дескриптор
+      PI (256-битный PIR + ON + NV=0xF0); GUEST_PI(27) маршрутизирует
+      вектор хоста: на ext-int выходе ядро постит вектор в PIR, на входе
+      PIR->vIRR + RVI (kernel-managed виртуальный EOI — real-mode гость
+      не пишет EOI), CPU доставляет через VID; без apicv — graceful отказ.
+- [x] v0.12.1: приёмка под posted поймала три ошибки в кодировках полей
+      VMCS (под TCG не ловится — там VMX нет вовсе): `VMX_PROC_CTLS2`
+      писался в 0x401E (это TPR-threshold; secondary-ctls = 0x4022, без
+      этого EPT/URG/VID вообще не включались на реальном железе);
+      `VMX_TPR_THRESHOLD` писался в 0x401C (зарезервированный слот, а не
+      0x401E); «virtualize APIC accesses» путалась с битом 5 proc2 (это
+      VPID; настоящий бит 0, и только под ним легальны APIC-register
+      virtualization и VID). Гейт записи VPID-поля переведён на proc2
+      бит 5; PIN_POSTED гейтится на доступность apicv; vid/reg-virt
+      принудительно снимаются без access-virt. По SDM Vol 3D Appendix B
+      и KVM (SECONDARY_VM_EXEC_CONTROL=0x4022, TPR_THRESHOLD=0x401e).
 
 **eq.rs / caps**
 - [x] P2: error-канал — head+32 error_code (первый код: E_DROP/E_CLOSED/
@@ -304,6 +320,13 @@ guest_destroy` за syscalls 15/16/17.
 - [x] P2: per-op права — грант это произвольное подмножество маски
       (POST/WAIT/KICK/LISTEN/SIGNAL), повторный грант заменяет биты без
       revoke; негативный тест в hello — v0.11.0.
+- [x] P2: слить права caps с capability-qid планом / queue-handles как
+      полноценные capabilities — qid скрыт за негадемым токеном
+      (capability = инстанс с qid/holder/bits/parent), грант порождает
+      дочерний токен, would_cycle (лимит 4096 предков, как CYCLE_SEARCH_
+      LIMIT в Veda) отказывает делегированию, замыкающему цикл; revoke
+      каскадно гасит поддерево; владелец держит корень неявно; новые ABI:
+      eq_grant(19)/eq_revoke(20) теперь токенные — v0.12.0.
 
 ---
 

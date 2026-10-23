@@ -217,9 +217,11 @@ Page fault из ring 3 убивает только провинившуюся з
 
 ## Дорожная карта
 
-1. Подсматриваем дальше: managarm (universe-хэндлы, UAR/STAC-копии, kernel->process данные) и Veda (would_cycle-детект capability-каналов, IOMMU для гостевых устройств, posted interrupts).
-2. Больше сервисов в ring 3: таймер-сервис, ps/kill-обвязка над pid, передача handle'ов очередей через capability.
-3. Гость ещё дальше: REAL hypervisor-драйвер (Veda-стиль drivervm), posted-interrupt processing, EPT-префиксы/PAT-память для гостевых устройств.
+1. Подсматриваем дальше: managarm (universe-хэндлы, UAR/STAC-копии, kernel->process данные) и Veda (IOMMU для гостевых устройств). Уже забрано из этого списка: would_cycle-детект (v0.12.0), posted interrupts (v0.12.0), передача handle'ов очередей через capability (v0.12.0, capsdemo).
+2. Больше сервисов в ring 3: таймер-сервис, ps/kill-обвязка над pid.
+3. Гость ещё дальше: REAL hypervisor-драйвер (Veda-стиль drivervm), EPT-префиксы/PAT-память для гостевых устройств.
+
+v0.12.1 — приёмка под posted поймала три ошибки в кодировках полей VMCS, из-за которых ни один гость не мог войти в VM на реальном железе (под TCG это не ловится — там VMX нет вовсе): `VMX_PROC_CTLS2` писался в 0x401E (это TPR-threshold; secondary-ctls живут в 0x4022 — EPT/URG/VID не включались вовсе), `VMX_TPR_THRESHOLD` писался в 0x401C (зарезервированный слот; TPR-threshold = 0x401E), а «virtualize APIC accesses» путалась с битом 5 proc2 (это VPID; настоящий бит — 0, и только под ним легальны APIC-register virtualization и VID); гейт записи VPID-поля переведён на proc2 бит 5, PIN_POSTED гейтится на доступность apicv (без неё пин-бит 7 без VID = отказ VM-entry), vid/reg-virt принудительно снимаются, если access-virt не дожил после clamp. По SDM (Vol 3D, Appendix B) и KVM (SECONDARY_VM_EXEC_CONTROL=0x4022, TPR_THRESHOLD=0x401e).
 
 ## Лицензия
 
@@ -426,3 +428,5 @@ A queue id is never exposed: `eq_setup` mints a root **capability handle** — a
 1. Keep peeking: managarm (universe handles, UAR/STAC copies, kernel->process data transfer) and Veda (IOMMU for guest devices). Done from this list: would_cycle for capability channels (v0.12.0), posted interrupts (v0.12.0).
 2. More ring 3 services: a timer service, ps/kill tooling over pids. Done: queue handles passed around as capabilities (v0.12.0, capsdemo).
 3. Guests even farther: a real driver VM (Veda-style), EPT/PAT memory types for guest devices, posted interrupts for a real device-assignment path (the P4 plumbing is in place).
+
+v0.12.1 — the posted-interrupt audit caught three VMCS field-encoding bugs that would have kept every guest out of VM entry on real hardware (invisible under TCG, which has no VMX): `VMX_PROC_CTLS2` was written to 0x401E (that is the TPR-threshold slot; secondary controls live at 0x4022 — EPT/URG/VID were never enabled), `VMX_TPR_THRESHOLD` was written to 0x401C (a reserved slot; TPR-threshold is 0x401E), and "virtualize APIC accesses" was confused with proc2 bit 5 (that is VPID; the real bit is 0, and APIC-register virtualization plus VID are only legal under it). The VPID field write is now gated on proc2 bit 5, PIN_POSTED is gated on apicv availability (pin bit 7 without VID = VM-entry refusal), and vid/reg-virt are force-cleared when access-virt does not survive the capability clamp. Per SDM Vol 3D Appendix B and KVM (SECONDARY_VM_EXEC_CONTROL=0x4022, TPR_THRESHOLD=0x401e).
