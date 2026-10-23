@@ -61,4 +61,57 @@ long guest_pi(long handle, u64 vector) {
     return syscall(Sys::guest_pi, static_cast<u64>(handle), vector);
 }
 
+long ps(PsEntry* buf, u64 max) {
+    return syscall(Sys::ps, reinterpret_cast<u64>(buf), max);
+}
+
+u64 ticks() {
+    return static_cast<u64>(syscall(Sys::ticks));
+}
+
+long tm_arm(u64 deadline_ticks) {
+    return syscall(Sys::tm_arm, deadline_ticks);
+}
+
+long ps_find(const char* name) {
+    PsEntry t[64];
+    long n = ps(t, 64);
+    for (long i = 0; i < n; ++i) {
+        const char* a = t[i].name;
+        const char* b = name;
+        while (*b != '\0' && *a == *b) {
+            ++a;
+            ++b;
+        }
+        if (*b == '\0' && *a == '\0') {
+            return t[i].pid;
+        }
+    }
+    return -1;
+}
+
+// sleep ms through the ring-3 timer daemon: "SLP" + u64 ms over the mailbox
+long tsleep(u64 ms) {
+    long pid = ps_find("timed");
+    if (pid < 0) {
+        return -1;
+    }
+    u8 msg[11];
+    msg[0] = 'S';
+    msg[1] = 'L';
+    msg[2] = 'P';
+    for (int i = 0; i < 8; ++i) {
+        msg[3 + i] = static_cast<u8>((ms >> (8 * i)) & 0xFF);
+    }
+    if (send(static_cast<u64>(pid), msg, sizeof(msg)) != 0) {
+        return -1;
+    }
+    u8 rep[8];
+    long from = recv(static_cast<u64>(pid), rep, sizeof(rep));
+    if (from != pid || rep[0] != 'W' || rep[1] != 'O' || rep[2] != 'K' || rep[3] != 'E') {
+        return -1;
+    }
+    return 0;
+}
+
 }

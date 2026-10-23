@@ -41,6 +41,7 @@ constexpr u32 EQ_OP_KEY = 1;   // payload: [scancode, ascii]
 constexpr u32 EQ_OP_BOOT = 2;  // payload: "boot" — sink attached
 constexpr u32 EQ_OP_ERROR = 3; // reserved for error-channel users
 constexpr u32 EQ_OP_ZMSG = 4;  // zero-copy gift: payload = u64 handle + u64 bytes
+constexpr u32 EQ_OP_TICK = 5;  // timer fire: payload = u64 tick count
 
 // head layout (user memory):
 // +0 magic, +4 chunk_size, +8 nchunks, +12 user_notify,
@@ -63,6 +64,9 @@ long eq_wait(long handle);
 long eq_alert(long handle);
 long eq_kick(long handle);
 long eq_listen(long handle);
+// attach the queue as the TIMER sink (eq_listen which=1): the kernel fires
+// one OP_TICK with the tick count whenever the tm_arm deadline passes
+long eq_tlisten(long handle);
 // derive a child capability for pid (subset of the caller's rights; the
 // caller's handle must carry GRANT) and return its token — pass it to pid
 // over ipc; refused when the derivation chain would cycle (would_cycle)

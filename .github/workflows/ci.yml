@@ -61,14 +61,23 @@ jobs:
           grep -qF "[vmx]" serial.log
           grep -qF "[console] up: kernel sink attached" serial.log
           grep -qF "[gdemo] vmx unavailable (guest_create refused)" serial.log
-          grep -qF "[caps] granted 0x1 on queue 3 to pid 2" serial.log
+          grep -qE "\[caps\] granted 0x1 on queue [0-9]+ to pid 2" serial.log
           grep -qF "[eq] wait: alerted (wait canceled)" serial.log
-          grep -qF "[eq] queue 3 closed (owner 1 gone)" serial.log
+          grep -qE "\[eq\] queue [0-9]+ closed \(owner 1 gone\)" serial.log
           grep -qF "[hello] forged token denied: capabilities are unguessable" serial.log
           grep -qF "[capsdemo] all ok" serial.log
           grep -qF "[caps] would_cycle refused" serial.log
           grep -qF "[capsuser] post denied after revoke (cascade ok)" serial.log
           grep -qE "process 'init' \(1\) torn down, [0-9]+ frames freed" serial.log
+          grep -qF "[timed] up: kernel timer sink attached" serial.log
+          grep -qE "\[eq\] kernel event sink timer -> queue [0-9]+ owned by pid [0-9]+" serial.log
+          grep -qF "[sleeper] slept 300ms (measured " serial.log
+          grep -qF "[init] napped (measured " serial.log
+          grep -qF "[timed] fired at tick " serial.log
+          grep -qE "\[ps\] [0-9]+ run [0-9]+ timed" serial.log
+          grep -qE "\[ps\] [0-9]+ run [0-9]+ sleeper" serial.log
+          grep -qE "\[kill\] target [0-9]+ terminated \(by [0-9]+\)" serial.log
+          grep -qF "[init] kill ok" serial.log
 
   userspace:
     name: userspace (c++)

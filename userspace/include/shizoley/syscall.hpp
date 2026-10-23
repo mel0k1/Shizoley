@@ -34,7 +34,20 @@ enum class Sys : u64 {
     guest_mode = 26,   // (handle, mode) -> 0 | -1; mode 1 = long-mode guest
     guest_pi = 27,     // (handle, vector) -> 0 | -1; route host irq into
                        // the guest's posted-interrupt descriptor (0 = clear)
+    ps = 28,           // (buf, max_entries) -> n; 40-byte process records
+    ticks = 29,        // () -> scheduler tick count (PIT clock)
+    tm_arm = 30,       // (deadline_ticks) -> 0 | -1; one-shot timer fire
+                       // into the timer sink (owner only; 0 disarms)
 };
+
+// ps(28) record, filled by the kernel (name is NUL-padded)
+struct PsEntry {
+    u64 pid;
+    u64 thr;
+    u64 state; // 0 = run, 1 = dead (waits for the reaper)
+    char name[16];
+};
+static_assert(sizeof(PsEntry) == 40, "ps record abi");
 
 // vcpu_run exit reasons (reportable vmx exits; see kernel vmx.rs)
 enum class VmxExit : long {
@@ -95,6 +108,11 @@ long guest_destroy(long handle);
 long guest_mode(long handle, u64 mode);
 long guest_pi(long handle, u64 vector);
 long eq_alert(long qid);
+long ps(PsEntry* buf, u64 max);
+u64 ticks();
+long tm_arm(u64 deadline_ticks);
+long ps_find(const char* name);
+long tsleep(u64 ms);
 
 inline long syscall(Sys nr) {
     u64 ret = static_cast<u64>(nr);

@@ -65,6 +65,8 @@
 - [x] обработка ошибок ELF: валидация заголовков, границ, пересечений сегментов, точки входа; при ошибке — откат с возвратом кадров
 - [x] граничные случаи IPC: недоставляемое сообщение -> ошибка вместо вечной парковки; kick только у владельца; защита от пересечения очередей в памяти
 - [x] клавиатура/консоль как процессы: kbd IRQ -> event queue (eq_listen), consoled рендерит в ring 3
+- [x] ps/kill-обвязка: ps(28) снимает живой снепшот registry (pid, потоки, состояние, имя), kill(14) честно отказывает на неизвестном pid; утилиты ps и kill в ring 3, сервис-дискавери через ps_find
+- [x] таймер-сервис в ring 3 (timed): ядро даёт сырые тики — ticks(29) читает счётчик PIT, tm_arm(30) ставит one-shot дедлайн (только владелец таймер-синка, выстрел = OP_TICK в очередь), timed мультиплексирует sleep'ы клиентов («SLP»+ms по mailbox -> «WOKE»), shz.tsleep() прячет весь обмен
 - [x] очередь-хэндлы как полноценные capabilities: eq_setup возвращает негадуемый 64-битный токен, привязанный к процессу; права (POST/WAIT/KICK/LISTEN/SIGNAL/GRANT) ездят байтами через IPC; конный тест capsdemo: self-grant/forged-token отказы, делегация B->C, would_cycle, revoke-каскад
 - [x] would_cycle для грантов (по-ведовски): грант — ребро в лесе дериваций; выдача права назад держателю предка (очередь «дотягивается» сама до себя) отказывается, длинные цепочки — тоже (безопасный ответ); revoke каскадом снимает всё поддерево, владелец может отозвать любой свой сабтри
 - [x] гипервизор по Veda-рецепту: VMCS + vcpu + EPT, syscalls GUEST_CREATE/VCPU_RUN/GUEST_DESTROY (unrestricted real-mode guest, vmcall как выход)
@@ -110,6 +112,10 @@ Shizoley/
 │   ├── programs/hello/      # hello: 100 событий через event queue
 │   ├── programs/fsd/        # файловый сервис: ustar из RO-маппинга initrd
 │   ├── programs/rtcd/       # драйвер часов: CMOS-порты из ring 3 (IOPL=3)
+│   ├── programs/timed/      # таймер-сервис: мультиплексор sleep'ов (tm_arm + OP_TICK)
+│   ├── programs/ps/         # таблица процессов (ps syscall)
+│   ├── programs/kill/       # утилита kill: pid приходит по mailbox
+│   ├── programs/sleeper/    # клиент таймер-сервиса, гасится kill'ом посреди сна
 │   ├── rootfs/motd          # данные для fsd
 │   └── link.ld              # фиксация образа на 0x400000
 ├── .github/workflows/       # CI: сборка + линт
@@ -153,10 +159,11 @@ qemu-system-x86_64 -drive format=raw,file=target/x86_64-paparaci/debug/bootimage
 - создаёт **два user-потока** (`thread_create`) — оба работают в одном адресном пространстве, печатают тики и завершаются;
 - делает `spawn("hello")` — ядро грузит второй ELF из initrd в отдельный процесс (pid 2) и гоняет с ним ping-pong через mailbox IPC;
 - поднимает **сервисы в ring 3**: `fsd` (отдаёт файл `motd` из RO-маппинга initrd по mailbox) и `rtcd` (читает CMOS-часы портами 0x70/0x71 — IOPL=3);
+- приносит **таймер-сервис** `timed` (tm_arm/OP_TICK-дедлайн от ядра, мультиплексирование снов клиентов по mailbox), `ps` печатает таблицу процессов, init спит 400 мс через `tsleep`, `kill` гасит припаркованный `sleeper` посреди 5-секундного сна, и вторая таблица `ps` уже без него;
 - регистрирует **event queue** (`eq_setup`), hello постит 100 событий через `eq_post` — init вычитывает их обычными load'ами из памяти (без syscall на элемент), между пачками спя в ядре на doorbell (`eq_wait`);
 - `exit` последнего потока завершает процесс, жнец печатает коды выходов.
 
-Page fault из ring 3 убивает только провинившуюся задачу — ядро продолжает жить. Клавиатура по-прежнему жива — нажатия печатаются на экран из обработчика прерывания.
+Page fault из ring 3 убивает только провинившуюся задачу — ядро продолжает жить. Клавиатура тоже в ring 3: нажатия ядро постит событиями в очередь consoled, который их рендерит.
 
 ## Syscall ABI
 
@@ -180,7 +187,7 @@ Page fault из ring 3 убивает только провинившуюся з
 | 15 | `guest_create`  | `rdi`: страницы                        | VMCS + EPT + окно RAM, -> handle           |
 | 16 | `vcpu_run`      | `rdi`: handle, `rsi`: буфер (40×u64)   | войти в гостя, -> причина vmexit; ядро пишет 20×u64 (reason/rip/qual/gpa/gprs), ring 3 пишет управляющую половину (флаги, инжекция события, gprs) |
 | 17 | `guest_destroy` | `rdi`: handle                          | освободить RAM/EPT/VMCS, -> 0              |
-| 18 | `eq_listen`     | `rdi`: хэндл                           | сделать очередь приёмником событий ядра (LISTEN) |
+| 18 | `eq_listen`     | `rdi`: хэндл, `rsi`: which             | сделать очередь приёмником событий ядра (LISTEN): which 0 = клавиатура, 1 = таймер |
 | 19 | `eq_grant`      | `rdi`: хэндл, `rsi`: pid, `rdx`: права | произвести дочерний capability для pid (подмножество своих бит; нужен GRANT), would_cycle-проверка -> новый хэндл |
 | 20 | `eq_revoke`     | `rdi`: хэндл                           | каскадно снять поддерево дериваций (держатель токена или его предок) -> сколько хэндлов умерло |
 | 21 | `guest_map`     | `rdi`: handle, `rsi`: страницы         | вырастить RAM гостя (+EPT+окно), -> новый размер |
@@ -190,6 +197,9 @@ Page fault из ring 3 убивает только провинившуюся з
 | 25 | `eq_zdone`      | `rdi`: handle                          | потребить: отмапить и вернуть кадры в пул -> 0  |
 | 26 | `guest_mode`    | `rdi`: handle, `rsi`: mode             | mode 1 = переписать guest-state под long mode -> 0 |
 | 27 | `guest_pi`      | `rdi`: handle, `rsi`: вектор           | маршрутизировать вектор хоста в posted-interrupt дескриптор гостя (0 = снять всё), -> 0; требует apicv |
+| 28 | `ps`            | `rdi`: buf, `rsi`: max записей         | таблица процессов: 40-байтовые записи (pid, потоки, состояние 0=run/1=dead, имя[16]), -> сколько записано |
+| 29 | `ticks`         | —                                      | счётчик PIT-тиков планировщика (100 Гц)    |
+| 30 | `timer_arm`     | `rdi`: дедлайн в тиках                 | one-shot дедлайн таймер-синка (только его владелец; 0 = снять); выстрел = OP_TICK с номером тика в очередь, -> 0 |
 
 Права (bitmask): `POST=1`, `WAIT=2`, `KICK=4`, `LISTEN=8`, `SIGNAL=16`, `GRANT=32`. Хэндл — это capability: негадуемый токен, привязанный к процессу-держателю; eq_setup возвращает корневой (все права), eq_grant производит дочерний (подмножество, нужен GRANT), токены передаются по IPC байтами, eq_revoke снимает поддерево. would_cycle отказывает гранту, который вернул бы право держателю предка (очередь «дотянулась» бы сама до себя через собственную цепочку дериваций).
 
@@ -218,11 +228,12 @@ Page fault из ring 3 убивает только провинившуюся з
 ## Дорожная карта
 
 1. Подсматриваем дальше: managarm (universe-хэндлы, UAR/STAC-копии, kernel->process данные) и Veda (IOMMU для гостевых устройств). Уже забрано из этого списка: would_cycle-детект (v0.12.0), posted interrupts (v0.12.0), передача handle'ов очередей через capability (v0.12.0, capsdemo).
-2. Больше сервисов в ring 3: таймер-сервис, ps/kill-обвязка над pid.
+2. Больше сервисов в ring 3: таймер-сервис, ps/kill-обвязка над pid. Готово: ps/kill-обвязка и таймер-сервис timed (v0.13.0).
 3. Гость ещё дальше: REAL hypervisor-драйвер (Veda-стиль drivervm), EPT-префиксы/PAT-память для гостевых устройств.
 
 v0.12.1 — приёмка под posted поймала три ошибки в кодировках полей VMCS, из-за которых ни один гость не мог войти в VM на реальном железе (под TCG это не ловится — там VMX нет вовсе): `VMX_PROC_CTLS2` писался в 0x401E (это TPR-threshold; secondary-ctls живут в 0x4022 — EPT/URG/VID не включались вовсе), `VMX_TPR_THRESHOLD` писался в 0x401C (зарезервированный слот; TPR-threshold = 0x401E), а «virtualize APIC accesses» путалась с битом 5 proc2 (это VPID; настоящий бит — 0, и только под ним легальны APIC-register virtualization и VID); гейт записи VPID-поля переведён на proc2 бит 5, PIN_POSTED гейтится на доступность apicv (без неё пин-бит 7 без VID = отказ VM-entry), vid/reg-virt принудительно снимаются, если access-virt не дожил после clamp. По SDM (Vol 3D, Appendix B) и KVM (SECONDARY_VM_EXEC_CONTROL=0x4022, TPR_THRESHOLD=0x401e).
 v0.12.2 — проход по коду поймал класс тихих багов. Самый заметный — busy-spin консоли: ядро ставило EVENT-бит doorbell'а, но никто его не гасил, поэтому после первой посылки eq_wait больше никогда не спал и consoled/init крутили цикл вхолостую на 100% CPU. Теперь eq_wait решает по факту: спит только когда данных нет (prod_seq == cons_seq и открытый чанк пуст), а EVENT-бит стал advisory — потребитель гасит его после дрена, так что lost-wakeup невозможен. Попутно: ipc_recv с сообщением, не влезающим в буфер, возвращает ошибку вместо вечной парковки; eq_setup закрывает гонку overlap-проверки (регистрация и проверка под одним локом); guest_map больше не оставляет валидные записи EPT на откате роста (окно мапится до записи таблиц); коллапс 2 MiB-листьев EPT требует физической непрерывности региона — разрозненный fallback-аллокат с выровненным первым кадром больше не может отдать гостю чужую память; vcpu_run отпускает список гостей до включения прерываний (лок больше не держится через yield планировщика); map_zeroed_range/map_initrd не теряют кадры и не паникуют при исчерпании пула. Баннер ядра теперь печатает CARGO_PKG_VERSION.
+v0.13.0 — ps/kill-обвязка и таймер-сервис в ring 3. Ядро: ps(28) снимает живой снепшот registry (40-байтовые записи pid/потоки/состояние/имя, сортировка по pid), kill(14) на неизвестном pid возвращает -1 вместо фальшивого успеха; ticks(29) отдаёт счётчик PIT-тиков; eq_listen(18) получил селектор синка (0 = клавиатура, 1 = таймер); tm_arm(30) ставит one-shot дедлайн в тиках — только владелец таймер-синка, выстрел = OP_TICK с номером тика в очередь (пост из IRQ не блокируется, при неудаче дедлайн перезаряжается — потеря выстрела невозможна), смерть владельца синка разряжает дедлайн. timed: два потока — main собирает запросы клиентов («SLP»+ms по mailbox) и держит таблицу слиперов под спинлоком, драйвер eq_wait'ится на OP_TICK и будит всех, чей дедлайн прошёл, перезаряжая ядро на ближайший будущий; shz.tsleep() находит timed через ps_find (сервис-дискавери через ps!) и прячет весь протокол. Сценарий init: timed/kill/ps/sleeper спавнятся, ps печатает таблицу, init спит 400 мс через timed (sleeper успевает отспать свои 300), потом kill-демон гасит sleeper посреди 5-секундного сна — вторая таблица ps уже без него.
 
 ## Лицензия
 
@@ -304,6 +315,8 @@ The kernel is named after paparazzi for a reason: Paparaci watches everything ha
 - [x] ELF error handling: full header/bounds/segment-overlap/entry validation; on failure the loader rolls back and returns every frame
 - [x] IPC edge cases: an undeliverable message fails the syscall instead of parking forever; kick is owner-only; queue memory ranges may not overlap
 - [x] Keyboard/console as processes: kbd IRQ -> event queue (eq_listen), consoled renders in ring 3
+- [x] ps/kill tooling: ps(28) takes a live registry snapshot (pid, threads, state, name), kill(14) honestly refuses unknown pids; ps and kill utilities in ring 3, service discovery via ps_find
+- [x] Ring-3 timer service (timed): the kernel hands out raw ticks — ticks(29) reads the PIT counter, tm_arm(30) arms a one-shot deadline (timer-sink owner only, expiry fires OP_TICK into the queue), timed multiplexes client sleeps ("SLP"+ms over the mailbox -> "WOKE"), shz.tsleep() hides the exchange
 - [x] Queue handles as full capabilities: eq_setup returns an unguessable 64-bit token bound to the process; rights (POST/WAIT/KICK/LISTEN/SIGNAL/GRANT) travel as bytes over IPC; the capsdemo round trip: self-grant/forged-token refusals, B->C delegation, would_cycle, revoke cascade
 - [x] would_cycle for grants (Veda-style): a grant is an edge in the derivation forest; handing a right back to a holder of an ancestor (the queue reaching itself) is refused, over-long chains too (the safe answer); revoke cascades the whole subtree, the owner can revoke any subtree it spawned
 - [x] Hypervisor the Veda way: VMCS + vcpu + EPT, GUEST_CREATE/VCPU_RUN/GUEST_DESTROY syscalls (unrestricted real-mode guest, vmcall as the exit door)
@@ -340,6 +353,7 @@ The kernel boots, sets up the heap and MSRs, then hands control to the scheduler
 - calls `spawn("hello")` — the kernel loads the second ELF from the initrd into a separate process (pid 2) and runs a mailbox ping-pong with it;
 - brings up **ring 3 services**: `fsd` (serves the `motd` file from the read-only initrd mapping over the mailbox) and `rtcd` (reads the CMOS clock through ports 0x70/0x71 — IOPL=3);
 - starts **consoled** — the keyboard/console as a process: it registers its queue as the kernel event sink (`eq_listen`), the kbd IRQ posts `[scancode, ascii]` events, and the boot ping proves the pipe;
+- brings up the **ring-3 timer service** `timed` (tm_arm/OP_TICK deadline from the kernel, per-client sleep multiplexing over the mailbox), dumps the process table with `ps`, naps 400 ms through `tsleep`, then `kill` takes the parked `sleeper` down in the middle of its 5 s nap and a second `ps` shows the table without it;
 - runs **gdemo** — the Veda-approach smoke: `guest_create` builds VMCS + EPT + a 1 MiB ram window, `guest_map` grows it by one page, a 16-bit blob writes text into its own "VGA" through the EPT, reads the mapped page after a GPR override and takes an injected int 0x20; on machines without VT-x the kernel refuses politely;
 - grants hello the `POST` right on its queue (`eq_grant`) and consumes hello's 100 events with plain loads, sleeping on the doorbell between batches;
 - when the last thread of a process exits, the reaper tears the process down: address-space frames go back to the bitmap pool, its queues close, its capability grants vanish.
@@ -368,7 +382,7 @@ A page fault (or #GP/#UD) from ring 3 kills only the offending process — the k
 | 15 | `guest_create`  | `rdi`: pages                                | VMCS + EPT + ram window, -> handle                 |
 | 16 | `vcpu_run`      | `rdi`: handle, `rsi`: buffer (40×u64)       | enter the guest, -> vmexit reason; the kernel writes 20×u64 (reason/rip/qual/gpa/gprs), ring 3 writes the control half (flags, event injection, gprs) |
 | 17 | `guest_destroy` | `rdi`: handle                               | free ram/ept/vmcs, -> 0                            |
-| 18 | `eq_listen`     | `rdi`: qid                                  | make the queue the kernel event sink (LISTEN)      |
+| 18 | `eq_listen`     | `rdi`: handle, `rsi`: which                 | make the queue a kernel event sink (LISTEN): which 0 = keyboard, 1 = timer |
 | 19 | `eq_grant`      | `rdi`: qid, `rsi`: pid, `rdx`: rights       | the owner hands out qid rights                     |
 | 20 | `eq_revoke`     | `rdi`: qid, `rsi`: pid                      | the owner takes rights back                        |
 | 21 | `guest_map`     | `rdi`: handle, `rsi`: pages                 | grow guest ram (+EPT+window), -> new size          |
@@ -377,8 +391,12 @@ A page fault (or #GP/#UD) from ring 3 kills only the offending process — the k
 | 24 | `eq_zmap`       | `rdi`: handle                               | owner maps the gift (RW, NOEXEC) -> va             |
 | 25 | `eq_zdone`      | `rdi`: handle                               | consume: unmap and return the frames -> 0          |
 | 26 | `guest_mode`    | `rdi`: handle, `rsi`: mode                  | mode 1 = rewrite the guest state for long mode -> 0 |
+| 27 | `guest_pi`      | `rdi`: handle, `rsi`: vector                | route a host irq vector into the guest's posted-interrupt descriptor (0 = clear), -> 0; needs apicv |
+| 28 | `ps`            | `rdi`: buf, `rsi`: max entries              | process table: 40-byte records (pid, threads, state 0=run/1=dead, name[16]), -> count written |
+| 29 | `ticks`         | —                                           | scheduler PIT tick counter (100 Hz)                |
+| 30 | `timer_arm`     | `rdi`: deadline in ticks                    | one-shot deadline for the timer sink (its owner only; 0 = disarm); expiry fires OP_TICK into the queue, -> 0 |
 
-qid rights (bitmask): `POST=1`, `WAIT=2`, `KICK=4`, `LISTEN=8`, `SIGNAL=16`; the queue owner holds all of them implicitly.
+qid rights (bitmask): `POST=1`, `WAIT=2`, `KICK=4`, `LISTEN=8`, `SIGNAL=16`, `GRANT=32`. A handle is a capability: an unguessable token bound to the holding process; eq_setup returns the root (all rights), eq_grant derives a child (a subset, needs GRANT), tokens travel as bytes over IPC, eq_revoke takes the derivation subtree back. would_cycle refuses a grant that would hand the right back to a holder of an ancestor (the queue would reach itself through its own derivation chain).
 
 Convention: number in `rax`, args in `rdi`, `rsi`, `rdx`, result in `rax`.
 
@@ -427,8 +445,9 @@ A queue id is never exposed: `eq_setup` mints a root **capability handle** — a
 ### Roadmap
 
 1. Keep peeking: managarm (universe handles, UAR/STAC copies, kernel->process data transfer) and Veda (IOMMU for guest devices). Done from this list: would_cycle for capability channels (v0.12.0), posted interrupts (v0.12.0).
-2. More ring 3 services: a timer service, ps/kill tooling over pids. Done: queue handles passed around as capabilities (v0.12.0, capsdemo).
+2. More ring 3 services: a timer service, ps/kill tooling over pids. Done from this list: queue handles passed around as capabilities (v0.12.0, capsdemo), ps/kill tooling and the timed timer service (v0.13.0).
 3. Guests even farther: a real driver VM (Veda-style), EPT/PAT memory types for guest devices, posted interrupts for a real device-assignment path (the P4 plumbing is in place).
 
 v0.12.1 — the posted-interrupt audit caught three VMCS field-encoding bugs that would have kept every guest out of VM entry on real hardware (invisible under TCG, which has no VMX): `VMX_PROC_CTLS2` was written to 0x401E (that is the TPR-threshold slot; secondary controls live at 0x4022 — EPT/URG/VID were never enabled), `VMX_TPR_THRESHOLD` was written to 0x401C (a reserved slot; TPR-threshold is 0x401E), and "virtualize APIC accesses" was confused with proc2 bit 5 (that is VPID; the real bit is 0, and APIC-register virtualization plus VID are only legal under it). The VPID field write is now gated on proc2 bit 5, PIN_POSTED is gated on apicv availability (pin bit 7 without VID = VM-entry refusal), and vid/reg-virt are force-cleared when access-virt does not survive the capability clamp. Per SDM Vol 3D Appendix B and KVM (SECONDARY_VM_EXEC_CONTROL=0x4022, TPR_THRESHOLD=0x401e).
 v0.12.2 — a code pass caught a class of silent bugs. The most visible: console busy-spin — the kernel set the doorbell EVENT bit but nobody ever cleared it, so after the first delivery eq_wait never slept again and consoled/init burned a full core spinning. eq_wait now decides on facts: it sleeps only when no data is pending (prod_seq == cons_seq and the open chunk drained), and the EVENT bit is advisory — the consumer clears it after draining, which makes lost wakeups impossible. Also: ipc_recv with a message too big for the buffer now returns an error instead of parking forever; eq_setup closes the overlap-check race (check and registration under one lock); guest_map no longer leaves valid EPT entries behind on a rolled-back growth (the window maps before any table writes); the 2 MiB EPT-leaf collapse demands physical contiguity — a scattered fallback allocation with an aligned first frame can no longer hand the guest memory it does not own; vcpu_run releases the guest list before re-enabling interrupts (no lock held across a scheduler yield); map_zeroed_range/map_initrd no longer leak frames or panic on pool exhaustion. The kernel banner now prints CARGO_PKG_VERSION.
+v0.13.0 — ps/kill tooling and a ring-3 timer service. Kernel: ps(28) takes a live registry snapshot (40-byte pid/threads/state/name records, sorted by pid), kill(14) returns -1 on an unknown pid instead of fake success; ticks(29) exposes the PIT tick counter; eq_listen(18) gained a sink selector (0 = keyboard, 1 = timer); tm_arm(30) arms a one-shot deadline in ticks — timer-sink owner only, expiry fires OP_TICK with the tick count into the sink (the IRQ-context post never blocks, a failed post re-arms so a fire cannot be lost), a dead sink owner disarms. timed runs two threads — main collects client requests ("SLP"+ms over the mailbox) and keeps the sleeper table under a spinlock, the driver eq_waits on OP_TICK and wakes everyone past their deadline, re-arming the kernel on the earliest future one; shz.tsleep() finds timed via ps_find (service discovery through ps!) and hides the whole protocol. The init scenario: timed/kill/ps/sleeper spawn, ps dumps the table, init naps 400 ms through timed (the sleeper's 300 ms nap lands first), then the kill daemon takes the sleeper down in the middle of its 5 s nap — the second table is without it.

@@ -69,7 +69,11 @@ long eq_kick(long handle) {
 }
 
 long eq_listen(long handle) {
-    return syscall(Sys::eq_listen, static_cast<u64>(handle));
+    return syscall(Sys::eq_listen, static_cast<u64>(handle), 0);
+}
+
+long eq_tlisten(long handle) {
+    return syscall(Sys::eq_listen, static_cast<u64>(handle), 1);
 }
 
 long eq_grant(long handle, u64 pid, u32 rights) {

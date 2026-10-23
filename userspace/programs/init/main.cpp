@@ -127,6 +127,41 @@ int main() {
     buf[127] = '\0';
     println("[init] rtc says: ", buf);
 
+    // ring-3 timer service + ps/kill plumbing
+    long timed = spawn("timed", 5);
+    long killp = spawn("kill", 4);
+    println("[init] spawned timed (", static_cast<u64>(timed), ") kill (",
+            static_cast<u64>(killp), ")");
+    long sleeper = spawn("sleeper", 7);
+    // ps spawned last: its dump is guaranteed to list every process above
+    long ps1 = spawn("ps", 2);
+    println("[init] spawned sleeper (", static_cast<u64>(sleeper), ") ps (",
+            static_cast<u64>(ps1), ")");
+
+    // the sleeper's first nap (300ms) ends before ours (400ms) does
+    u64 t0 = ticks();
+    if (tsleep(400) == 0) {
+        println("[init] napped (measured ", (ticks() - t0) * 10, "ms)");
+    } else {
+        println("[init] timer daemon unavailable");
+    }
+
+    // kill the sleeper in the middle of its 5s nap through the kill daemon
+    u8 kt[8];
+    u64 target = static_cast<u64>(sleeper);
+    for (int i = 0; i < 8; ++i) {
+        kt[i] = static_cast<u8>((target >> (8 * i)) & 0xFF);
+    }
+    send(static_cast<u64>(killp), kt, sizeof(kt));
+    u8 krep[4];
+    long kfrom = recv(static_cast<u64>(killp), krep, sizeof(krep));
+    if (kfrom == killp && krep[0] == 'K' && krep[1] == 'O') {
+        println("[init] kill ok");
+    } else {
+        println("[init] kill failed");
+    }
+    spawn("ps", 2);
+
     // managarm-style event queue: hello posts events, we drain them with
     // plain loads and only sleep in the kernel between batches. q is a
     // capability handle now — unguessable, bound to this process
