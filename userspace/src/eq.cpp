@@ -80,6 +80,19 @@ long eq_revoke(long qid, u64 pid) {
     return syscall(Sys::eq_revoke, static_cast<u64>(qid), pid);
 }
 
+long eq_zpost(long qid, const void* buf, u64 len) {
+    return syscall(Sys::eq_zpost, static_cast<u64>(qid),
+                   reinterpret_cast<u64>(buf), len);
+}
+
+long eq_zmap(long handle) {
+    return syscall(Sys::eq_zmap, static_cast<u64>(handle));
+}
+
+long eq_zdone(long handle) {
+    return syscall(Sys::eq_zdone, static_cast<u64>(handle));
+}
+
 u32 eq_drive(long qid, void* base, void (*cb)(const EqEvent&)) {
     u8* b = static_cast<u8*>(base);
     volatile u8* h = b;

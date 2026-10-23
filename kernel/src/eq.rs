@@ -1,10 +1,14 @@
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::VirtAddr;
 
 use crate::caps;
+use crate::memory;
 use crate::serial_println;
 use crate::task::{Process, Task, TaskState, USER_LIMIT};
 
@@ -52,6 +56,7 @@ pub const E_PROTO: u32 = 3; // producer protocol violation
                             // opcodes used by the kernel side
 pub const OP_KERNEL_EVENT: u32 = 1; // keyboard scancode+ascii pair
 pub const OP_BOOT: u32 = 2; // "queue is listening" ping
+pub const OP_ZMSG: u32 = 4; // zero-copy gift: payload = handle + bytes
 
 struct EqProd {
     seq: u64, // chunks opened
@@ -243,6 +248,21 @@ pub fn post(qid: u64, opcode: u32, buf: u64, len: u64) -> i64 {
         Some(c) => c,
         None => return -1,
     };
+    // stage the payload in kernel memory first (the source may be reused)
+    let mut payload = vec![0u8; len as usize];
+    if !cur.proc.aspace.lock().read_bytes(buf, &mut payload) {
+        return -1;
+    }
+    post_bytes(qid, opcode, &payload)
+}
+
+// kernel-side append used by post() and the zero-copy path: payload comes
+// prepared, no user-memory access below this point
+fn post_bytes(qid: u64, opcode: u32, payload: &[u8]) -> i64 {
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
     let eq = match find(qid) {
         Some(e) => e,
         None => return -1,
@@ -256,11 +276,6 @@ pub fn post(qid: u64, opcode: u32, buf: u64, len: u64) -> i64 {
         );
         return -1;
     }
-    // stage the payload in kernel memory first (the source may be reused)
-    let mut payload = vec![0u8; len as usize];
-    if !cur.proc.aspace.lock().read_bytes(buf, &mut payload) {
-        return -1;
-    }
     let elem_len = (EQ_ELEM_HDR + payload.len() + 7) & !7usize;
     if elem_len as u32 > eq.chunk_size - 8 {
         return -1;
@@ -269,7 +284,7 @@ pub fn post(qid: u64, opcode: u32, buf: u64, len: u64) -> i64 {
     elem[0..4].copy_from_slice(&(elem_len as u32).to_le_bytes());
     elem[4..8].copy_from_slice(&opcode.to_le_bytes());
     elem[8..16].copy_from_slice(&cur.proc.id.to_le_bytes());
-    elem[EQ_ELEM_HDR..EQ_ELEM_HDR + payload.len()].copy_from_slice(&payload);
+    elem[EQ_ELEM_HDR..EQ_ELEM_HDR + payload.len()].copy_from_slice(payload);
 
     interrupts::without_interrupts(|| loop {
         if find(qid).is_none() {
@@ -610,6 +625,270 @@ pub fn revoke(qid: u64, pid: u64) -> i64 {
     }
 }
 
+// ------------------------------------------------------- zero-copy gifts
+//
+// big events travel as PAGES, not bytes: eq_zpost detaches the frames
+// behind a page-aligned user buffer from the poster's address space and
+// posts a tiny OP_ZMSG event carrying a handle; the queue owner maps the
+// gift into its own space with eq_zmap (plain loads, zero copies), reads
+// it and hands the frames back to the pool with eq_zdone. a gift dies
+// with either side of the queue — the frames always come home.
+
+const ZWIN_BASE: u64 = 0x4000_0000; // per-slot mapping window (owner va)
+const ZSLOT_STRIDE: u64 = 4 * 1024 * 1024;
+const ZSLOTS: u64 = 16;
+const ZMAX_PAGES: usize = 64; // one gift <= 256 KiB
+
+struct ZGift {
+    handle: u64,
+    owner: Arc<Process>, // queue owner = the receiver
+    from_pid: u64,       // the poster who gave the pages away
+    frames: Vec<PhysFrame<Size4KiB>>,
+    bytes: u64,
+    mapped_va: u64, // 0 = not mapped yet
+}
+
+static GIFTS: Mutex<Vec<ZGift>> = Mutex::new(Vec::new());
+static NEXT_GIFT: AtomicU64 = AtomicU64::new(1);
+
+// poster side: validate, detach, register, announce
+pub fn zpost(qid: u64, uaddr: u64, len: u64) -> i64 {
+    if len == 0
+        || len > (ZMAX_PAGES as u64) * 0x1000
+        || uaddr & 0xFFF != 0
+        || len & 0xFFF != 0
+        || uaddr.checked_add(len).is_none_or(|end| end > USER_LIMIT)
+    {
+        return -1;
+    }
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    let eq = match find(qid) {
+        Some(e) => e,
+        None => return -1,
+    };
+    if !caps::check(qid, cur.proc.id, eq.owner.id, caps::QPOST) {
+        serial_println!(
+            "[eq] zpost denied: pid {} lacks POST on {}",
+            cur.proc.id,
+            qid
+        );
+        return -1;
+    }
+    let npages = (len / 0x1000) as usize;
+    // pass 1: every page must be a user-writable 4 KiB leaf and never a
+    // kernel-owned frame (BIT_9) — the gift must be poster-exclusive
+    let mut frames: Vec<PhysFrame<Size4KiB>> = Vec::new();
+    {
+        let mut aspace = cur.proc.aspace.lock();
+        for i in 0..npages {
+            let va = VirtAddr::new(uaddr + i as u64 * 0x1000);
+            let Some((frame, flags)) = aspace.walk_leaf(va) else {
+                serial_println!("[eq] zpost: unmapped page {} of pid {}", i, cur.proc.id);
+                return -1;
+            };
+            if !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                || !flags.contains(PageTableFlags::WRITABLE)
+                || flags.contains(PageTableFlags::BIT_9)
+            {
+                serial_println!(
+                    "[eq] zpost: page {} not givable (flags {:#x})",
+                    i,
+                    flags.bits()
+                );
+                return -1;
+            }
+            frames.push(frame);
+        }
+    }
+    // pass 2: detach from the poster (from here on the pages are the queue's)
+    {
+        let mut aspace = cur.proc.aspace.lock();
+        for i in 0..npages {
+            let page =
+                Page::<Size4KiB>::containing_address(VirtAddr::new(uaddr + i as u64 * 0x1000));
+            aspace.unmap_user_page(page);
+        }
+    }
+    let handle = NEXT_GIFT.fetch_add(1, Ordering::AcqRel);
+    GIFTS.lock().push(ZGift {
+        handle,
+        owner: eq.owner.clone(),
+        from_pid: cur.proc.id,
+        frames,
+        bytes: len,
+        mapped_va: 0,
+    });
+    // announce: 16-byte payload — handle + byte count
+    let mut payload = [0u8; 16];
+    payload[0..8].copy_from_slice(&handle.to_le_bytes());
+    payload[8..16].copy_from_slice(&len.to_le_bytes());
+    if post_bytes(qid, OP_ZMSG, &payload) != 0 {
+        // queue died mid-post: the gift is void, the pages go back to the
+        // pool (the poster's buffer is gone — that is the transfer contract)
+        zdrop_handle(handle);
+        return -1;
+    }
+    serial_println!(
+        "[eq] zcopy: pid {} gave handle {} ({} pages) to queue {}",
+        cur.proc.id,
+        handle,
+        npages,
+        qid
+    );
+    handle as i64
+}
+
+// receiver side: map the gift into the owner's address space, one slot
+// each; the mapping is plain RW user pages — reads are direct loads
+pub fn zmap(handle: u64) -> i64 {
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    let mut gifts = GIFTS.lock();
+    // immutable passes first: existence, ownership, idempotency, slot usage
+    let state = gifts
+        .iter()
+        .find(|g| g.handle == handle)
+        .map(|g| (g.owner.id == cur.proc.id, g.mapped_va));
+    let Some((is_owner, mapped)) = state else {
+        return -1;
+    };
+    if !is_owner {
+        return -1;
+    }
+    if mapped != 0 {
+        return mapped as i64; // idempotent
+    }
+    let used: Vec<u64> = gifts
+        .iter()
+        .filter(|x| x.mapped_va != 0)
+        .map(|x| x.mapped_va)
+        .collect();
+    let mut va = 0u64;
+    for s in 0..ZSLOTS {
+        let cand = ZWIN_BASE + s * ZSLOT_STRIDE;
+        if !used.contains(&cand) {
+            va = cand;
+            break;
+        }
+    }
+    if va == 0 {
+        serial_println!("[eq] zmap: no free slot for handle {}", handle);
+        return -1;
+    }
+    let Some(g) = gifts.iter_mut().find(|g| g.handle == handle) else {
+        return -1;
+    };
+
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    let mut installed = 0usize;
+    for (i, f) in g.frames.iter().enumerate() {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va + i as u64 * 0x1000));
+        serial_println!(
+            "[eq] zmap: page {} va {:#x} <- phys {:#x}",
+            i,
+            page.start_address().as_u64(),
+            f.start_address().as_u64()
+        );
+        if g.owner
+            .aspace
+            .lock()
+            .map_user_page(page, *f, flags)
+            .is_err()
+        {
+            break;
+        }
+        installed += 1;
+    }
+    if installed < g.frames.len() {
+        let owner = g.owner.clone();
+        for i in 0..installed {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va + i as u64 * 0x1000));
+            owner.aspace.lock().unmap_user_page(page);
+        }
+        return -1;
+    }
+    g.mapped_va = va;
+    serial_println!(
+        "[eq] zcopy: handle {} -> {:#x} for pid {} ({} bytes)",
+        handle,
+        va,
+        cur.proc.id,
+        g.bytes
+    );
+    va as i64
+}
+
+// receiver side: consumed — unmap and free the frames
+pub fn zdone(handle: u64) -> i64 {
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    let mut gifts = GIFTS.lock();
+    let Some(pos) = gifts.iter().position(|g| g.handle == handle) else {
+        return -1;
+    };
+    if gifts[pos].owner.id != cur.proc.id {
+        return -1;
+    }
+    let g = gifts.remove(pos);
+    drop(gifts);
+    zfree_gift(&g, "consumed");
+    0
+}
+
+// unmap (if mapped) and return the frames to the pool
+fn zfree_gift(g: &ZGift, why: &str) {
+    if g.mapped_va != 0 {
+        let mut aspace = g.owner.aspace.lock();
+        for i in 0..g.frames.len() {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                g.mapped_va + i as u64 * 0x1000,
+            ));
+            aspace.unmap_user_page(page);
+        }
+    }
+    let n = g.frames.len();
+    for f in g.frames.iter() {
+        memory::dealloc_frame(*f);
+    }
+    serial_println!("[eq] zcopy: gift {} {} ({} pages freed)", g.handle, why, n);
+}
+
+// abort a gift that never got announced (post failure)
+fn zdrop_handle(handle: u64) {
+    let mut gifts = GIFTS.lock();
+    if let Some(pos) = gifts.iter().position(|g| g.handle == handle) {
+        let g = gifts.remove(pos);
+        drop(gifts);
+        zfree_gift(&g, "aborted");
+    }
+}
+
+// a process died: gifts it posted are lost, gifts it owned are freed —
+// either way every frame goes back to the pool, nothing leaks
+fn zdrop_process(pid: u64) {
+    let dead: Vec<ZGift> = {
+        let mut gifts = GIFTS.lock();
+        let (dead, rest): (Vec<_>, Vec<_>) = gifts
+            .drain(..)
+            .partition(|g| g.owner.id == pid || g.from_pid == pid);
+        *gifts = rest;
+        dead
+    };
+    for g in dead {
+        zfree_gift(&g, "dropped");
+    }
+}
+
 // keyboard irq hook: forward scancode+ascii to the listening console queue
 pub fn kbd_event(scancode: u8, ascii: u8) {
     let qid = *SINK_QID.lock();
@@ -646,6 +925,9 @@ pub fn close_process(pid: u64) {
         });
         serial_println!("[eq] queue {} closed (owner {} gone)", qid, pid);
     }
+    // zero-copy gifts die with the process too: gifts it posted are lost,
+    // gifts it owned are freed — every frame goes back to the pool
+    zdrop_process(pid);
 }
 
 // remove every parked task of `pid` from queue lists; returns them so the

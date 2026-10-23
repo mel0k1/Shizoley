@@ -38,6 +38,7 @@ constexpr u32 EQ_RIGHT_SIGNAL = 16;
 constexpr u32 EQ_OP_KEY = 1;   // payload: [scancode, ascii]
 constexpr u32 EQ_OP_BOOT = 2;  // payload: "boot" — sink attached
 constexpr u32 EQ_OP_ERROR = 3; // reserved for error-channel users
+constexpr u32 EQ_OP_ZMSG = 4;  // zero-copy gift: payload = u64 handle + u64 bytes
 
 // head layout (user memory):
 // +0 magic, +4 chunk_size, +8 nchunks, +12 user_notify,
@@ -62,6 +63,14 @@ long eq_kick(long qid);
 long eq_listen(long qid);
 long eq_grant(long qid, u64 pid, u32 rights);
 long eq_revoke(long qid, u64 pid);
+
+// zero-copy big events: the poster gives away the pages behind a
+// page-aligned buffer (eq_zpost -> handle), the queue owner maps them with
+// eq_zmap (plain loads, no copies) and frees them with eq_zdone. a gift
+// dies with either side of the queue.
+long eq_zpost(long qid, const void* buf, u64 len);
+long eq_zmap(long handle);
+long eq_zdone(long handle);
 
 // drains pending elements (plain loads, no syscalls per element) and calls
 // cb for each; follows the producer's chunk chain and returns chunks by

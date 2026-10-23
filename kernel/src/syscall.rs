@@ -202,6 +202,14 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         21 => crate::vmx::guest_map(cur.proc.id, a1, a2) as u64,
         // 22: eq_alert(qid) -> 0 | -1; cancel parked eq_wait (SIGNAL right)
         22 => crate::eq::alert(a1) as u64,
+        // 23: eq_zpost(qid, buf, len) -> handle | -1; zero-copy page gift
+        23 => crate::eq::zpost(a1, a2, a3) as u64,
+        // 24: eq_zmap(handle) -> va | -1; map the gift into the owner
+        24 => crate::eq::zmap(a1) as u64,
+        // 25: eq_zdone(handle) -> 0 | -1; consume the gift, free the frames
+        25 => crate::eq::zdone(a1) as u64,
+        // 26: guest_mode(handle, mode) -> 0 | -1; mode 1 = long-mode guest
+        26 => crate::vmx::guest_mode(cur.proc.id, a1, a2) as u64,
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);

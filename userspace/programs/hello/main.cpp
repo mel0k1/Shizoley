@@ -7,6 +7,10 @@ using namespace shz;
 
 namespace shz {
 
+// 8 KiB pattern buffer, page-aligned: it travels to init as a zero-copy
+// gift — the pages themselves get detached from this address space
+static unsigned char bigbuf[8192] __attribute__((aligned(4096)));
+
 int main() {
     char buf[64];
     long from = recv(0, buf, sizeof(buf));
@@ -28,6 +32,15 @@ int main() {
         q = q * 10 + (buf[i] - '0');
     }
     println("[hello] posting 100 events to queue ", static_cast<u64>(q));
+
+    // per-op caps: we hold POST only — WAIT must be denied (no park, the
+    // check fires before the doorbell ever matters)
+    if (eq_wait(q) == -1) {
+        println("[hello] wait denied (no WAIT right): per-op caps ok");
+    } else {
+        println("[hello] wait should have been denied!");
+        return 1;
+    }
 
     for (u32 i = 0; i < 100; ++i) {
         char text[8];
@@ -52,6 +65,19 @@ int main() {
         }
     }
     println("[hello] posted 100, bye");
+
+    // zero-copy finale: give the pattern pages to init through the queue;
+    // after this the buffer is gone from our address space — do not touch
+    for (u32 i = 0; i < sizeof(bigbuf); ++i) {
+        bigbuf[i] = static_cast<unsigned char>(i & 0xFF);
+    }
+    long h = eq_zpost(q, bigbuf, sizeof(bigbuf));
+    if (h < 0) {
+        println("[hello] zpost failed");
+        return 1;
+    }
+    println("[hello] zposted ", static_cast<u64>(sizeof(bigbuf)),
+            " bytes as handle ", static_cast<u64>(h));
     return 0;
 }
 

@@ -31,14 +31,17 @@ pub fn check(qid: u64, pid: u64, owner_pid: u64, bit: u32) -> bool {
         .any(|g| g.qid == qid && g.pid == pid && g.bits & bit != 0)
 }
 
-// grant rights; returns false if the pid already has a grant entry
+// grant rights; the caller (owner) hands out an arbitrary subset — per-op
+// grants, never all-or-nothing. a repeated grant replaces the previous
+// bits so the owner can adjust rights without a revoke round-trip
 pub fn grant(qid: u64, pid: u64, bits: u32) -> bool {
     if bits & !(QPOST | QWAIT | QKICK | QLISTEN | QSIGNAL) != 0 || bits == 0 {
         return false;
     }
     let mut grants = GRANTS.lock();
-    if grants.iter().any(|g| g.qid == qid && g.pid == pid) {
-        return false;
+    if let Some(g) = grants.iter_mut().find(|g| g.qid == qid && g.pid == pid) {
+        g.bits = bits;
+        return true;
     }
     grants.push(Grant { pid, qid, bits });
     true
