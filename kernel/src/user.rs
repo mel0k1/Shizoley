@@ -28,12 +28,18 @@ fn map_zeroed_range(
     let last = Page::containing_address(VirtAddr::new(top - 1));
     for page in Page::range_inclusive(first, last) {
         let frame = memory::alloc_frame().ok_or("no frames")?;
-        let fresh = aspace
-            .map_user_page(page, frame, flags)
-            .map_err(|_| "map")?;
+        let fresh = match aspace.map_user_page(page, frame, flags) {
+            Ok(f) => f,
+            Err(_) => {
+                memory::dealloc_frame(frame);
+                return Err("map");
+            }
+        };
         if fresh {
             let dst = memory::phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
             unsafe { core::ptr::write_bytes(dst, 0, 4096) };
+        } else {
+            memory::dealloc_frame(frame);
         }
     }
     let _ = what;
@@ -41,7 +47,7 @@ fn map_zeroed_range(
 }
 
 // share the kernel's initrd frames read-only into a fresh address space
-fn map_initrd(aspace: &mut task::AddressSpace) {
+fn map_initrd(aspace: &mut task::AddressSpace) -> Result<(), &'static str> {
     use x86_64::structures::paging::{Mapper, OffsetPageTable};
 
     // BIT_9 marks kernel-owned frames: teardown must not free them
@@ -67,8 +73,9 @@ fn map_initrd(aspace: &mut task::AddressSpace) {
         let upage = Page::containing_address(VirtAddr::new(initrd::INITRD_BASE + i * 0x1000));
         aspace
             .map_user_page(upage, frame, flags)
-            .expect("initrd map failed");
+            .map_err(|_| "initrd map failed")?;
     }
+    Ok(())
 }
 
 // loads `name` from the initrd into a fresh process and queues its main
@@ -105,7 +112,11 @@ pub fn spawn_process(name: &str) -> Option<u64> {
         aspace.teardown();
         return None;
     }
-    map_initrd(&mut aspace);
+    if let Err(e) = map_initrd(&mut aspace) {
+        serial_println!("[spawn] initrd '{}' rejected: {}", name, e);
+        aspace.teardown();
+        return None;
+    }
 
     let pid = NEXT_PID.fetch_add(1, Ordering::AcqRel);
     let proc = Arc::new(task::Process::new(pid, name, aspace));

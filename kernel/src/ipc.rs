@@ -126,7 +126,10 @@ pub fn try_recv(receiver: &Arc<Task>, src: u64, buf: u64, max: u64) -> Recv {
         .iter()
         .position(|m| (src == 0 || m.from == src) && m.data.len() <= max as usize)
     else {
-        return Recv::Empty;
+        // a matching message that cannot fit the buffer is an error: the
+        // caller retries with a bigger one instead of parking on it forever
+        let stuck = mb.iter().any(|m| src == 0 || m.from == src);
+        return if stuck { Recv::Bad } else { Recv::Empty };
     };
     let msg = mb.remove(idx).expect("position vanished");
     if !proc.aspace.lock().write_bytes(buf, &msg.data) {

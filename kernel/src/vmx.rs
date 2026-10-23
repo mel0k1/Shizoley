@@ -976,6 +976,17 @@ pub const GUEST_MAX_PAGES: u64 = 8192; // 32 MiB
 
 // ---------------------------------------------------------------- syscalls
 
+// a 2 mib leaf maps a whole region, so its 512 frames must be physically
+// contiguous — a scattered run with an aligned first frame must never
+// collapse (it would hand the guest physical memory it does not own)
+fn region_contiguous(ram: &[PhysFrame<Size4KiB>], start: usize) -> bool {
+    let base = ram[start].start_address().as_u64();
+    ram[start..start + 512]
+        .iter()
+        .enumerate()
+        .all(|(k, f)| f.start_address().as_u64() == base + k as u64 * 0x1000)
+}
+
 pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
     if !vmx_ready() {
         return -1;
@@ -1095,6 +1106,7 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
                 && i.is_multiple_of(512)
                 && i + 512 <= ram.len()
                 && base.is_multiple_of(TWO_MIB)
+                && region_contiguous(&ram, i)
             {
                 wr(ept_pd, i / 512, base | EPT_LEAF_2M);
                 i += 512;
@@ -1694,6 +1706,17 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
     let vcpu_ptr: *mut Vcpu = &mut g.vcpu;
     let err = unsafe { vmx_launch_asm(vcpu_ptr, first) };
     g.launched = true;
+    let reason = g.vcpu.out[0];
+    // the out half only: the user's control fields stay untouched for the
+    // next vcpu_run call
+    let mut buf = [0u8; 160];
+    for (i, v) in g.vcpu.out.iter().enumerate() {
+        buf[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    // release the guest list BEFORE interrupts come back: a timer tick
+    // here can switch tasks, and holding the lock across a yield would
+    // spin every other guest syscall until this one runs again
+    drop(guests);
     // interrupts were cleared by the vm-exit path
     x86_64::instructions::interrupts::enable();
     // hand the address space back to the caller before touching user memory
@@ -1703,13 +1726,6 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
         let ierr = vmread(VM_INSTRUCTION_ERROR);
         serial_println!("[vmx] launch/resume failed: err {} vmfail {}", err, ierr);
         return -1;
-    }
-    let reason = g.vcpu.out[0];
-    // the out half only: the user's control fields stay untouched for the
-    // next vcpu_run call
-    let mut buf = [0u8; 160];
-    for (i, v) in g.vcpu.out.iter().enumerate() {
-        buf[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }
     if !cur.proc.aspace.lock().write_bytes(out_buf, &buf) {
         serial_println!("[vmx] bad out buffer");
@@ -1788,51 +1804,9 @@ pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
             }
         }
     }
-    let ept_pd = g.tables[2];
-    unsafe {
-        let pd_ptr = memory::phys_to_virt(ept_pd.start_address()).as_mut_ptr::<u64>();
-        for (k, pt) in new_pts.iter().enumerate() {
-            pd_ptr
-                .add(old_npts as usize + k)
-                .write_volatile(pt.start_address().as_u64() | EPT_TABLE);
-        }
-        // pt for guest frame index gi: an existing tail pt or one of the
-        // fresh ones — new pts are appended to g.tables only at commit, so
-        // indexing g.tables here would land in the apic frames
-        for (i, rf) in new_ram.iter().enumerate() {
-            let gi = old_len as usize + i;
-            let pt = if gi / 512 < old_npts as usize {
-                g.tables[3 + gi / 512]
-            } else {
-                new_pts[gi / 512 - old_npts as usize]
-            };
-            let p = memory::phys_to_virt(pt.start_address()).as_mut_ptr::<u64>();
-            p.add(gi % 512)
-                .write_volatile(rf.start_address().as_u64() | EPT_LEAF);
-        }
-        // p3: collapse completed, physically aligned regions into 2 mib
-        // leaves — the old tail finished by this growth and full new
-        // regions; pt frames stay allocated for uniform indexing
-        if EPT2M_OK.load(Ordering::Relaxed) {
-            let total = old_len as usize + new_ram.len();
-            for k in 0..total.div_ceil(512) {
-                let start = k * 512;
-                if start + 512 <= total {
-                    let rf = if start < old_len as usize {
-                        g.ram[start]
-                    } else {
-                        new_ram[start - old_len as usize]
-                    };
-                    let base = rf.start_address().as_u64();
-                    if base.is_multiple_of(TWO_MIB) {
-                        pd_ptr.add(k).write_volatile(base | EPT_LEAF_2M);
-                    }
-                }
-            }
-        }
-    }
-
-    // extend the creator's window; unmap on partial failure
+    // extend the creator's window; unmap on partial failure. all ept
+    // mutations happen only after this succeeds — a rolled-back growth
+    // must never leave stale translations behind
     let mut mapped: u64 = 0;
     {
         let mut aspace = cur.proc.aspace.lock();
@@ -1869,9 +1843,44 @@ pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
         return -1;
     }
 
-    // commit: new cacheable translations appeared — flush the ept caches
+    // commit, then wire the ept: new cacheable translations appear below,
+    // so the flush comes last
     g.ram.extend(new_ram);
     g.tables.extend(new_pts);
+    let ept_pd = g.tables[2];
+    unsafe {
+        let pd_ptr = memory::phys_to_virt(ept_pd.start_address()).as_mut_ptr::<u64>();
+        for (k, pt) in g.tables[3 + old_npts as usize..3 + new_npts as usize]
+            .iter()
+            .enumerate()
+        {
+            pd_ptr
+                .add(old_npts as usize + k)
+                .write_volatile(pt.start_address().as_u64() | EPT_TABLE);
+        }
+        for (i, rf) in g.ram[old_len as usize..].iter().enumerate() {
+            let gi = old_len as usize + i;
+            let p =
+                memory::phys_to_virt(g.tables[3 + gi / 512].start_address()).as_mut_ptr::<u64>();
+            p.add(gi % 512)
+                .write_volatile(rf.start_address().as_u64() | EPT_LEAF);
+        }
+        // p3: collapse completed, physically aligned regions into 2 mib
+        // leaves — the old tail finished by this growth and full new
+        // regions; pt frames stay allocated for uniform indexing
+        if EPT2M_OK.load(Ordering::Relaxed) {
+            let total = g.ram.len();
+            for k in 0..total.div_ceil(512) {
+                let start = k * 512;
+                if start + 512 <= total {
+                    let base = g.ram[start].start_address().as_u64();
+                    if base.is_multiple_of(TWO_MIB) && region_contiguous(&g.ram, start) {
+                        pd_ptr.add(k).write_volatile(base | EPT_LEAF_2M);
+                    }
+                }
+            }
+        }
+    }
     let eptp = g.tables[0].start_address().as_u64();
     drop(guests);
     invept_all(eptp);
