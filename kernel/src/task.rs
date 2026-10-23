@@ -84,14 +84,20 @@ impl AddressSpace {
         let root: &mut PageTable =
             unsafe { &mut *(memory::phys_to_virt(self.pml4.start_address()).as_mut_ptr()) };
         let pml4e = &mut root[page.p4_index()];
-        pml4e.set_flags(pml4e.flags() | PageTableFlags::USER_ACCESSIBLE);
         if !pml4e.flags().contains(PageTableFlags::PRESENT) {
+            // absent ancestors are built by map_to with parent_flags (which
+            // include USER); touching them here would flip the entry's raw
+            // value non-zero and the crate's is_unused() (raw == 0) would
+            // then treat phys 0 as a page table and walk real-mode garbage
             return;
         }
+        pml4e.set_flags(pml4e.flags() | PageTableFlags::USER_ACCESSIBLE);
         let pdpt: &mut PageTable =
             unsafe { &mut *(memory::phys_to_virt(pml4e.addr()).as_mut_ptr()) };
         let pdpte = &mut pdpt[page.p3_index()];
-        pdpte.set_flags(pdpte.flags() | PageTableFlags::USER_ACCESSIBLE);
+        if pdpte.flags().contains(PageTableFlags::PRESENT) {
+            pdpte.set_flags(pdpte.flags() | PageTableFlags::USER_ACCESSIBLE);
+        }
     }
 
     // map one user page; returns true when the frame was freshly inserted
@@ -132,7 +138,7 @@ impl AddressSpace {
     // resolve the 4 KiB leaf behind a virtual address through THIS space's
     // tables (via the physmap, so any CR3 works); huge pages are rejected:
     // user mappings are always built from 4 KiB frames
-    fn walk_leaf(&mut self, addr: VirtAddr) -> Option<(PhysFrame<Size4KiB>, PageTableFlags)> {
+    pub fn walk_leaf(&mut self, addr: VirtAddr) -> Option<(PhysFrame<Size4KiB>, PageTableFlags)> {
         let p4: &PageTable =
             unsafe { &*(memory::phys_to_virt(self.pml4.start_address()).as_ptr()) };
         let e4 = &p4[addr.p4_index()];
