@@ -41,6 +41,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         "shizoley v{} (kernel paparaci: caps, eq, vmx)",
         env!("CARGO_PKG_VERSION")
     );
+    serial_println!("shizoley v{}", env!("CARGO_PKG_VERSION"));
 
     vmx::init();
     syscall::init();

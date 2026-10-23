@@ -153,7 +153,7 @@ extern "x86-interrupt" fn page_fault_handler(
 extern "x86-interrupt" fn pi_notify_handler(_stack_frame: InterruptStackFrame) {}
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
+    let ticks = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if ticks % 512 == 0 {
         serial_print!(".");
     }
@@ -162,6 +162,7 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8())
     };
+    crate::eq::timer_tick(ticks);
     sched::on_tick();
 }
 
@@ -208,11 +209,12 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
 pub fn dispatch_in_root(vector: u8) -> bool {
     match vector {
         v if v == InterruptIndex::Timer.as_u8() => {
-            TICKS.fetch_add(1, Ordering::Relaxed);
+            let ticks = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
             unsafe {
                 PICS.lock()
                     .notify_end_of_interrupt(InterruptIndex::Timer.as_u8())
             };
+            crate::eq::timer_tick(ticks);
             true
         }
         v if v == InterruptIndex::Keyboard.as_u8() => {

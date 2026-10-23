@@ -291,6 +291,10 @@ pub fn kill_process(target: u64) -> i64 {
     if target == 0 {
         return -1; // the kernel process is immortal
     }
+    // unknown pid: nothing to kill, report it instead of fake success
+    if crate::ipc::find(target).is_none() {
+        return -1;
+    }
     interrupts::without_interrupts(|| {
         let cur = current();
         let is_self = cur.as_ref().is_some_and(|t| t.proc.id == target);

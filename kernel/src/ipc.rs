@@ -1,5 +1,6 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
@@ -42,6 +43,42 @@ pub fn find(pid: u64) -> Option<Arc<Process>> {
         let p = w.upgrade()?;
         (p.id == pid).then_some(p)
     })
+}
+
+// live snapshot for ps(28), sorted by pid; state comes from the thread counter
+pub fn snapshot() -> Vec<Arc<Process>> {
+    let mut list = PROCESSES.lock();
+    list.retain(|w| w.upgrade().is_some());
+    let mut out: Vec<Arc<Process>> = list.iter().filter_map(|w| w.upgrade()).collect();
+    drop(list);
+    out.sort_by_key(|p| p.id);
+    out
+}
+
+// ps(28): 40-byte records (pid, threads, state 0=run/1=dead, name[16])
+pub fn ps(buf: u64, max: u64) -> i64 {
+    let cur = match sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    let list = snapshot();
+    let n = list.len().min(max as usize).min(128);
+    let mut blob: Vec<u8> = Vec::with_capacity(n * 40);
+    for p in list.iter().take(n) {
+        let mut name = [0u8; 16];
+        for (i, b) in p.name.bytes().take(16).enumerate() {
+            name[i] = b;
+        }
+        let alive = p.alive.load(Ordering::Acquire) as u64;
+        blob.extend_from_slice(&p.id.to_le_bytes());
+        blob.extend_from_slice(&alive.to_le_bytes());
+        blob.extend_from_slice(&u64::from(alive == 0).to_le_bytes());
+        blob.extend_from_slice(&name);
+    }
+    if !cur.proc.aspace.lock().write_bytes(buf, &blob) {
+        return -1;
+    }
+    n as i64
 }
 
 // kernel-side send: copy the payload out of the sender, then either hand it

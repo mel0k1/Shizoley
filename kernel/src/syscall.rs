@@ -193,8 +193,9 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         16 => crate::vmx::vcpu_run(cur.proc.id, a1, a2) as u64,
         // 17: guest_destroy(handle) -> 0 | -1; frees ram, ept, vmcs
         17 => crate::vmx::guest_destroy(cur.proc.id, a1) as u64,
-        // 18: eq_listen(qid) -> 0 | -1; register kernel event sink (LISTEN)
-        18 => crate::eq::listen(a1) as u64,
+        // 18: eq_listen(qid, which) -> 0 | -1; register a kernel event sink
+        //     (LISTEN right): which 0 = keyboard, 1 = timer fires
+        18 => crate::eq::listen(a1, a2) as u64,
         // 19: eq_grant(handle, pid, rights) -> child handle | -1; derives a
         //     capability for pid (would_cycle-checked delegation)
         19 => crate::eq::grant(a1, a2, a3 as u32) as u64,
@@ -215,6 +216,14 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         // 27: guest_pi(handle, vector) -> 0 | -1; route a host irq vector
         //     into the guest's posted-interrupt descriptor (0 = clear all)
         27 => crate::vmx::guest_pi(cur.proc.id, a1, a2) as u64,
+        // 28: ps(buf, max_entries) -> n; 40-byte records (pid, threads,
+        //     state 0=run/1=dead, name[16])
+        28 => crate::ipc::ps(a1, a2) as u64,
+        // 29: ticks() -> scheduler tick count (the PIT clock)
+        29 => crate::interrupts::tick_count(),
+        // 30: timer_arm(deadline_ticks) -> 0 | -1; one-shot deadline for
+        //     the timer sink (only its owner may arm; 0 disarms)
+        30 => crate::eq::arm(a1) as u64,
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);

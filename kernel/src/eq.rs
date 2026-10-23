@@ -59,6 +59,7 @@ pub const E_PROTO: u32 = 3; // producer protocol violation
 pub const OP_KERNEL_EVENT: u32 = 1; // keyboard scancode+ascii pair
 pub const OP_BOOT: u32 = 2; // "queue is listening" ping
 pub const OP_ZMSG: u32 = 4; // zero-copy gift: payload = handle + bytes
+pub const OP_TICK: u32 = 5; // timer fire: payload = tick count
 
 struct EqProd {
     seq: u64, // chunks opened
@@ -82,6 +83,9 @@ static EQS: Mutex<Vec<(u64, Arc<Eq>)>> = Mutex::new(Vec::new());
 static NEXT_QID: Mutex<u64> = Mutex::new(1);
 // the queue kernel events (keyboard) flow into, set by eq_listen
 static SINK_QID: Mutex<u64> = Mutex::new(0);
+// the timer sink (eq_listen which=1) and its one-shot deadline in ticks (0 = off)
+static TSINK_QID: Mutex<u64> = Mutex::new(0);
+static TIMER_DEADLINE: AtomicU64 = AtomicU64::new(0);
 
 fn find(qid: u64) -> Option<Arc<Eq>> {
     EQS.lock()
@@ -591,9 +595,8 @@ pub fn kick(handle: u64) -> i64 {
     })
 }
 
-// make the caller's queue the kernel event sink (keyboard events); the
-// caller's capability must carry LISTEN, and a boot ping proves the pipe
-pub fn listen(handle: u64) -> i64 {
+// register a kernel event sink: which 0 = keyboard (consoled), 1 = timer (timed)
+pub fn listen(handle: u64, which: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
         None => return -1,
@@ -606,9 +609,17 @@ pub fn listen(handle: u64) -> i64 {
         Some(e) => e,
         None => return -1,
     };
-    *SINK_QID.lock() = qid;
+    match which {
+        0 => *SINK_QID.lock() = qid,
+        1 => {
+            *TSINK_QID.lock() = qid;
+            TIMER_DEADLINE.store(0, Ordering::Release);
+        }
+        _ => return -1,
+    }
     serial_println!(
-        "[eq] kernel event sink -> queue {} owned by pid {} (listener {})",
+        "[eq] kernel event sink {} -> queue {} owned by pid {} (listener {})",
+        if which == 0 { "kbd" } else { "timer" },
         qid,
         eq.owner.id,
         cur.proc.id
@@ -616,6 +627,39 @@ pub fn listen(handle: u64) -> i64 {
     let payload = b"boot";
     post_nb(qid, OP_BOOT, payload);
     0
+}
+
+// timer_arm(30): one-shot deadline for the timer sink, only its owner may arm
+pub fn arm(deadline: u64) -> i64 {
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    let qid = *TSINK_QID.lock();
+    let Some(eq) = find(qid) else {
+        return -1;
+    };
+    if eq.owner.id != cur.proc.id {
+        return -1;
+    }
+    TIMER_DEADLINE.store(deadline, Ordering::Release);
+    0
+}
+
+// both timer paths call this; a failed post re-arms so the fire is never lost
+pub fn timer_tick(t: u64) {
+    let d = TIMER_DEADLINE.load(Ordering::Acquire);
+    if d == 0 || t < d {
+        return;
+    }
+    TIMER_DEADLINE.store(0, Ordering::Release);
+    let qid = *TSINK_QID.lock();
+    if qid == 0 {
+        return;
+    }
+    if !post_nb(qid, OP_TICK, &t.to_le_bytes()) {
+        TIMER_DEADLINE.store(d, Ordering::Release);
+    }
 }
 
 // hand out rights: derives a child capability from the caller's instance
@@ -970,6 +1014,11 @@ pub fn close_process(pid: u64) {
         caps::drop_queue(qid);
         if qid == *SINK_QID.lock() {
             *SINK_QID.lock() = 0;
+        }
+        // a dying timer sink must not keep an armed deadline pointing at it
+        if qid == *TSINK_QID.lock() {
+            *TSINK_QID.lock() = 0;
+            TIMER_DEADLINE.store(0, Ordering::Release);
         }
         // the head is in the dying owner's memory: best-effort write so a
         // consumer polling the channel sees why events stopped
