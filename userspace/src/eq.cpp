@@ -50,38 +50,39 @@ long eq_setup(void* mem, u64 size) {
     return syscall(Sys::eq_setup, reinterpret_cast<u64>(mem), size);
 }
 
-long eq_post(long qid, u32 opcode, const void* data, u32 len) {
-    return syscall(Sys::eq_post, static_cast<u64>(qid),
+long eq_post(long handle, u32 opcode, const void* data, u32 len) {
+    return syscall(Sys::eq_post, static_cast<u64>(handle),
                    static_cast<u64>(opcode), reinterpret_cast<u64>(data),
                    static_cast<u64>(len));
 }
 
-long eq_wait(long qid) {
-    return syscall(Sys::eq_wait, static_cast<u64>(qid));
+long eq_wait(long handle) {
+    return syscall(Sys::eq_wait, static_cast<u64>(handle));
 }
 
-long eq_alert(long qid) {
-    return syscall(Sys::eq_alert, static_cast<u64>(qid));
+long eq_alert(long handle) {
+    return syscall(Sys::eq_alert, static_cast<u64>(handle));
 }
 
-long eq_kick(long qid) {
-    return syscall(Sys::eq_kick, static_cast<u64>(qid));
+long eq_kick(long handle) {
+    return syscall(Sys::eq_kick, static_cast<u64>(handle));
 }
 
-long eq_listen(long qid) {
-    return syscall(Sys::eq_listen, static_cast<u64>(qid));
+long eq_listen(long handle) {
+    return syscall(Sys::eq_listen, static_cast<u64>(handle));
 }
 
-long eq_grant(long qid, u64 pid, u32 rights) {
-    return syscall(Sys::eq_grant, static_cast<u64>(qid), pid, rights);
+long eq_grant(long handle, u64 pid, u32 rights) {
+    return syscall(Sys::eq_grant, static_cast<u64>(handle), pid,
+                   static_cast<u64>(rights));
 }
 
-long eq_revoke(long qid, u64 pid) {
-    return syscall(Sys::eq_revoke, static_cast<u64>(qid), pid);
+long eq_revoke(long handle) {
+    return syscall(Sys::eq_revoke, static_cast<u64>(handle));
 }
 
-long eq_zpost(long qid, const void* buf, u64 len) {
-    return syscall(Sys::eq_zpost, static_cast<u64>(qid),
+long eq_zpost(long handle, const void* buf, u64 len) {
+    return syscall(Sys::eq_zpost, static_cast<u64>(handle),
                    reinterpret_cast<u64>(buf), len);
 }
 
@@ -93,7 +94,7 @@ long eq_zdone(long handle) {
     return syscall(Sys::eq_zdone, static_cast<u64>(handle));
 }
 
-u32 eq_drive(long qid, void* base, void (*cb)(const EqEvent&)) {
+u32 eq_drive(long handle, void* base, void (*cb)(const EqEvent&)) {
     u8* b = static_cast<u8*>(base);
     volatile u8* h = b;
 
@@ -133,7 +134,7 @@ u32 eq_drive(long qid, void* base, void (*cb)(const EqEvent&)) {
             st64(h + 24, cons);
             st64(h + 40, 0);
             st32(ch + 4, 0);
-            eq_kick(qid);
+            eq_kick(handle);
             if (next >= nchunks) {
                 break; // broken chain: stop, the kernel flags the channel
             }

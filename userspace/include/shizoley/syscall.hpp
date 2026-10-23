@@ -13,30 +13,33 @@ enum class Sys : u64 {
     ipc_recv = 5,       // (src_pid /*0 = any*/, buf, max) -> sender pid
     getpid = 6,
     gettid = 7,
-    eq_setup = 8,      // (mem, size) -> qid; managarm-style event queue
-    eq_post = 9,       // (qid, opcode, buf, len) -> 0 | -1
-    eq_wait = 10,      // (qid) -> 1 | -1; parks until the doorbell
-    eq_kick = 11,      // (qid) -> 0 | -1; release chunk credit
+    eq_setup = 8,      // (mem, size) -> root capability handle; unguessable
+    eq_post = 9,       // (handle, opcode, buf, len) -> 0 | -1
+    eq_wait = 10,      // (handle) -> 1 | -1; parks until the doorbell
+    eq_kick = 11,      // (handle) -> 0 | -1; release chunk credit
     initrd_size = 12,  // () -> bytes (initrd mapped ro at INITRD_BASE)
     write = 13,        // (buf, len) -> len; atomic console line
     kill = 14,         // (pid) -> 0 | -1; end every thread of the process
     guest_create = 15, // (pages) -> handle; vmcs + ept + ram window
     vcpu_run = 16,     // (handle, out u64[20]) -> exit reason
     guest_destroy = 17,// (handle) -> 0 | -1; frees ram, ept, vmcs
-    eq_listen = 18,    // (qid) -> 0 | -1; register kernel event sink
-    eq_grant = 19,     // (qid, pid, rights) -> 0 | -1
-    eq_revoke = 20,    // (qid, pid) -> 0 | -1
+    eq_listen = 18,    // (handle) -> 0 | -1; register kernel event sink
+    eq_grant = 19,     // (handle, pid, rights) -> child handle | -1
+    eq_revoke = 20,    // (handle) -> n revoked | -1; cascade the subtree
     guest_map = 21,    // (handle, count) -> new size | -1; grow guest ram+ept
-    eq_alert = 22,     // (qid) -> 0 | -1; cancel a parked eq_wait
-    eq_zpost = 23,     // (qid, buf, len) -> handle | -1; zero-copy page gift
+    eq_alert = 22,     // (handle) -> 0 | -1; cancel a parked eq_wait
+    eq_zpost = 23,     // (handle, buf, len) -> gift handle | -1; zero-copy
     eq_zmap = 24,      // (handle) -> va | -1; map the gift into the owner
     eq_zdone = 25,     // (handle) -> 0 | -1; consume the gift, free frames
     guest_mode = 26,   // (handle, mode) -> 0 | -1; mode 1 = long-mode guest
+    guest_pi = 27,     // (handle, vector) -> 0 | -1; route host irq into
+                       // the guest's posted-interrupt descriptor (0 = clear)
 };
 
 // vcpu_run exit reasons (reportable vmx exits; see kernel vmx.rs)
 enum class VmxExit : long {
-    ext_int = 1,       // timer tick stopped the guest for scheduling: re-enter
+    ext_int = 1,       // host irq stopped the guest: timer tick (re-enter) or
+                       // a routed vector posted into the guest (out[3]=vector)
     ud = 10,           // guest took #UD (intercepted): e.g. the rax proof failed
     vmcall = 18,       // guest hypercall (kernel advanced rip past it)
     io = 30,           // guest touched a real port: kernel blocks it (out[3]=port)
@@ -90,6 +93,7 @@ long guest_map(long handle, u64 count);
 long vcpu_run(long handle, VcpuExit* ve);
 long guest_destroy(long handle);
 long guest_mode(long handle, u64 mode);
+long guest_pi(long handle, u64 vector);
 long eq_alert(long qid);
 
 inline long syscall(Sys nr) {

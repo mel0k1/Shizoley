@@ -57,4 +57,8 @@ long guest_mode(long handle, u64 mode) {
     return syscall(Sys::guest_mode, static_cast<u64>(handle), mode);
 }
 
+long guest_pi(long handle, u64 vector) {
+    return syscall(Sys::guest_pi, static_cast<u64>(handle), vector);
+}
+
 }

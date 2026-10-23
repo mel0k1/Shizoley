@@ -51,6 +51,11 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_handler);
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_handler);
+    // vmx posted-interrupt notification vector: the cpu consumes this
+    // vector itself while a guest runs (it never reaches the host idt in
+    // that case); in vmx-root it is a silent stub so a stray notification
+    // can never land on an unhandled idt slot and shut the machine down
+    idt[0xF0].set_handler_fn(pi_notify_handler);
     idt
 });
 
@@ -141,6 +146,11 @@ extern "x86-interrupt" fn page_fault_handler(
         x86_64::instructions::hlt();
     }
 }
+
+// the vmx posted-interrupt notification vector (0xf0): nothing to ack (it
+// cannot come from the pic) and the kernel entry-sync processes the
+// descriptor anyway — just return
+extern "x86-interrupt" fn pi_notify_handler(_stack_frame: InterruptStackFrame) {}
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     let ticks = TICKS.fetch_add(1, Ordering::Relaxed);

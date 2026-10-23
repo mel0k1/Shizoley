@@ -61,9 +61,13 @@ jobs:
           grep -qF "[vmx]" serial.log
           grep -qF "[console] up: kernel sink attached" serial.log
           grep -qF "[gdemo] vmx unavailable (guest_create refused)" serial.log
-          grep -qF "[eq] granted 0x1 on queue 2 to pid 2" serial.log
+          grep -qF "[caps] granted 0x1 on queue 3 to pid 2" serial.log
           grep -qF "[eq] wait: alerted (wait canceled)" serial.log
-          grep -qF "[eq] queue 2 closed (owner 1 gone)" serial.log
+          grep -qF "[eq] queue 3 closed (owner 1 gone)" serial.log
+          grep -qF "[hello] forged token denied: capabilities are unguessable" serial.log
+          grep -qF "[capsdemo] all ok" serial.log
+          grep -qF "[caps] would_cycle refused" serial.log
+          grep -qF "[capsuser] post denied after revoke (cascade ok)" serial.log
           grep -qE "process 'init' \(1\) torn down, [0-9]+ frames freed" serial.log
 
   userspace:

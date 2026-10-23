@@ -70,33 +70,15 @@ void on_event(const EqEvent& ev) {
     }
 }
 
-void put_str(char* dst, u64& n, const char* s) {
-    while (*s != '\0') {
-        dst[n++] = *s++;
-    }
-}
-
-void put_num(char* dst, u64& n, u64 v) {
-    char tmp[20];
-    int i = 0;
-    if (v == 0) {
-        tmp[i++] = '0';
-    }
-    while (v > 0) {
-        tmp[i++] = static_cast<char>('0' + v % 10);
-        v /= 10;
-    }
-    while (i > 0) {
-        dst[n++] = tmp[--i];
-    }
-}
+// recv returns the sender pid; messages carry their own framing ("EQH" +
+// token bytes for capability handoff)
 
 long request(long pid, const char* what, u64 len, char* buf, u64 max) {
     send(static_cast<u64>(pid), what, len);
     return recv(static_cast<u64>(pid), buf, max);
 }
 
-}
+}  // namespace
 
 namespace shz {
 
@@ -113,6 +95,10 @@ int main() {
     char buf[128];
     long from = recv(static_cast<u64>(hello), buf, sizeof(buf));
     println("[init] ", buf, " from ", static_cast<u64>(from));
+
+    // capability round trip: grant -> delegation -> would_cycle refusal
+    long caps = spawn("capsdemo", 8);
+    println("[init] spawned capsdemo (", static_cast<u64>(caps), ")");
 
     // services in ring 3: fsd owns the initrd, rtcd owns the cmos ports
     long fsd = spawn("fsd", 3);
@@ -142,14 +128,20 @@ int main() {
     println("[init] rtc says: ", buf);
 
     // managarm-style event queue: hello posts events, we drain them with
-    // plain loads and only sleep in the kernel between batches
+    // plain loads and only sleep in the kernel between batches. q is a
+    // capability handle now — unguessable, bound to this process
     eqmem[4] = 0x00;             // chunk_size = 512 (LE u32)
     eqmem[5] = 0x02;
     eqmem[8] = 4;                // nchunks
     long q = eq_setup(eqmem, sizeof(eqmem));
-    println("[init] event queue ", static_cast<u64>(q));
-    // hello may post into our queue: hand it the POST capability
-    eq_grant(q, static_cast<u64>(hello), EQ_RIGHT_POST);
+    println("[init] event queue root handle ", static_cast<u64>(q));
+    // hello may post into our queue: derive a POST-only child capability
+    // and pass its token over ipc — rights travel as bytes
+    long hhello = eq_grant(q, static_cast<u64>(hello), EQ_RIGHT_POST);
+    if (hhello < 0) {
+        println("[init] grant to hello failed");
+        return 1;
+    }
 
     // alert semantics: eq_alert cancels a parked eq_wait (fast path here —
     // the ALERT bit is up before we ever park, wait returns 2 right away)
@@ -158,12 +150,16 @@ int main() {
         println("[eq] wait: alerted (wait canceled)");
     }
 
-    char msg[32];
-    u64 mn = 0;
-    put_str(msg, mn, "EQ ");
-    put_num(msg, mn, static_cast<u64>(q));
-    msg[mn] = '\0';
-    send(static_cast<u64>(hello), msg, mn + 1);
+    // "EQH" + the 8-byte token, little-endian: hello posts with it
+    char msg[12];
+    msg[0] = 'E';
+    msg[1] = 'Q';
+    msg[2] = 'H';
+    u64 tok = static_cast<u64>(hhello);
+    for (int i = 0; i < 8; ++i) {
+        msg[3 + i] = static_cast<char>(tok >> (8 * i));
+    }
+    send(static_cast<u64>(hello), msg, sizeof(msg));
 
     u32 total = 0;
     u32 milestone = 0;

@@ -37,8 +37,10 @@ use crate::task::{Process, Task, TaskState, USER_LIMIT};
 // `next` chain instead of assuming index order, so a chunk is only ever
 // read while FULL, and only ever reused after the consumer zeroed it.
 //
-// access is capability-guarded: the creator holds every right implicitly,
-// anyone else needs an eq_grant (POST/WAIT/KICK/LISTEN/SIGNAL).
+// access is capability-guarded: the creator gets an unguessable root
+// handle from caps (every right, incl. QGRANT for delegation); anyone
+// else only gets a derived handle through eq_grant — full capability
+// semantics, see caps.rs.
 
 pub const EQ_MAGIC: u32 = 0x5A48_5632; // "ZHv2"
 pub const EQ_FULL: u32 = 0x8000_0000;
@@ -220,15 +222,37 @@ pub fn setup(base: u64, size: u64) -> i64 {
     *nid += 1;
     drop(nid);
     reg.push((qid, eq));
+    // the caller's root capability: unguessable, every right
+    let root = caps::install_root(qid, cur.proc.id);
     serial_println!(
-        "[eq] queue {} registered: pid {} base {:#x} chunk {} x {}",
+        "[eq] queue {} registered: pid {} base {:#x} chunk {} x {} root {:#x}",
         qid,
         cur.proc.id,
         base,
         chunk_size,
-        nchunks
+        nchunks,
+        root
     );
-    qid as i64
+    root as i64
+}
+
+// resolve a capability token for the caller into the qid it names; the
+// denial carries the right that was missing so the serial log tells the
+// whole story
+fn resolve(token: u64, pid: u64, need: u32, what: &str) -> Option<u64> {
+    match caps::lookup(token, pid, need) {
+        Some(qid) => Some(qid),
+        None => {
+            serial_println!(
+                "[eq] {} denied: pid {} holds no capability {:#x} (need {:#x})",
+                what,
+                pid,
+                token,
+                need
+            );
+            None
+        }
+    }
 }
 
 fn find_qid(reg: &[(u64, Arc<Eq>)], eq: &Arc<Eq>) -> u64 {
@@ -239,13 +263,19 @@ fn find_qid(reg: &[(u64, Arc<Eq>)], eq: &Arc<Eq>) -> u64 {
 }
 
 // append one element; parks the poster when chunk credit runs out until
-// the consumer drains a full chunk and kicks the queue
-pub fn post(qid: u64, opcode: u32, buf: u64, len: u64) -> i64 {
+// the consumer drains a full chunk and kicks the queue. `handle` is the
+// caller's capability token (root or derived), not a guessable id.
+pub fn post(handle: u64, opcode: u32, buf: u64, len: u64) -> i64 {
     if len as usize > EQ_MAX_PAYLOAD {
         return -1;
     }
     let cur = match crate::sched::current() {
         Some(c) => c,
+        None => return -1,
+    };
+    // capability first: the token must be the caller's and carry POST
+    let qid = match resolve(handle, cur.proc.id, caps::QPOST, "post") {
+        Some(q) => q,
         None => return -1,
     };
     // stage the payload in kernel memory first (the source may be reused)
@@ -257,7 +287,8 @@ pub fn post(qid: u64, opcode: u32, buf: u64, len: u64) -> i64 {
 }
 
 // kernel-side append used by post() and the zero-copy path: payload comes
-// prepared, no user-memory access below this point
+// prepared, no user-memory access below this point. the capability was
+// resolved by the caller — post_bytes itself is kernel-trusted.
 fn post_bytes(qid: u64, opcode: u32, payload: &[u8]) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
@@ -267,15 +298,6 @@ fn post_bytes(qid: u64, opcode: u32, payload: &[u8]) -> i64 {
         Some(e) => e,
         None => return -1,
     };
-    // capability: only posters with the POST right (or the owner) may write
-    if !caps::check(qid, cur.proc.id, eq.owner.id, caps::QPOST) {
-        serial_println!(
-            "[eq] post denied: pid {} lacks POST on {}",
-            cur.proc.id,
-            qid
-        );
-        return -1;
-    }
     let elem_len = (EQ_ELEM_HDR + payload.len() + 7) & !7usize;
     if elem_len as u32 > eq.chunk_size - 8 {
         return -1;
@@ -472,18 +494,19 @@ pub fn post_nb(qid: u64, opcode: u32, payload: &[u8]) -> bool {
 
 // block the current thread until the doorbell has bits; returns 1 =
 // events, 2 = alerted (a parked wait was canceled), -1 = closed or bad
-pub fn wait(qid: u64) -> i64 {
+pub fn wait(handle: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
+        None => return -1,
+    };
+    let qid = match resolve(handle, cur.proc.id, caps::QWAIT, "wait") {
+        Some(q) => q,
         None => return -1,
     };
     let eq = match find(qid) {
         Some(e) => e,
         None => return -1,
     };
-    if !caps::check(qid, cur.proc.id, eq.owner.id, caps::QWAIT) {
-        return -1;
-    }
     interrupts::without_interrupts(|| {
         let bits = rd32(&eq.owner, eq.base, 12).unwrap_or(0);
         if bits & (NOTIFY_EVENT | NOTIFY_ERROR) != 0 {
@@ -513,18 +536,19 @@ pub fn wait(qid: u64) -> i64 {
 
 // cancel waiters: any SIGNAL holder may ring the alert bit; every parked
 // eq_wait wakes with 2 instead of blocking until real events show up
-pub fn alert(qid: u64) -> i64 {
+pub fn alert(handle: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
+        None => return -1,
+    };
+    let qid = match resolve(handle, cur.proc.id, caps::QSIGNAL, "alert") {
+        Some(q) => q,
         None => return -1,
     };
     let eq = match find(qid) {
         Some(e) => e,
         None => return -1,
     };
-    if !caps::check(qid, cur.proc.id, eq.owner.id, caps::QSIGNAL) {
-        return -1;
-    }
     interrupts::without_interrupts(|| {
         let n = rd32(&eq.owner, eq.base, 12).unwrap_or(0);
         let _ = wr32(&eq.owner, eq.base, 12, n | NOTIFY_ALERT);
@@ -536,18 +560,19 @@ pub fn alert(qid: u64) -> i64 {
 }
 
 // called by the consumer after cons_seq++: release parked posters
-pub fn kick(qid: u64) -> i64 {
+pub fn kick(handle: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
+        None => return -1,
+    };
+    let qid = match resolve(handle, cur.proc.id, caps::QKICK, "kick") {
+        Some(q) => q,
         None => return -1,
     };
     let eq = match find(qid) {
         Some(e) => e,
         None => return -1,
     };
-    if !caps::check(qid, cur.proc.id, eq.owner.id, caps::QKICK) {
-        return -1;
-    }
     interrupts::without_interrupts(|| {
         wake_producers(&eq);
         0
@@ -555,28 +580,25 @@ pub fn kick(qid: u64) -> i64 {
 }
 
 // make the caller's queue the kernel event sink (keyboard events); the
-// caller needs the LISTEN right, and a boot ping proves the pipe works
-pub fn listen(qid: u64) -> i64 {
+// caller's capability must carry LISTEN, and a boot ping proves the pipe
+pub fn listen(handle: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
+        None => return -1,
+    };
+    let qid = match resolve(handle, cur.proc.id, caps::QLISTEN, "listen") {
+        Some(q) => q,
         None => return -1,
     };
     let eq = match find(qid) {
         Some(e) => e,
         None => return -1,
     };
-    if !caps::check(qid, cur.proc.id, eq.owner.id, caps::QLISTEN) {
-        serial_println!(
-            "[eq] listen denied: pid {} lacks LISTEN on {}",
-            cur.proc.id,
-            qid
-        );
-        return -1;
-    }
     *SINK_QID.lock() = qid;
     serial_println!(
-        "[eq] kernel event sink -> queue {} (pid {})",
+        "[eq] kernel event sink -> queue {} owned by pid {} (listener {})",
         qid,
+        eq.owner.id,
         cur.proc.id
     );
     let payload = b"boot";
@@ -584,44 +606,72 @@ pub fn listen(qid: u64) -> i64 {
     0
 }
 
-// owner-only: hand out rights on a queue to another process
-pub fn grant(qid: u64, pid: u64, bits: u32) -> i64 {
+// hand out rights: derives a child capability from the caller's instance
+// (subset of its bits; delegation needs QGRANT) bound to target_pid and
+// returns the child's token — the granter passes those 8 bytes over ipc.
+// would_cycle refuses grants that would hand the queue back to a holder
+// of an ancestor (Veda-style cycle in the derivation forest)
+pub fn grant(handle: u64, target_pid: u64, bits: u32) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
         None => return -1,
     };
-    let eq = match find(qid) {
-        Some(e) => e,
-        None => return -1,
-    };
-    if cur.proc.id != eq.owner.id || pid == 0 || pid == eq.owner.id {
+    let Some(qid) = caps::lookup(handle, cur.proc.id, 0) else {
+        serial_println!(
+            "[caps] grant denied: pid {} holds no capability {:#x}",
+            cur.proc.id,
+            handle
+        );
         return -1;
-    }
-    if caps::grant(qid, pid, bits) {
-        serial_println!("[eq] granted {:#x} on queue {} to pid {}", bits, qid, pid);
-        0
-    } else {
-        -1
+    };
+    match caps::grant(handle, cur.proc.id, target_pid, bits) {
+        Ok(child) => {
+            serial_println!(
+                "[caps] granted {:#x} on queue {} to pid {} (handle {:#x})",
+                bits,
+                qid,
+                target_pid,
+                child
+            );
+            child as i64
+        }
+        Err(caps::GrantErr::Cycle) => {
+            serial_println!(
+                "[caps] would_cycle refused: grant on queue {} to pid {} (chain reaches the holder)",
+                qid,
+                target_pid
+            );
+            -1
+        }
+        Err(caps::GrantErr::NoRight) => {
+            serial_println!(
+                "[caps] grant denied: pid {} lacks QGRANT or the bits on queue {}",
+                cur.proc.id,
+                qid
+            );
+            -1
+        }
+        Err(caps::GrantErr::Bad) => -1,
     }
 }
 
-// owner-only: take rights back
-pub fn revoke(qid: u64, pid: u64) -> i64 {
+// take a derivation subtree back: the caller's instance stays, everything
+// derived from it (transitively) is removed; returns the count
+pub fn revoke(handle: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
         None => return -1,
     };
-    let eq = match find(qid) {
-        Some(e) => e,
-        None => return -1,
-    };
-    if cur.proc.id != eq.owner.id {
-        return -1;
-    }
-    if caps::revoke(qid, pid) {
-        0
-    } else {
-        -1
+    match caps::revoke(handle, cur.proc.id) {
+        Ok(n) => {
+            serial_println!(
+                "[caps] revoked handle {:#x}: {} derived handles died",
+                handle,
+                n
+            );
+            n as i64
+        }
+        Err(_) => -1,
     }
 }
 
@@ -651,8 +701,9 @@ struct ZGift {
 static GIFTS: Mutex<Vec<ZGift>> = Mutex::new(Vec::new());
 static NEXT_GIFT: AtomicU64 = AtomicU64::new(1);
 
-// poster side: validate, detach, register, announce
-pub fn zpost(qid: u64, uaddr: u64, len: u64) -> i64 {
+// poster side: validate, detach, register, announce. `handle` is the
+// caller's queue capability and must carry POST.
+pub fn zpost(handle: u64, uaddr: u64, len: u64) -> i64 {
     if len == 0
         || len > (ZMAX_PAGES as u64) * 0x1000
         || uaddr & 0xFFF != 0
@@ -665,18 +716,14 @@ pub fn zpost(qid: u64, uaddr: u64, len: u64) -> i64 {
         Some(c) => c,
         None => return -1,
     };
+    let qid = match resolve(handle, cur.proc.id, caps::QPOST, "zpost") {
+        Some(q) => q,
+        None => return -1,
+    };
     let eq = match find(qid) {
         Some(e) => e,
         None => return -1,
     };
-    if !caps::check(qid, cur.proc.id, eq.owner.id, caps::QPOST) {
-        serial_println!(
-            "[eq] zpost denied: pid {} lacks POST on {}",
-            cur.proc.id,
-            qid
-        );
-        return -1;
-    }
     let npages = (len / 0x1000) as usize;
     // pass 1: every page must be a user-writable 4 KiB leaf and never a
     // kernel-owned frame (BIT_9) — the gift must be poster-exclusive

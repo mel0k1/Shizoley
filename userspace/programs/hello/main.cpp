@@ -18,27 +18,37 @@ int main() {
             "' from ", static_cast<u64>(from));
     send(static_cast<u64>(from), "pong", 5);
 
-    // wait for the event queue handle: "EQ <qid>" (recv returns sender pid)
+    // wait for the capability token: "EQH" + 8-byte LE handle (recv
+    // returns the sender pid). the token is unguessable and bound to us —
+    // a bystander copying the bytes still fails the holder check
     for (u64 i = 0; i < sizeof(buf); ++i) {
         buf[i] = 0;
     }
     recv(0, buf, sizeof(buf));
-    if (buf[0] != 'E' || buf[1] != 'Q' || buf[2] != ' ') {
-        println("[hello] no queue handle, bye");
+    if (buf[0] != 'E' || buf[1] != 'Q' || buf[2] != 'H') {
+        println("[hello] no queue capability, bye");
         return 1;
     }
-    long q = 0;
-    for (int i = 3; buf[i] >= '0' && buf[i] <= '9'; ++i) {
-        q = q * 10 + (buf[i] - '0');
+    u64 tok = 0;
+    for (int i = 0; i < 8; ++i) {
+        tok |= static_cast<u64>(static_cast<unsigned char>(buf[3 + i])) << (8 * i);
     }
-    println("[hello] posting 100 events to queue ", static_cast<u64>(q));
+    long q = static_cast<long>(tok);
+    println("[hello] got capability handle");
 
     // per-op caps: we hold POST only — WAIT must be denied (no park, the
-    // check fires before the doorbell ever matters)
+    // check fires before the doorbell ever matters), and so must a token
+    // we do not hold (the holder check is per-process)
     if (eq_wait(q) == -1) {
         println("[hello] wait denied (no WAIT right): per-op caps ok");
     } else {
         println("[hello] wait should have been denied!");
+        return 1;
+    }
+    if (eq_post(q + 1, 1, "x", 1) == -1) {
+        println("[hello] forged token denied: capabilities are unguessable");
+    } else {
+        println("[hello] forged token was accepted!");
         return 1;
     }
 

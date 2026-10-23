@@ -106,6 +106,20 @@ const VMX_VPID: u64 = 0x0000;
 const VMX_PREEMPT_TIMER: u64 = 0x482E;
 const VMX_VIRTUAL_APIC: u64 = 0x2012;
 const VMX_APIC_ACCESS: u64 = 0x2014;
+const VMX_POSTED_INTR_DESC: u64 = 0x2016; // posted-interrupt descriptor addr
+const VMX_POSTED_INTR_NV: u64 = 0x0002; // notification vector (16-bit)
+const GUEST_INTR_STATUS: u64 = 0x482; // RVI 7:0 / SVI 15:8 (needs vid)
+                                      // p4: pin-ctl bit 7 = process posted interrupts; secondary bit 9 =
+                                      // virtual-interrupt delivery. vm-entry refuses the pair without each
+                                      // other (and without apicv behind them), so both are probed together
+const PIN_POSTED: u64 = 1 << 7;
+const PROC2_VID: u64 = 1 << 9;
+// the notification vector the cpu consumes in non-root instead of
+// exiting; dodges the pic range, exceptions and guest vectors
+const PI_VECTOR: u64 = 0xF0;
+// vAPIC register offsets (sdm 29.1): isr 0x100, irr 0x200, 32 bytes each
+const VAPIC_ISR: u64 = 0x100;
+const VAPIC_IRR: u64 = 0x200;
 // 0x401c is the tpr threshold; 0x401e is secondary proc ctls — off by one
 // pair and one of them silently eats the other
 const VMX_TPR_THRESHOLD: u64 = 0x401C;
@@ -175,14 +189,17 @@ const MSR_BM_RD_LOW: usize = 0x000;
 // asm-visible layout; offsets are load-bearing for the stub
 #[repr(C)]
 pub struct Vcpu {
-    _vmcs: u64,           // +0
-    _launched: u64,       // +8
-    pub gprs: [u64; 16],  // +16 .. +144
-    pub out: [u64; 20],   // +144 .. +304: reason rip qual gpa + 16 gprs
-    _exit_stack_top: u64, // +304
-    _orig_rsp: u64,       // +312
+    _vmcs: u64,              // +0
+    _launched: u64,          // +8
+    pub gprs: [u64; 16],     // +16 .. +144
+    pub out: [u64; 20],      // +144 .. +304: reason rip qual gpa + 16 gprs
+    _exit_stack_top: u64,    // +304
+    _orig_rsp: u64,          // +312
+    pub pi_desc: u64,        // +320: posted-interrupt descriptor phys (0 = off)
+    pub vapic: u64,          // +328: virtual-apic page phys
+    pub pi_routed: [u64; 4], // +336: host vectors routed into the guest
 }
-const _: () = assert!(core::mem::size_of::<Vcpu>() == 320);
+const _: () = assert!(core::mem::size_of::<Vcpu>() == 368);
 
 #[repr(C, align(16))]
 struct ExitStack([u8; 4096]);
@@ -191,12 +208,14 @@ struct Guest {
     id: u64,
     owner_pid: u64,
     ram: Vec<PhysFrame<Size4KiB>>,
-    tables: Vec<PhysFrame<Size4KiB>>, // ept pml4+pdpt+pd+pts + apic pd/pt/access/vapic
+    tables: Vec<PhysFrame<Size4KiB>>, // ept pml4+pdpt+pd+pts + apic pd/pt/access/vapic (+pi desc)
     vmcs: PhysFrame<Size4KiB>,
     exit_stack: Box<ExitStack>,
     vcpu: Vcpu,
     launched: bool,
     mode: u8, // 0 = unrestricted real mode, 1 = long mode (guest_mode)
+    pi_desc: Option<PhysFrame<Size4KiB>>, // posted-interrupt descriptor (apicv)
+    pi_routed: [u64; 4], // host vectors routed into the guest
 }
 
 static GUESTS: Mutex<Vec<Guest>> = Mutex::new(Vec::new());
@@ -213,6 +232,10 @@ static EPT2M_OK: AtomicBool = AtomicBool::new(false);
 static PREEMPT_ARMED: AtomicBool = AtomicBool::new(false);
 static PREEMPT_RATE: AtomicU64 = AtomicU64::new(0);
 static SLICE_TICKS: Once<u64> = Once::new();
+// p4 posted interrupts: armed = pin bit 7 (process posted interrupts) +
+// secondary bit 9 (virtual-interrupt delivery) + apic-access virtualization
+// all allowed-1; without apicv the cpu refuses the pair at vm-entry
+static PI_ARMED: AtomicBool = AtomicBool::new(false);
 
 // asm-visible state (single core: one guest runs at a time)
 #[no_mangle]
@@ -383,10 +406,42 @@ extern "C" fn vmx_after_exit(vcpu: *mut Vcpu) -> u64 {
             let info = vmread(VM_EXIT_INTR_INFO);
             let vector = (info & 0xFF) as u8;
             crate::interrupts::dispatch_in_root(vector);
+            // p4: a routed vector is posted into the guest's descriptor
+            // instead of being left to ring 3; re-entry runs the
+            // PIR->vIRR sync and virtual-interrupt delivery injects it
+            // while the guest runs (out[3] carries the posted vector)
+            let v = vector as usize;
+            if vcpu.pi_desc != 0 && vcpu.pi_routed[v / 64] >> (v % 64) & 1 != 0 {
+                let vapic = memory::phys_to_virt(x86_64::PhysAddr::new(vcpu.vapic));
+                unsafe {
+                    // kernel-managed virtual EOI, same as the entry sync:
+                    // the real-mode guest cannot clear its own vISR bit
+                    let isr = vapic
+                        .as_mut_ptr::<u32>()
+                        .add((VAPIC_ISR as usize) / 4 + v / 32);
+                    isr.write_volatile(isr.read_volatile() & !(1 << (v % 32)));
+                }
+                let desc = memory::phys_to_virt(x86_64::PhysAddr::new(vcpu.pi_desc));
+                unsafe {
+                    let pir = desc.as_mut_ptr::<u32>().add(v / 32);
+                    pir.write_volatile(pir.read_volatile() | 1 << (v % 32));
+                }
+                vcpu.out[0] = reason;
+                vcpu.out[1] = vmread(GUEST_RIP);
+                vcpu.out[2] = 0;
+                vcpu.out[3] = vector as u64;
+                vcpu.out[4..20].copy_from_slice(&vcpu.gprs);
+                return 1; // reportable: the monitor re-enters
+            }
             // fairness: a timer tick ends this guest slice so the scheduler
             // decides who owns the cpu next; ext-int never retires an
             // instruction, so the monitor just re-enters (vmresume)
             if vector == crate::interrupts::TIMER_VECTOR {
+                vcpu.out[0] = reason;
+                vcpu.out[1] = vmread(GUEST_RIP);
+                vcpu.out[2] = 0;
+                vcpu.out[3] = 0;
+                vcpu.out[4..20].copy_from_slice(&vcpu.gprs);
                 return 1;
             }
             0
@@ -631,9 +686,18 @@ pub fn init() {
                     PREEMPT_RATE.store(rate, Ordering::Relaxed);
                     PREEMPT_ARMED.store(true, Ordering::Relaxed);
                 }
+                // p4: posted interrupts — the pair pin bit 7 + vid bit 9 plus
+                // the apic machinery must all be allowed-1
+                let proc2_allowed1 = unsafe { Msr::new(0x48B).read() } >> 32;
+                PI_ARMED.store(
+                    pin_allowed1 & PIN_POSTED != 0
+                        && proc2_allowed1 & PROC2_VID != 0
+                        && proc2_allowed1 & (1 << 5) != 0,
+                    Ordering::Relaxed,
+                );
                 VMX_READY.call_once(|| {});
                 serial_println!(
-                    "[vmx] on: rev {:#x} ept {} urg {} msrbm {} vpid {} ept2m {} preempt {}(rate {}) — guest_create/vcpu_run armed",
+                    "[vmx] on: rev {:#x} ept {} urg {} msrbm {} vpid {} ept2m {} preempt {}(rate {}) pi {} — guest_create/vcpu_run armed",
                     rev,
                     ept,
                     urg,
@@ -641,17 +705,19 @@ pub fn init() {
                     VPID_OK.load(Ordering::Relaxed),
                     EPT2M_OK.load(Ordering::Relaxed),
                     PREEMPT_ARMED.load(Ordering::Relaxed),
-                    PREEMPT_RATE.load(Ordering::Relaxed)
+                    PREEMPT_RATE.load(Ordering::Relaxed),
+                    PI_ARMED.load(Ordering::Relaxed)
                 );
                 println!(
-                    "[vmx] on: rev {:#x} ept {} urg {} msrbm {} vpid {} ept2m {} preempt {} — vm armed",
+                    "[vmx] on: rev {:#x} ept {} urg {} msrbm {} vpid {} ept2m {} preempt {} pi {} — vm armed",
                     rev,
                     ept,
                     urg,
                     msr_armed,
                     VPID_OK.load(Ordering::Relaxed),
                     EPT2M_OK.load(Ordering::Relaxed),
-                    PREEMPT_ARMED.load(Ordering::Relaxed)
+                    PREEMPT_ARMED.load(Ordering::Relaxed),
+                    PI_ARMED.load(Ordering::Relaxed)
                 );
             } else {
                 serial_println!(
@@ -703,6 +769,49 @@ fn calibrate_slice_ticks() -> u64 {
 fn preempt_slice(rate: u64) -> u64 {
     let per_tick = SLICE_TICKS.call_once(calibrate_slice_ticks);
     (*per_tick >> rate).clamp(1, u32::MAX as u64)
+}
+
+// p4: transfer posted interrupts from the descriptor into the vAPIC.
+// called on every entry with the guest's vmcs current; the descriptor is
+// kernel-owned memory, plain volatile access suffices (single cpu). PIR
+// bits clear, vIRR bits set (plus a kernel-managed virtual EOI that
+// clears stale vISR bits — our real-mode guests never write the vAPIC
+// EOI register), and RVI carries the highest vector so virtual-interrupt
+// delivery injects it while the guest runs.
+fn sync_posted(vcpu: &mut Vcpu) {
+    if vcpu.pi_desc == 0 {
+        return;
+    }
+    let desc = memory::phys_to_virt(x86_64::PhysAddr::new(vcpu.pi_desc));
+    let vapic = memory::phys_to_virt(x86_64::PhysAddr::new(vcpu.vapic));
+    let mut rvi = 0u64;
+    unsafe {
+        let pir = desc.as_mut_ptr::<u32>();
+        for w in 0..4usize {
+            let mut bits = pir.add(w).read_volatile();
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                pir.add(w)
+                    .write_volatile(pir.add(w).read_volatile() & !(1 << bit));
+                let v = w * 32 + bit as usize;
+                let irr = vapic
+                    .as_mut_ptr::<u32>()
+                    .add((VAPIC_IRR as usize) / 4 + v / 32);
+                irr.write_volatile(irr.read_volatile() | 1 << (v % 32));
+                let isr = vapic
+                    .as_mut_ptr::<u32>()
+                    .add((VAPIC_ISR as usize) / 4 + v / 32);
+                isr.write_volatile(isr.read_volatile() & !(1 << (v % 32)));
+                rvi = v as u64; // ascending scan: ends on the highest
+            }
+        }
+    }
+    if rvi != 0 {
+        // guest interrupt status: RVI bits 7:0, SVI (15:8) untouched
+        let cur = vmread(GUEST_INTR_STATUS) & 0xFF00;
+        let _ = vmwrite(GUEST_INTR_STATUS, cur | rvi);
+    }
 }
 
 fn probe_ept() -> (bool, bool, bool) {
@@ -938,6 +1047,30 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
     let apic_access = tables[3 + npts as usize + 2];
     let virtual_apic = tables[3 + npts as usize + 3];
 
+    // p4: the posted-interrupt descriptor (PIR 256 bit + ON + NV), kept in
+    // its own frame — it goes into tables so destroy frees it like the rest
+    let mut pi_desc: Option<PhysFrame<Size4KiB>> = None;
+    if PI_ARMED.load(Ordering::Relaxed) {
+        if let Some(f) = memory::alloc_frame() {
+            unsafe { zero_frame(f) };
+            // NV lives at byte 34: informational, but keep it in sync with
+            // the vmcs control so software reading the descriptor sees the
+            // vector the cpu would consume
+            unsafe {
+                memory::phys_to_virt(f.start_address())
+                    .as_mut_ptr::<u16>()
+                    .add(17)
+                    .write_volatile(PI_VECTOR as u16);
+            }
+            pi_desc = Some(f);
+        } else {
+            serial_println!(
+                "[vmx] no frame for pi descriptor — guest runs without posted interrupts"
+            );
+        }
+    }
+    let pi_desc_phys = pi_desc.map_or(0, |f| f.start_address().as_u64());
+
     unsafe {
         let wr = |frame: PhysFrame<Size4KiB>, idx: usize, val: u64| {
             let p = memory::phys_to_virt(frame.start_address()).as_mut_ptr::<u64>();
@@ -1070,6 +1203,7 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
         id,
         apic_access.start_address().as_u64(),
         virtual_apic.start_address().as_u64(),
+        pi_desc_phys,
     ) {
         serial_println!("[vmx] vmcs setup failed");
         let _ = vmclear(vmcs.start_address().as_u64());
@@ -1091,8 +1225,14 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
         out: [0; 20],
         _exit_stack_top: 0,
         _orig_rsp: 0,
+        pi_desc: pi_desc_phys,
+        vapic: virtual_apic.start_address().as_u64(),
+        pi_routed: [0; 4],
     };
     let exit_stack = Box::new(ExitStack([0; 4096]));
+    if let Some(f) = pi_desc {
+        tables.push(f); // freed by guest_destroy with the rest
+    }
     GUESTS.lock().push(Guest {
         id,
         owner_pid,
@@ -1103,14 +1243,17 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
         vcpu,
         launched: false,
         mode: 0,
+        pi_desc,
+        pi_routed: [0; 4],
     });
     serial_println!(
-        "[vmx] guest {} created: pid {} pages {} eptp {:#x} vpid {}",
+        "[vmx] guest {} created: pid {} pages {} eptp {:#x} vpid {} pi {}",
         id,
         owner_pid,
         pages,
         ept_pml4.start_address().as_u64(),
-        id & 0xFFFF
+        id & 0xFFFF,
+        pi_desc_phys != 0
     );
     id as i64
 }
@@ -1125,6 +1268,7 @@ fn setup_vmcs(
     vpid: u64,
     apic_access: u64,
     virtual_apic: u64,
+    pi_desc: u64,
 ) -> bool {
     let _ = vmcs;
     let mut failed: Vec<u64> = Vec::new();
@@ -1149,6 +1293,9 @@ fn setup_vmcs(
     if PREEMPT_ARMED.load(Ordering::Relaxed) {
         pin_desired |= 1 << 6; // p3: preemption timer bounds every guest slice
     }
+    if pi_desc != 0 {
+        pin_desired |= PIN_POSTED; // p4: process posted interrupts (needs vid)
+    }
     let pin = adjust_ctl(m_pin, pin_desired);
     w(VMX_PIN_CTLS, pin);
     if PREEMPT_ARMED.load(Ordering::Relaxed) {
@@ -1160,9 +1307,12 @@ fn setup_vmcs(
         );
     }
     // secondary first: ept | unrestricted guest | apic-access virtualization
-    // | apic-register virtualization; dependent primary bits are added only
-    // when the secondary ones actually survived the capability clamp
-    let proc2 = adjust_ctl(0x48B, (1 << 1) | (1 << 7) | (1 << 5) | (1 << 8));
+    // | apic-register virtualization | virtual-interrupt delivery (p4, when
+    // a descriptor exists); dependent primary bits are added only when the
+    // secondary ones actually survived the capability clamp
+    let proc2_desired =
+        (1 << 1) | (1 << 7) | (1 << 5) | (1 << 8) | if pi_desc != 0 { PROC2_VID } else { 0 };
+    let proc2 = adjust_ctl(0x48B, proc2_desired);
     let apic_virt = proc2 & (1 << 5) != 0;
     let proc2 = if apic_virt {
         proc2
@@ -1170,6 +1320,13 @@ fn setup_vmcs(
         proc2 & !(1 << 8) // reg-virt cannot stand without access-virt
     };
     w(VMX_PROC_CTLS2, proc2);
+    if pi_desc != 0 && proc2 & PROC2_VID != 0 {
+        // the pair survived the clamp: wire the descriptor and the
+        // notification vector. vid alone already delivers from vIRR/RVI at
+        // entry; the pin bit only adds the cpu-side notification path
+        w(VMX_POSTED_INTR_DESC, pi_desc);
+        w(VMX_POSTED_INTR_NV, PI_VECTOR);
+    }
     let mut proc_desired = (1 << 7) | (1 << 24) | (1 << 31); // hlt | unconditional io | secondary;
                                                              // io exiting keeps guest ports away
                                                              // from the real pic/pit/keyboard
@@ -1251,7 +1408,7 @@ fn setup_vmcs(
     w(GUEST_DR7, 0x400);
     w(GUEST_RSP, 0);
     w(GUEST_RIP, 0);
-    w(GUEST_RFLAGS, 0x2);
+    w(GUEST_RFLAGS, if pi_desc != 0 { 0x202 } else { 0x2 }); // if=1 for vid delivery
     w(GUEST_PENDING_DBG, 0);
     w(GUEST_SYSENTER_ESP, 0);
     w(GUEST_SYSENTER_EIP, 0);
@@ -1454,6 +1611,12 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
             VMX_PREEMPT_TIMER,
             preempt_slice(PREEMPT_RATE.load(Ordering::Relaxed)),
         );
+    }
+    // p4: hand anything the host posted to the vAPIC before the guest sees
+    // the cpu again; the stub's pi_routed copy drives the exit-side posting
+    g.vcpu.pi_routed = g.pi_routed;
+    if g.pi_desc.is_some() {
+        sync_posted(&mut g.vcpu);
     }
 
     // apply the ring-3 requests: entry state, gpr overrides, then injection
@@ -1702,6 +1865,48 @@ pub fn guest_map(owner_pid: u64, gid: u64, count: u64) -> i64 {
         old_len + count
     );
     (old_len + count) as i64
+}
+
+// p4: route host irq `vector` into the guest's posted-interrupt
+// descriptor: on the next ext-int exit with that vector the kernel posts
+// it instead of reporting it to ring 3, and virtual-interrupt delivery
+// injects it into the guest without further exits. vector 0 clears every
+// routing. needs apicv (pin bit 7 + vid allowed); refused elsewhere.
+pub fn guest_pi(owner_pid: u64, gid: u64, vector: u64) -> i64 {
+    if !vmx_ready() || vector > 255 {
+        return -1;
+    }
+    if !PI_ARMED.load(Ordering::Relaxed) {
+        serial_println!("[vmx] guest_pi: posted interrupts unavailable (no apicv/vid)");
+        return -1;
+    }
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    if cur.proc.id != owner_pid {
+        return -1;
+    }
+    let mut guests = GUESTS.lock();
+    let Some(g) = guests
+        .iter_mut()
+        .find(|g| g.id == gid && g.owner_pid == owner_pid)
+    else {
+        return -1;
+    };
+    if vector == 0 {
+        g.pi_routed = [0; 4];
+        serial_println!("[vmx] guest {}: posted-interrupt routing cleared", g.id);
+        return 0;
+    }
+    g.pi_routed[(vector >> 6) as usize] |= 1 << (vector & 63);
+    serial_println!(
+        "[vmx] guest {}: host vector {:#x} -> posted interrupts (nv {:#x})",
+        g.id,
+        vector,
+        PI_VECTOR
+    );
+    0
 }
 
 pub fn guest_destroy(owner_pid: u64, gid: u64) -> i64 {

@@ -5,7 +5,11 @@
 //   2. host loads gprs (rax=0x1CEB) and re-enters: guest branches on it and
 //      prints the string from the GUEST_MAPPED page (gprs + guest_map)
 //   3. guest vmcalls again; host injects extint 0x20 whose real-mode IVT
-//      handler writes 'I' to 0xB8100 and irets; guest halts
+//      handler writes 'I' to 0xB8100 and irets
+//   4. p4: guest_pi routes the host timer vector (0x20) into the guest's
+//      posted-interrupt descriptor; with apicv the kernel posts it on every
+//      ext-int exit and virtual-interrupt delivery injects it while the
+//      guest spins — the IVT handler counts deliveries at 0xB8102
 // on machines without VMX (or without nested virt, e.g. CI) the kernel
 // refuses GUEST_CREATE and we report that gracefully.
 #include <shizoley/io.hpp>
@@ -23,7 +27,7 @@ namespace {
 //     mov ax,0x1000; mov fs,ax; mov si,0xF0000   ; string in the mapped page
 // .bad: xor di,di;
 // .l2: lodsb; or al,al; jz .c; mov ah,0x2A; stosw; jmp .l2
-// .c: vmcall; hlt; jmp $
+// .c: vmcall; jmp $        ; spin: the p4 phase keeps the guest running
 //   0x40: "VEDA VMX OK"   0x50: "GPRS BAD"
 const unsigned char guest_code[] = {
     0x31, 0xFF,                   // xor di, di
@@ -51,19 +55,20 @@ const unsigned char guest_code[] = {
     0xAB,                         // stosw
     0xEB, 0xFB,                   // jmp .l2
     0x0F, 0x01, 0xC1,             // .c: vmcall
-    0xF4,                         // hlt
-    0xEB, 0xFE,                   // jmp $
+    0xEB, 0xFE,                   // jmp $ (spin — posted ints land here)
     // pad to 0x40, then the stage-1 string
-    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
     'V', 'E', 'D', 'A', ' ', 'V', 'M', 'X', ' ', 'O', 'K', 0,
 };
 static_assert(sizeof(guest_code) == 0x4C, "blob layout");
 
 // real-mode int 0x20 handler at phys 0x200, wired through the IVT:
-//   es:mov byte [0x8100],'I'; es:mov byte [0x8101],0x2A; iret
+//   es:mov byte [0x8100],'I'; es:inc byte [0x8102]; iret
+// the counter byte at 0x8102 counts every delivery: one from the manual
+// injection, the rest from posted-interrupt/vid deliveries
 const unsigned char int20_handler[] = {
     0x26, 0xC6, 0x06, 0x00, 0x81, 0x49, // es: mov byte [0x8100], 'I'
-    0x26, 0xC6, 0x06, 0x01, 0x81, 0x2A, // es: mov byte [0x8101], 0x2A
+    0x26, 0xFE, 0x06, 0x02, 0x81,       // es: inc byte [0x8102]
     0xCF,                               // iret
 };
 
@@ -113,6 +118,7 @@ int main() {
     VcpuExit ve{};
     long reason = -1;
     int stage = 0;
+    bool pi_active = false;
     for (int i = 0; i < 1000; ++i) {
         reason = vcpu_run(g, &ve);
         if (reason < 0) {
@@ -122,7 +128,8 @@ int main() {
         }
         if (reason == static_cast<long>(VmxExit::ext_int) ||
             reason == static_cast<long>(VmxExit::preempt_timer)) {
-            continue; // host took the cpu back (tick or p3 timer): re-enter
+            continue; // host took the cpu back (tick, p3 timer or a posted
+                      // vector): re-enter
         }
         if (reason == static_cast<long>(VmxExit::vmcall) && stage == 0) {
             // host -> guest: gpr override, the guest branches on rax
@@ -140,9 +147,39 @@ int main() {
             ve.instr_len = 0;
             continue;
         }
-        break; // hlt (or anything unexpected): done
+        if (reason == static_cast<long>(VmxExit::vmcall) && stage == 2) {
+            // the manual injection is done (the guest counted it at
+            // 0x8102): arm p4 posted-interrupt routing for the host timer
+            // vector and let it spin — every tick inside a slice ends in a
+            // posted 0x20, delivered by virtual-interrupt delivery
+            stage = 3;
+            ve.flags = 0; // the injection request is consumed
+            if (guest_pi(g, 0x20) == 0) {
+                pi_active = true;
+                continue;
+            }
+            println("[gdemo] posted interrupts unavailable (no apicv/vid)");
+            break; // the guest would just spin — stop here
+        }
+        break; // anything unexpected: done
     }
     println("[gdemo] exit reason ", static_cast<u64>(reason), " rip ", ve.out[1]);
+
+    if (pi_active) {
+        // let the guest run for a few hundred slices: the p3 preemption
+        // timer bounds each one, the host timer ticks post int 0x20 into
+        // the descriptor and the cpu injects them without further exits
+        for (int i = 0; i < 400; ++i) {
+            reason = vcpu_run(g, &ve);
+            if (reason < 0) {
+                break;
+            }
+        }
+        u64 posted = win[0xB8102];
+        println("[gdemo] posted: ", posted,
+                " int 0x20 deliveries via vid (1 was the manual inject)");
+        guest_pi(g, 0); // clear the routing before teardown
+    }
 
     // read what the guest wrote through the EPT windows
     char text[16];

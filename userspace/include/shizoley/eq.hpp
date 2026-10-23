@@ -27,12 +27,14 @@ constexpr u32 EQ_E_DROP = 1;   // kernel dropped an event (credit shortage)
 constexpr u32 EQ_E_CLOSED = 2; // queue closed, owner gone
 constexpr u32 EQ_E_PROTO = 3;  // producer protocol violation
 
-// capability rights on a qid (owner holds them all implicitly)
+// capability rights on a queue handle (the owner's root handle carries
+// them all plus GRANT for delegation)
 constexpr u32 EQ_RIGHT_POST = 1;
 constexpr u32 EQ_RIGHT_WAIT = 2;
 constexpr u32 EQ_RIGHT_KICK = 4;
 constexpr u32 EQ_RIGHT_LISTEN = 8;
 constexpr u32 EQ_RIGHT_SIGNAL = 16;
+constexpr u32 EQ_RIGHT_GRANT = 32;
 
 // opcodes the kernel posts into a listening queue
 constexpr u32 EQ_OP_KEY = 1;   // payload: [scancode, ascii]
@@ -56,19 +58,23 @@ struct EqEvent {
 };
 
 long eq_setup(void* mem, u64 size);
-long eq_post(long qid, u32 opcode, const void* data, u32 len);
-long eq_wait(long qid);
-long eq_alert(long qid);
-long eq_kick(long qid);
-long eq_listen(long qid);
-long eq_grant(long qid, u64 pid, u32 rights);
-long eq_revoke(long qid, u64 pid);
+long eq_post(long handle, u32 opcode, const void* data, u32 len);
+long eq_wait(long handle);
+long eq_alert(long handle);
+long eq_kick(long handle);
+long eq_listen(long handle);
+// derive a child capability for pid (subset of the caller's rights; the
+// caller's handle must carry GRANT) and return its token — pass it to pid
+// over ipc; refused when the derivation chain would cycle (would_cycle)
+long eq_grant(long handle, u64 pid, u32 rights);
+// take the whole derivation subtree back; returns how many handles died
+long eq_revoke(long handle);
 
 // zero-copy big events: the poster gives away the pages behind a
 // page-aligned buffer (eq_zpost -> handle), the queue owner maps them with
 // eq_zmap (plain loads, no copies) and frees them with eq_zdone. a gift
 // dies with either side of the queue.
-long eq_zpost(long qid, const void* buf, u64 len);
+long eq_zpost(long handle, const void* buf, u64 len);
 long eq_zmap(long handle);
 long eq_zdone(long handle);
 
@@ -76,7 +82,7 @@ long eq_zdone(long handle);
 // cb for each; follows the producer's chunk chain and returns chunks by
 // zeroing their progress word; releases credit via cons_seq++/eq_kick;
 // returns the count
-u32 eq_drive(long qid, void* base, void (*cb)(const EqEvent&));
+u32 eq_drive(long handle, void* base, void (*cb)(const EqEvent&));
 
 // error channel: returns the number of errors raised so far and (if the
 // ERROR bit is up) stores the first error code; clears the bit

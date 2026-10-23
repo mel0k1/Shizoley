@@ -158,7 +158,8 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         6 => cur.proc.id,
         // 7: gettid() -> tid
         7 => cur.id,
-        // 8: eq_setup(base, size) -> qid; managarm-style event queue
+        // 8: eq_setup(base, size) -> root capability handle; the qid stays
+        //    kernel-internal, callers only ever see unguessable tokens
         8 => crate::eq::setup(a1, a2) as u64,
         // 9: eq_post(qid, opcode, buf, len) -> 0 | -1
         9 => crate::eq::post(a1, a2 as u32, a3, a4) as u64,
@@ -194,10 +195,11 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         17 => crate::vmx::guest_destroy(cur.proc.id, a1) as u64,
         // 18: eq_listen(qid) -> 0 | -1; register kernel event sink (LISTEN)
         18 => crate::eq::listen(a1) as u64,
-        // 19: eq_grant(qid, pid, rights) -> 0 | -1; owner hands out rights
+        // 19: eq_grant(handle, pid, rights) -> child handle | -1; derives a
+        //     capability for pid (would_cycle-checked delegation)
         19 => crate::eq::grant(a1, a2, a3 as u32) as u64,
-        // 20: eq_revoke(qid, pid) -> 0 | -1; owner takes rights back
-        20 => crate::eq::revoke(a1, a2) as u64,
+        // 20: eq_revoke(handle) -> n revoked | -1; cascade the subtree
+        20 => crate::eq::revoke(a1) as u64,
         // 21: guest_map(handle, count) -> new size | -1; grow guest ram + ept
         21 => crate::vmx::guest_map(cur.proc.id, a1, a2) as u64,
         // 22: eq_alert(qid) -> 0 | -1; cancel parked eq_wait (SIGNAL right)
@@ -210,6 +212,9 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         25 => crate::eq::zdone(a1) as u64,
         // 26: guest_mode(handle, mode) -> 0 | -1; mode 1 = long-mode guest
         26 => crate::vmx::guest_mode(cur.proc.id, a1, a2) as u64,
+        // 27: guest_pi(handle, vector) -> 0 | -1; route a host irq vector
+        //     into the guest's posted-interrupt descriptor (0 = clear all)
+        27 => crate::vmx::guest_pi(cur.proc.id, a1, a2) as u64,
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);
