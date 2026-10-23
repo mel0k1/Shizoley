@@ -43,3 +43,6 @@ target_link_options(consoled PRIVATE -nostdlib -static -no-pie -Wl,--build-id=no
 add_executable(gdemo programs/gdemo/main.cpp src/start.cpp)
 target_link_libraries(gdemo PRIVATE shz)
 target_link_options(gdemo PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)
+add_executable(gdemo64 programs/gdemo64/main.cpp src/start.cpp)
+target_link_libraries(gdemo64 PRIVATE shz)
+target_link_options(gdemo64 PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)

@@ -21,8 +21,42 @@ extern "C" void worker(u64 arg) {
 namespace {
 
 bool g_first_event = true;
+bool g_zcopy_ok = false;
 
 void on_event(const EqEvent& ev) {
+    // zero-copy gift: payload = u64 handle + u64 bytes (little endian)
+    if (ev.opcode == EQ_OP_ZMSG && ev.len >= 16) {
+        u64 handle = 0;
+        u64 bytes = 0;
+        for (int i = 7; i >= 0; --i) {
+            handle = (handle << 8) | ev.payload[i];
+        }
+        for (int i = 15; i >= 8; --i) {
+            bytes = (bytes << 8) | ev.payload[i];
+        }
+        long va = eq_zmap(static_cast<long>(handle));
+        if (va < 0) {
+            println("[eq] zcopy: zmap failed for handle ", handle);
+            return;
+        }
+        const u8* p = reinterpret_cast<const u8*>(static_cast<u64>(va));
+        bool ok = true;
+        for (u64 i = 0; i < bytes; ++i) {
+            if (p[i] != static_cast<u8>(i & 0xFF)) {
+                ok = false;
+                break;
+            }
+        }
+        eq_zdone(static_cast<long>(handle));
+        if (ok) {
+            println("[eq] zcopy: ", bytes, " bytes via handle ", handle,
+                    ": pattern ok");
+            g_zcopy_ok = true;
+        } else {
+            println("[eq] zcopy: pattern MISMATCH via handle ", handle);
+        }
+        return;
+    }
     if (g_first_event) {
         char name[8];
         u64 k = 0;
@@ -94,6 +128,10 @@ int main() {
     long gd = spawn("gdemo", 5);
     println("[init] spawned gdemo (", static_cast<u64>(gd), ")");
 
+    // the next step: a 64-bit long-mode guest behind guest_mode
+    long gd64 = spawn("gdemo64", 7);
+    println("[init] spawned gdemo64 (", static_cast<u64>(gd64), ")");
+
     // recv returns the sender pid; messages carry their own NUL
     request(fsd, "motd", 4, buf, sizeof(buf));
     buf[127] = '\0';
@@ -129,17 +167,20 @@ int main() {
 
     u32 total = 0;
     u32 milestone = 0;
-    while (total < 100) {
+    while (total < 101) { // 100 inline events + 1 zero-copy gift
         total += eq_drive(q, eqmem, on_event);
         while (total >= milestone + 25 && milestone < 100) {
             milestone += 25;
             println("[eq] ", static_cast<u64>(milestone), " events in");
         }
-        if (total < 100 && eq_wait(q) < 0) {
+        if (total < 101 && eq_wait(q) < 0) {
             break;
         }
     }
     println("[init] drained ", static_cast<u64>(total), " events, bye");
+    if (!g_zcopy_ok) {
+        println("[eq] zcopy: gift never arrived");
+    }
     return 0;
 }
 

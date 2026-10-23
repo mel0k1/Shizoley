@@ -53,4 +53,8 @@ long guest_destroy(long handle) {
     return syscall(Sys::guest_destroy, static_cast<u64>(handle));
 }
 
+long guest_mode(long handle, u64 mode) {
+    return syscall(Sys::guest_mode, static_cast<u64>(handle), mode);
+}
+
 }

@@ -28,11 +28,16 @@ enum class Sys : u64 {
     eq_revoke = 20,    // (qid, pid) -> 0 | -1
     guest_map = 21,    // (handle, count) -> new size | -1; grow guest ram+ept
     eq_alert = 22,     // (qid) -> 0 | -1; cancel a parked eq_wait
+    eq_zpost = 23,     // (qid, buf, len) -> handle | -1; zero-copy page gift
+    eq_zmap = 24,      // (handle) -> va | -1; map the gift into the owner
+    eq_zdone = 25,     // (handle) -> 0 | -1; consume the gift, free frames
+    guest_mode = 26,   // (handle, mode) -> 0 | -1; mode 1 = long-mode guest
 };
 
 // vcpu_run exit reasons (reportable vmx exits; see kernel vmx.rs)
 enum class VmxExit : long {
     ext_int = 1,       // timer tick stopped the guest for scheduling: re-enter
+    ud = 10,           // guest took #UD (intercepted): e.g. the rax proof failed
     vmcall = 18,       // guest hypercall (kernel advanced rip past it)
     io = 30,           // guest touched a real port: kernel blocks it (out[3]=port)
     apic_access = 44,  // guest hit the virtual apic page (out[3]=offset)
@@ -42,20 +47,25 @@ enum class VmxExit : long {
     hlt = 12,
 };
 
-// two-way vcpu exit buffer, 320 bytes: the kernel writes `out` (guest ->
+// two-way vcpu exit buffer, 352 bytes: the kernel writes `out` (guest ->
 // host), ring 3 fills the rest and calls vcpu_run again (host -> guest)
 struct VcpuExit {
-    u64 out[20];   // reason, rip, qual, gpa/port, 16 gprs
-    u64 flags;     // EXIT_IN_* below
-    u64 inject;    // raw vm-entry interruption-info field (sdm table 25-x)
-    u64 err;       // exception error code, valid when inject bit 11 set
-    u64 instr_len; // guest instruction length (exceptions need non-zero)
-    u64 gprs[16];  // loaded into the guest when EXIT_IN_GPRS
+    u64 out[20];      // reason, rip, qual, gpa/port, 16 gprs
+    u64 flags;        // EXIT_IN_* below
+    u64 inject;       // raw vm-entry interruption-info field (sdm table 25-x)
+    u64 err;          // exception error code, valid when inject bit 11 set
+    u64 instr_len;    // guest instruction length (exceptions need non-zero)
+    u64 entry_rip;    // entry state, loaded when EXIT_IN_ENTRY (long mode)
+    u64 entry_rsp;
+    u64 entry_cr3;    // guest phys, validated against guest ram size
+    u64 pad;
+    u64 gprs[16];     // loaded into the guest when EXIT_IN_GPRS
 };
-static_assert(sizeof(VcpuExit) == 320, "vcpu exit abi");
+static_assert(sizeof(VcpuExit) == 352, "vcpu exit abi");
 
-constexpr u64 EXIT_IN_GPRS = 1;  // load VcpuExit::gprs into the guest
-constexpr u64 EXIT_INJECT = 2;   // deliver VcpuExit::inject on next entry
+constexpr u64 EXIT_IN_GPRS = 1;   // load VcpuExit::gprs into the guest
+constexpr u64 EXIT_INJECT = 2;    // deliver VcpuExit::inject on next entry
+constexpr u64 EXIT_IN_ENTRY = 4;  // load entry_rip/rsp/cr3 (long mode)
 
 // injection builders (raw sdm vm-entry interruption-info field):
 // bits 7:0 vector, 10:8 type (0 extint, 2 nmi, 3 exception), 11 err-valid,
@@ -79,6 +89,7 @@ long guest_create(u64 pages);
 long guest_map(long handle, u64 count);
 long vcpu_run(long handle, VcpuExit* ve);
 long guest_destroy(long handle);
+long guest_mode(long handle, u64 mode);
 long eq_alert(long qid);
 
 inline long syscall(Sys nr) {

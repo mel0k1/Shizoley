@@ -196,6 +196,7 @@ struct Guest {
     exit_stack: Box<ExitStack>,
     vcpu: Vcpu,
     launched: bool,
+    mode: u8, // 0 = unrestricted real mode, 1 = long mode (guest_mode)
 }
 
 static GUESTS: Mutex<Vec<Guest>> = Mutex::new(Vec::new());
@@ -1101,6 +1102,7 @@ pub fn guest_create(owner_pid: u64, pages: u64) -> i64 {
         exit_stack,
         vcpu,
         launched: false,
+        mode: 0,
     });
     serial_println!(
         "[vmx] guest {} created: pid {} pages {} eptp {:#x} vpid {}",
@@ -1307,15 +1309,108 @@ fn setup_vmcs(
     false
 }
 
+// switch a guest to the long-mode preset (mode 1): the monitor preloads
+// page tables / gdt / 64-bit code into guest ram through its window and
+// points rip/rsp/cr3 at them via the vcpu_run control half (flags bit2).
+// real-mode guests are unaffected; the switch is idempotent.
+pub fn guest_mode(owner_pid: u64, gid: u64, mode: u64) -> i64 {
+    if !vmx_ready() || mode != 1 {
+        return -1;
+    }
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    if cur.proc.id != owner_pid {
+        return -1;
+    }
+    let mut guests = GUESTS.lock();
+    let Some(g) = guests
+        .iter_mut()
+        .find(|g| g.id == gid && g.owner_pid == owner_pid)
+    else {
+        return -1;
+    };
+    if g.mode == 1 {
+        return 0;
+    }
+    if !vmptrld(g.vmcs.start_address().as_u64()) {
+        return -1;
+    }
+    let ok = apply_long_mode();
+    let _ = vmclear(g.vmcs.start_address().as_u64());
+    if !ok {
+        serial_println!("[vmx] guest {}: long mode setup failed", g.id);
+        return -1;
+    }
+    g.mode = 1;
+    serial_println!("[vmx] guest {}: long mode armed", g.id);
+    0
+}
+
+// rewrite the guest-state block for ia-32e entry: pe|pg, pae, efer lme|lma,
+// a 64-bit cs and flat data segments. gdtr/idtr point at monitor-provided
+// tables in guest ram (fixed layout, see gdemo64). every value satisfies
+// the vm-entry long-mode checks (sdm vol 3d 26.2.1.3).
+fn apply_long_mode() -> bool {
+    let mut ok = true;
+    let mut w = |f: u64, v: u64| {
+        ok &= vmwrite(f, v);
+    };
+    let m_entry = if TRUE_CTLS.load(Ordering::Relaxed) {
+        IA32_VMX_TRUE_ENTRY
+    } else {
+        IA32_VMX_ENTRY
+    };
+    // load ia32_efer | ia-32e mode guest
+    w(VMX_ENTRY_CTLS, adjust_ctl(m_entry, (1 << 15) | (1 << 9)));
+    let cr0_fixed0 = unsafe { Msr::new(IA32_VMX_CR0_FIXED0).read() };
+    let cr0_fixed1 = unsafe { Msr::new(IA32_VMX_CR0_FIXED1).read() };
+    let cr4_fixed0 = unsafe { Msr::new(IA32_VMX_CR4_FIXED0).read() };
+    let cr4_fixed1 = unsafe { Msr::new(IA32_VMX_CR4_FIXED1).read() };
+    w(GUEST_CR0, (0x8005_0033u64 | cr0_fixed0) & cr0_fixed1); // pe|pg now
+    w(GUEST_CR4, ((1 << 5) | 0x2000u64 | cr4_fixed0) & cr4_fixed1); // pae|vmxe
+    w(GUEST_EFER, 0x500); // lme | lma
+    w(GUEST_CS_SEL, 0x08);
+    w(GUEST_CS_LIMIT, 0xFFFF_FFFF);
+    w(GUEST_CS_AR, 0xA09B); // l=1 g=1 p=1 exec/read accessed, dpl 0
+    w(GUEST_CS_BASE, 0);
+    let flat: [(u64, u64, u64, u64); 5] = [
+        (GUEST_DS_SEL, GUEST_DS_LIMIT, GUEST_DS_AR, GUEST_DS_BASE),
+        (GUEST_ES_SEL, GUEST_ES_LIMIT, GUEST_ES_AR, GUEST_ES_BASE),
+        (GUEST_SS_SEL, GUEST_SS_LIMIT, GUEST_SS_AR, GUEST_SS_BASE),
+        (GUEST_FS_SEL, GUEST_FS_LIMIT, GUEST_FS_AR, GUEST_FS_BASE),
+        (GUEST_GS_SEL, GUEST_GS_LIMIT, GUEST_GS_AR, GUEST_GS_BASE),
+    ];
+    for (sel, lim, ar, base) in flat {
+        w(sel, 0);
+        w(lim, 0xFFFF_FFFF);
+        w(ar, 0xC093); // g=1 p=1 r/w accessed, dpl 0 (== cs dpl)
+        w(base, 0);
+    }
+    // monitor-provided descriptor tables in guest ram (fixed convention)
+    w(GUEST_GDTR_BASE, 0x5000);
+    w(GUEST_GDTR_LIMIT, 0x17);
+    w(GUEST_IDTR_BASE, 0x6000);
+    w(GUEST_IDTR_LIMIT, 0xFFF); // nmi-exiting demands >= 0xfff
+    w(GUEST_RFLAGS, 0x2);
+    w(GUEST_INTERRUPTIBILITY, 0);
+    ok
+}
+
 // two-way exit buffer in user memory: the kernel writes 20 u64 of exit
 // info (guest→host), ring 3 writes the control half back before the next
-// run (host→guest): flags, an optional event injection and gpr overrides
-const OFF_IN_FLAGS: usize = 20; // bit0 = load gprs, bit1 = inject event
+// run (host→guest): flags, an optional event injection, entry state and
+// gpr overrides
+const OFF_IN_FLAGS: usize = 20; // bit0 = load gprs, bit1 = inject event, bit2 = load entry
 const OFF_IN_INJECT: usize = 21; // raw vm-entry interruption-info field
 const OFF_IN_ERR: usize = 22; // exception error code (inject bit 11)
 const OFF_IN_LEN: usize = 23; // instruction length for exceptions
-const OFF_IN_GPRS: usize = 24; // 16 u64 loaded when flags bit0
-const EXIT_BUF_BYTES: usize = 320; // 40 u64 total
+const OFF_IN_RIP: usize = 24; // entry rip (flags bit2)
+const OFF_IN_RSP: usize = 25; // entry rsp
+const OFF_IN_CR3: usize = 26; // entry cr3 (guest phys, validated)
+const OFF_IN_GPRS: usize = 28; // 16 u64 loaded when flags bit0
+const EXIT_BUF_BYTES: usize = 352; // 44 u64 total
 
 // enter the guest until a reportable exit; returns the reason
 pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
@@ -1361,9 +1456,22 @@ pub fn vcpu_run(owner_pid: u64, gid: u64, out_buf: u64) -> i64 {
         );
     }
 
-    // apply the ring-3 requests: gpr overrides first, then the injection
+    // apply the ring-3 requests: entry state, gpr overrides, then injection
     if have_ctl {
         let flags = u64::from_le_bytes(ctl[(OFF_IN_FLAGS * 8 - 160)..][..8].try_into().unwrap());
+        if flags & 4 != 0 {
+            // long-mode entry point: rip/rsp/cr3 point at images the monitor
+            // preloaded into guest ram; cr3 must be inside the guest
+            let rd = |off: usize| u64::from_le_bytes(ctl[off * 8 - 160..][..8].try_into().unwrap());
+            let (rip, rsp, cr3) = (rd(OFF_IN_RIP), rd(OFF_IN_RSP), rd(OFF_IN_CR3));
+            if cr3 < g.ram.len() as u64 * 0x1000 {
+                let _ = vmwrite(GUEST_CR3, cr3);
+                let _ = vmwrite(GUEST_RIP, rip);
+                let _ = vmwrite(GUEST_RSP, rsp);
+            } else {
+                serial_println!("[vmx] bad entry cr3 {:#x} — ignored", cr3);
+            }
+        }
         if flags & 1 != 0 {
             for (i, slot) in g.vcpu.gprs.iter_mut().enumerate() {
                 let b = &ctl[OFF_IN_GPRS * 8 - 160 + i * 8..][..8];
