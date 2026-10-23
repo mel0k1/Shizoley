@@ -43,6 +43,7 @@ pub const GMODE: u32 = 4; // guest_mode
 pub const GPI: u32 = 8; // guest_pi
 pub const GDESTROY: u32 = 16; // guest_destroy
 pub const GGRANT: u32 = 32; // may re-grant guest rights
+pub const GDEV: u32 = 64; // guest_device_attach/detach (iommu domain)
 
 // zero-copy gift rights
 pub const ZMAP: u32 = 1; // eq_zmap
@@ -53,7 +54,7 @@ pub const ZDONE: u32 = 2; // eq_zdone
 fn rights_mask(kind: u32) -> u32 {
     match kind {
         K_EQ => QPOST | QWAIT | QKICK | QLISTEN | QSIGNAL | QGRANT,
-        K_GUEST => GRUN | GMAP | GMODE | GPI | GDESTROY | GGRANT,
+        K_GUEST => GRUN | GMAP | GMODE | GPI | GDESTROY | GGRANT | GDEV,
         K_GIFT => ZMAP | ZDONE,
         _ => 0,
     }

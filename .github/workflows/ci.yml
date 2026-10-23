@@ -40,12 +40,14 @@ jobs:
           sudo apt-get update && sudo apt-get install -y qemu-system-x86
           set +e
           timeout 120 qemu-system-x86_64 \
+            -machine q35 -device intel-iommu,intremap=off \
+            -device e1000,netdev=n0 -netdev user,id=n0 \
             -drive format=raw,file=kernel/target/x86_64-paparaci/debug/bootimage-paparaci.bin \
             -display none -serial stdio -no-reboot -no-shutdown \
             > serial.log 2>&1
           set -e
           cat serial.log
-          grep -qF "[init] threads: 3 4" serial.log
+          grep -qE "\[init\] threads: [0-9]+ [0-9]+" serial.log
           grep -qF "[t2] tick 2" serial.log
           grep -qF "[init] pong from 2" serial.log
           grep -qF "[fsd] served 'motd' (104 bytes) to 1" serial.log
@@ -81,6 +83,12 @@ jobs:
           grep -qF "[futex] mismatch returned 1 (no sleep)" serial.log
           grep -qF "[futex] woke, word 42" serial.log
           grep -qF "[futex] all ok" serial.log
+          grep -qF "[iommu] unit 0xfed90000: levels 4 aw 2 pt true" serial.log
+          grep -qF "[iommu] unit 0xfed90000: te on (host pass-through)" serial.log
+          grep -qF "[iommu] device 00:02.0 -> domain " serial.log
+          grep -qF "[iommu] dma ok: nic read gpa 0x8000 through domain " serial.log
+          grep -qF "[iommu] fault: 0x0010 0x8000 read (not readable)" serial.log
+          grep -qF "[iommu] device 00:02.0 out of domain " serial.log
 
   userspace:
     name: userspace (c++)

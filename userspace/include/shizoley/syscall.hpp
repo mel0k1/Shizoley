@@ -40,6 +40,10 @@ enum class Sys : u64 {
                        // into the timer sink (owner only; 0 disarms)
     futex_wait = 31,   // (uaddr, expected) -> 0 slept | 1 mismatch | -1
     futex_wake = 32,   // (uaddr, n) -> threads woken
+    guest_device_attach = 33, // (handle, sid) -> 0 | -1; pci device into the
+                              // guest's iommu domain: bus<<8 | dev<<3 | fn (GDEV)
+    guest_device_detach = 34, // (handle, sid) -> 0 | -1; device dma faults
+                              // until attached elsewhere (GDEV)
 };
 
 // ps(28) record, filled by the kernel (name is NUL-padded)

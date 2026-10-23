@@ -283,6 +283,12 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         31 => crate::futex::wait(a1, a2 as u32) as u64,
         // 32: futex_wake(uaddr, n) -> threads woken
         32 => crate::futex::wake(a1, a2) as u64,
+        // 33: guest_device_attach(handle, sid) -> 0 | -1; put a pci device
+        //     (bus<<8 | dev<<3 | fn) in the guest's iommu domain (GDEV)
+        33 => crate::vmx::guest_device_attach(a1, a2) as u64,
+        // 34: guest_device_detach(handle, sid) -> 0 | -1; the device's dma
+        //     faults until it is attached elsewhere (GDEV)
+        34 => crate::vmx::guest_device_detach(a1, a2) as u64,
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);

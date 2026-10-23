@@ -1,10 +1,11 @@
 use alloc::vec::Vec;
 use bootloader::bootinfo::{BootInfo, MemoryMap, MemoryRegionType};
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::{Mutex, Once};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{
-    FrameAllocator, OffsetPageTable, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+    FrameAllocator, Mapper, OffsetPageTable, PageTable, PageTableFlags, PhysFrame, Size4KiB,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -232,6 +233,39 @@ pub fn phys_offset() -> VirtAddr {
 
 pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
     phys_offset() + phys.as_u64()
+}
+
+// device mmio window: upper-half pml4 entry 496, shared by every address
+// space (user pml4s copy the kernel upper half verbatim), never used by
+// the bootloader's physmap
+const MMIO_BASE: u64 = 0xFFFF_E000_0000_0000;
+static NEXT_MMIO: AtomicU64 = AtomicU64::new(MMIO_BASE);
+
+// map `pages` frames rw, no-exec, uncached, and return a virtual address
+// whose page offset matches `phys` (it may be unaligned: acpi tables sit
+// anywhere). not unmapped: devices live as long as the kernel
+pub fn map_mmio(phys: u64, pages: u64) -> VirtAddr {
+    let off = phys % 4096;
+    let base = phys - off;
+    let total = (off + pages * 4096).div_ceil(4096);
+    let start = NEXT_MMIO.fetch_add(total * 4096, Ordering::AcqRel);
+    let mut mapper = unsafe { OffsetPageTable::new(active_pml4(phys_offset()), phys_offset()) };
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::NO_CACHE;
+    for i in 0..total {
+        let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(VirtAddr::new(
+            start + i * 4096,
+        ));
+        let frame = PhysFrame::containing_address(PhysAddr::new(base + i * 4096));
+        match unsafe { mapper.map_to(page, frame, flags, &mut GlobalFrames) } {
+            Ok(flush) => flush.flush(),
+            Err(x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_)) => {}
+            Err(e) => panic!("map_mmio {:#x}: {:?}", phys, e),
+        }
+    }
+    VirtAddr::new(start + off)
 }
 
 // global frame pool: usable from any address space via the physmap

@@ -1,0 +1,64 @@
+#!/bin/bash
+# tcg smoke for paparaci v0.15.0: device assignment (iommu domain dma)
+set -u
+IMG=/home/z/my-project/shizoley/kernel/target/x86_64-paparaci/debug/bootimage-paparaci.bin
+LOG=/home/z/my-project/shizoley/scripts/serial.log
+rm -f "$LOG"
+timeout 150 /home/z/my-project/.tools/bin/qemu-system-x86_64 \
+  -machine q35 -device intel-iommu,intremap=off \
+  -device e1000,netdev=n0 -netdev user,id=n0 \
+  -drive format=raw,file="$IMG" \
+  -display none -serial file:"$LOG" -no-reboot -no-shutdown
+rc=$?
+echo "--- qemu exit rc=$rc (124=timeout, expected for hlt loop)"
+FAIL=0
+ck() { if grep -qF "$1" "$LOG"; then echo "OK   $1"; else echo "MISS $1"; FAIL=1; fi; }
+cke() { if grep -qE "$1" "$LOG"; then echo "OK   ($1)"; else echo "MISS ($1)"; FAIL=1; fi; }
+
+cke "\[init\] threads: [0-9]+ [0-9]+"
+ck "[t2] tick 2"
+ck "[init] pong from 2"
+ck "[fsd] served 'motd' (104 bytes) to 1"
+cke "\[init\] rtc says: [0-9][0-9]:[0-9][0-9]:[0-9][0-9]"
+ck "[eq] first event: 'e0' op 1 from 2"
+ck "[eq] 100 events in"
+ck "[init] drained 101 events, bye"
+ck "ello] wait denied (no WAIT right): per-op caps ok"
+cke "\[eq\] zcopy: 8192 bytes via handle [0-9]+: pattern ok"
+ck "[eq] zcopy: gift 1 consumed (2 pages freed)"
+ck "[gdemo64] vmx unavailable (guest_create refused)"
+ck "process 'init' (1) finished"
+ck "[vmx]"
+ck "[console] up: kernel sink attached"
+ck "[gdemo] vmx unavailable (guest_create refused)"
+cke "\[caps\] granted 0x1 on queue [0-9]+ to pid 2"
+ck "[eq] wait: alerted (wait canceled)"
+cke "\[eq\] queue [0-9]+ closed \(owner 1 gone\)"
+ck "ello] forged token denied: capabilities are unguessable"
+ck "[capsdemo] all ok"
+ck "[caps] would_cycle refused"
+ck "[capsuser] post denied after revoke (cascade ok)"
+cke "process 'init' \(1\) torn down, [0-9]+ frames freed"
+ck "[timed] up: kernel timer sink attached"
+cke "\[eq\] kernel event sink timer -> queue [0-9]+ owned by pid [0-9]+"
+ck "[sleeper] slept 300ms (measured "
+ck "[init] napped (measured "
+ck "[timed] fired at tick "
+cke "\[ps\] [0-9]+ run [0-9]+ timed"
+cke "\[ps\] [0-9]+ run [0-9]+ sleeper"
+cke "\[kill\] target [0-9]+ terminated \(by [0-9]+\)"
+ck "[init] kill ok"
+
+ck "[futex] mismatch returned 1 (no sleep)"
+ck "[futex] woke, word 42"
+ck "[futex] all ok"
+ck "[init] spawned fuxdemo"
+
+ck "[iommu] unit 0xfed90000: levels 4 aw 2 pt true"
+ck "[iommu] unit 0xfed90000: te on (host pass-through)"
+ck "[iommu] device 00:02.0 -> domain "
+ck "[iommu] dma ok: nic read gpa 0x8000 through domain "
+ck "[iommu] fault: 0x0010 0x8000 read (not readable)"
+ck "[iommu] device 00:02.0 out of domain "
+
+exit $FAIL

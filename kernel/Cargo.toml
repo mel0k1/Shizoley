@@ -1,6 +1,6 @@
 [package]
 name = "paparaci"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Paparaci microkernel of the Shizoley OS"
 license = "Apache-2.0"
@@ -21,4 +21,4 @@ panic = "abort"
 panic = "abort"
 
 [package.metadata.bootimage]
-run-args = ["-drive", "format=raw,file={iso}", "-serial", "stdio"]
+run-args = ["-machine", "q35", "-device", "intel-iommu,intremap=off", "-device", "e1000,netdev=n0", "-netdev", "user,id=n0", "-drive", "format=raw,file={iso}", "-serial", "stdio"]

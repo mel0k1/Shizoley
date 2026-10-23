@@ -4,14 +4,19 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
+mod acpi;
 mod allocator;
 mod caps;
+mod dma;
 mod elf;
 mod eq;
 mod futex;
 mod gdt;
 mod initrd;
 mod interrupts;
+mod iommu;
 mod ipc;
 mod memory;
 mod sched;
@@ -38,6 +43,18 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         memory::frames_used()
     );
 
+    // usable ram ranges for the iommu's identity fallback
+    let mut ram: Vec<(u64, u64)> = Vec::new();
+    for r in boot_info.memory_map.iter() {
+        if r.region_type == bootloader::bootinfo::MemoryRegionType::Usable {
+            ram.push((
+                r.range.start_frame_number * 0x1000,
+                r.range.end_frame_number * 0x1000,
+            ));
+        }
+    }
+    iommu::init(&ram);
+
     println!(
         "shizoley v{} (kernel paparaci: caps, eq, vmx)",
         env!("CARGO_PKG_VERSION")
@@ -60,6 +77,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("[heartbeat] {}", i);
             }
         });
+        // kernel thread: the device-assignment round — nic dma through a
+        // domain: mapped frames complete, unmapped ones fault
+        sched::spawn_kernel("dma", dma::smoke);
         match user::spawn_process("init") {
             Some(pid) => {
                 serial_println!("[paparaci] init queued (pid {}), scheduler loop", pid);

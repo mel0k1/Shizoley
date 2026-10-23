@@ -221,6 +221,7 @@ struct Guest {
     mode: u8, // 0 = unrestricted real mode, 1 = long mode (guest_mode)
     pi_desc: Option<PhysFrame<Size4KiB>>, // posted-interrupt descriptor (apicv)
     pi_routed: [u64; 4], // host vectors routed into the guest
+    domain: Option<crate::iommu::Domain>, // device-assignment: mirrors the ept
 }
 
 static GUESTS: Mutex<Vec<Guest>> = Mutex::new(Vec::new());
@@ -1259,6 +1260,7 @@ pub fn guest_create(pages: u64) -> i64 {
         mode: 0,
         pi_desc,
         pi_routed: [0; 4],
+        domain: None,
     });
     serial_println!(
         "[vmx] guest {} created: pid {} pages {} eptp {:#x} vpid {} pi {}",
@@ -1881,6 +1883,19 @@ pub fn guest_map(handle: u64, count: u64) -> i64 {
         }
     }
     let eptp = g.tables[0].start_address().as_u64();
+    // a device-assignment domain mirrors the growth too
+    if let Some(d) = g.domain.as_mut() {
+        for (i, rf) in g.ram[old_len as usize..].iter().enumerate() {
+            if !d.map((old_len as usize + i) as u64 * 0x1000, rf.start_address()) {
+                serial_println!(
+                    "[iommu] guest {}: mirror growth failed at page {}",
+                    obj.id,
+                    old_len as usize + i
+                );
+                break;
+            }
+        }
+    }
     drop(guests);
     invept_all(eptp);
     serial_println!(
@@ -1931,6 +1946,81 @@ pub fn guest_pi(handle: u64, vector: u64) -> i64 {
     0
 }
 
+// device assignment: the guest's iommu domain mirrors the ept — device
+// dma walks the same guest-physical memory the cpu does. the domain is
+// built on first attach and follows guest_map growth afterwards
+pub fn guest_device_attach(handle: u64, sid: u64) -> i64 {
+    if sid > 0xFFFF || sid == 0 {
+        return -1;
+    }
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    let Some(obj) = caps::lookup(handle, cur.proc.id, caps::K_GUEST, caps::GDEV) else {
+        return -1;
+    };
+    let mut guests = GUESTS.lock();
+    let Some(g) = guests.iter_mut().find(|g| g.id == obj.id) else {
+        return -1;
+    };
+    if g.domain.is_none() {
+        let mut dom = match crate::iommu::Domain::new() {
+            Some(d) => d,
+            None => {
+                serial_println!("[iommu] guest {}: no domain (no unit or ids out)", obj.id);
+                return -1;
+            }
+        };
+        let mut ok = true;
+        for (i, f) in g.ram.iter().enumerate() {
+            if !dom.map(i as u64 * 0x1000, f.start_address()) {
+                serial_println!("[iommu] guest {}: mirror failed at page {}", obj.id, i);
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            drop(dom);
+            return -1;
+        }
+        serial_println!(
+            "[iommu] guest {}: domain {} mirrors {} pages",
+            obj.id,
+            dom.id,
+            g.ram.len()
+        );
+        g.domain = Some(dom);
+    }
+    match g.domain.as_mut().unwrap().attach(sid as u16) {
+        true => 0,
+        false => -1,
+    }
+}
+
+// give the device back: its context entry leaves the domain (dma from it
+// faults until it is attached elsewhere)
+pub fn guest_device_detach(handle: u64, sid: u64) -> i64 {
+    if sid > 0xFFFF || sid == 0 {
+        return -1;
+    }
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    let Some(obj) = caps::lookup(handle, cur.proc.id, caps::K_GUEST, caps::GDEV) else {
+        return -1;
+    };
+    let mut guests = GUESTS.lock();
+    let Some(g) = guests.iter_mut().find(|g| g.id == obj.id) else {
+        return -1;
+    };
+    match g.domain.as_mut().map(|d| d.detach(sid as u16)) {
+        Some(true) => 0,
+        _ => -1,
+    }
+}
+
 pub fn guest_destroy(handle: u64) -> i64 {
     let cur = match crate::sched::current() {
         Some(c) => c,
@@ -1943,10 +2033,13 @@ pub fn guest_destroy(handle: u64) -> i64 {
     let Some(pos) = guests.iter().position(|g| g.id == obj.id) else {
         return -1;
     };
-    let g = guests.remove(pos);
+    let mut g = guests.remove(pos);
     drop(guests);
     caps::drop_obj(caps::Obj::guest(g.id));
     let nram = g.ram.len();
+    // the domain's devices stop first: their dma must never reach frames
+    // that are about to return to the pool
+    let _ = g.domain.take();
     // detach the window from the creator's space, then free everything
     let mut freed: u64 = 0;
     {
@@ -1999,8 +2092,9 @@ pub fn close_process(proc: &Arc<Process>) {
         *guests = rest;
         mine
     };
-    for g in dead {
+    for mut g in dead {
         caps::drop_obj(caps::Obj::guest(g.id));
+        let _ = g.domain.take();
         let mut aspace = proc.aspace.lock();
         for i in 0..g.ram.len() as u64 {
             let page =

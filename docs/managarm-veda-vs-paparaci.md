@@ -304,6 +304,15 @@ guest_destroy` за syscalls 15/16/17.
       принудительно снимаются без access-virt. По SDM Vol 3D Appendix B
       и KVM (SECONDARY_VM_EXEC_CONTROL=0x4022, TPR_THRESHOLD=0x401e).
 
+**vmx.rs / iommu.rs**
+- [x] device-assignment путь: acpi (rsdp/rsdt/xsdt/dmar → drhd), vt-d юнит
+      (queued invalidation, root/context c copy-on-write на шину, host
+      pass-through с identity-фоллбеком), домены — second-level таблицы,
+      зеркалящие EPT гостя; guest_device_attach/detach (33/34, GDEV);
+      e1000-дымок: dma через домен читает гостевую память, после unmap —
+      фолт с адресом и source-id — v0.15.0. (Veda-соответствие: их 97/98
+      GUEST_ATTACH_DEVICE/VCPU_BIND_INTERRUPT = наш 33 + posted-путь v0.12.0.)
+
 **eq.rs / caps**
 - [x] P2: error-канал — head+32 error_code (первый код: E_DROP/E_CLOSED/
       E_PROTO), head+36 err_count, notify-бит ERROR; eq_wait -> 3 при
