@@ -52,7 +52,11 @@ jobs:
           grep -qE "\[init\] rtc says: [0-9][0-9]:[0-9][0-9]:[0-9][0-9]" serial.log
           grep -qF "[eq] first event: 'e0' op 1 from 2" serial.log
           grep -qF "[eq] 100 events in" serial.log
-          grep -qF "[init] drained 100 events, bye" serial.log
+          grep -qF "[init] drained 101 events, bye" serial.log
+          grep -qF "[hello] wait denied (no WAIT right): per-op caps ok" serial.log
+          grep -qF "[eq] zcopy: 8192 bytes via handle 1: pattern ok" serial.log
+          grep -qF "[eq] zcopy: gift 1 consumed (2 pages freed)" serial.log
+          grep -qF "[gdemo64] vmx unavailable (guest_create refused)" serial.log
           grep -qF "process 'init' (1) finished" serial.log
           grep -qF "[vmx]" serial.log
           grep -qF "[console] up: kernel sink attached" serial.log
