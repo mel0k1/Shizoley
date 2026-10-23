@@ -39,9 +39,11 @@ jobs:
             -display none -serial stdio -no-reboot -no-shutdown \
             > serial.log 2>&1
           set -e
-          grep -qF "[init] drained 100 events, bye" serial.log
+          grep -qF "[init] drained 101 events, bye" serial.log
           grep -qF "[console] up: kernel sink attached" serial.log
           grep -qF "[eq] wait: alerted (wait canceled)" serial.log
+          grep -qF "[init] kill ok" serial.log
+          grep -qF "[sleeper] slept 300ms (measured " serial.log
 
       - name: publish release
         env:
@@ -66,7 +68,7 @@ jobs:
             echo
             echo "### Что внутри / What is inside"
             echo
-            echo "- microkernel Paparaci + ring-3 init/hello/fsd/rtcd/consoled/gdemo from the embedded initrd"
+            echo "- microkernel Paparaci + ring-3 init/hello/fsd/rtcd/consoled/gdemo/timed from the embedded initrd"
             echo "- eq v2: producer-chained chunks, error channel, eq_alert"
             echo "- VMX P2: MSR bitmap, vAPIC, VPID, GUEST_MAP, two-way VcpuExit (KVM hosts: \`-enable-kvm -cpu host\`)"
           } > notes.md
