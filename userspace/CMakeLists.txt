@@ -67,3 +67,6 @@ target_link_options(sleeper PRIVATE -nostdlib -static -no-pie -Wl,--build-id=non
 add_executable(fuxdemo programs/fuxdemo/main.cpp src/start.cpp)
 target_link_libraries(fuxdemo PRIVATE shz)
 target_link_options(fuxdemo PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)
+add_executable(uardemo programs/uardemo/main.cpp src/start.cpp)
+target_link_libraries(uardemo PRIVATE shz)
+target_link_options(uardemo PRIVATE -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/link.ld)

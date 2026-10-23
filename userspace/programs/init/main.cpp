@@ -104,6 +104,10 @@ int main() {
     long fux = spawn("fuxdemo", 7);
     println("[init] spawned fuxdemo (", static_cast<u64>(fux), ")");
 
+    // uar/stac: bad user pointers fail the syscall, the kernel survives
+    long uar = spawn("uardemo", 7);
+    println("[init] spawned uardemo (", static_cast<u64>(uar), ")");
+
     // services in ring 3: fsd owns the initrd, rtcd owns the cmos ports
     long fsd = spawn("fsd", 3);
     long rtcd = spawn("rtcd", 4);

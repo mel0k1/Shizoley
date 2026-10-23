@@ -133,7 +133,7 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         2 => {
             let len = a2.min(32) as usize;
             let mut namebuf = [0u8; 32];
-            if len == 0 || !cur.proc.aspace.lock().read_bytes(a1, &mut namebuf[..len]) {
+            if len == 0 || crate::uar::copy_from_user(a1, &mut namebuf[..len]) != 0 {
                 return ERR;
             }
             match core::str::from_utf8(&namebuf[..len]) {
@@ -173,7 +173,7 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         13 => {
             let len = a2.min(4096) as usize;
             let mut bytes = alloc::vec![0u8; len];
-            if !cur.proc.aspace.lock().read_bytes(a1, &mut bytes) {
+            if crate::uar::copy_from_user(a1, &mut bytes) != 0 {
                 ERR
             } else {
                 x86_64::instructions::interrupts::without_interrupts(|| {

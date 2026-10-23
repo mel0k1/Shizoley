@@ -89,6 +89,11 @@ jobs:
           grep -qF "[iommu] dma ok: nic read gpa 0x8000 through domain " serial.log
           grep -qF "[iommu] fault: 0x0010 0x8000 read (not readable)" serial.log
           grep -qF "[iommu] device 00:02.0 out of domain " serial.log
+          grep -qE "\[uar\] smap " serial.log
+          grep -qF "[uar] fault at 0xdead0000 (" serial.log
+          grep -qF "[uardemo] live copy ok" serial.log
+          grep -qF "[uardemo] unmapped pointer -> -1 (fault recovered)" serial.log
+          grep -qF "[uardemo] kernel-half + overflow rejected, bad pointers rejected, all ok" serial.log
 
   userspace:
     name: userspace (c++)

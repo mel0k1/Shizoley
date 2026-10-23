@@ -122,12 +122,30 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame,
+    mut stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
     let fault_addr = x86_64::VirtAddr::new(Cr2::read_raw());
     let from_user = stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3;
+    if !from_user {
+        // a fault inside a uar copy window is a bad user pointer, not a
+        // kernel bug: rewind rip to the recovery label and let the copy
+        // come back as "bytes left" (the caller turns it into an error)
+        if let Some(recovery) = crate::uar::recovery_rip(stack_frame.instruction_pointer.as_u64()) {
+            unsafe {
+                stack_frame
+                    .as_mut()
+                    .update(|f| f.instruction_pointer = x86_64::VirtAddr::new(recovery));
+            }
+            serial_println!(
+                "[uar] fault at {:#x} ({:?}): recovered",
+                fault_addr,
+                error_code
+            );
+            return;
+        }
+    }
     println!(
         "[paparaci] page fault at {:?} ({:?})",
         fault_addr, error_code

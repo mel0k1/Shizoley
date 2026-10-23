@@ -41,11 +41,10 @@ pub fn wait(uaddr: u64, expected: u32) -> i64 {
         None => return -1,
     };
     interrupts::without_interrupts(|| {
-        let mut w = [0u8; 4];
-        if !cur.proc.aspace.lock().read_bytes(uaddr, &mut w) {
+        let Some(word) = crate::uar::read_u32(uaddr) else {
             return -1;
-        }
-        if u32::from_le_bytes(w) != expected {
+        };
+        if word != expected {
             return 1;
         }
         {

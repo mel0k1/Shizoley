@@ -57,10 +57,6 @@ pub fn snapshot() -> Vec<Arc<Process>> {
 
 // ps(28): 40-byte records (pid, threads, state 0=run/1=dead, name[16])
 pub fn ps(buf: u64, max: u64) -> i64 {
-    let cur = match sched::current() {
-        Some(c) => c,
-        None => return -1,
-    };
     let list = snapshot();
     let n = list.len().min(max as usize).min(128);
     let mut blob: Vec<u8> = Vec::with_capacity(n * 40);
@@ -75,7 +71,7 @@ pub fn ps(buf: u64, max: u64) -> i64 {
         blob.extend_from_slice(&u64::from(alive == 0).to_le_bytes());
         blob.extend_from_slice(&name);
     }
-    if !cur.proc.aspace.lock().write_bytes(buf, &blob) {
+    if crate::uar::copy_to_user(buf, &blob) != 0 {
         return -1;
     }
     n as i64
@@ -92,11 +88,8 @@ pub fn send(sender: &Arc<Task>, dest_pid: u64, buf: u64, len: u64) -> i64 {
         return -1; // the kernel process does not take mailbox messages
     }
     let mut data = alloc::vec![0u8; len as usize];
-    {
-        let mut aspace = sender.proc.aspace.lock();
-        if !aspace.read_bytes(buf, &mut data) {
-            return -1;
-        }
+    if crate::uar::copy_from_user(buf, &mut data) != 0 {
+        return -1;
     }
     let from = sender.proc.id;
     let Some(dest) = find(dest_pid) else {
@@ -169,7 +162,7 @@ pub fn try_recv(receiver: &Arc<Task>, src: u64, buf: u64, max: u64) -> Recv {
         return if stuck { Recv::Bad } else { Recv::Empty };
     };
     let msg = mb.remove(idx).expect("position vanished");
-    if !proc.aspace.lock().write_bytes(buf, &msg.data) {
+    if crate::uar::copy_to_user(buf, &msg.data) != 0 {
         mb.push_front(msg);
         return Recv::Bad;
     }

@@ -161,7 +161,7 @@ pub fn setup(base: u64, size: u64) -> i64 {
         None => return -1,
     };
     let mut rd = [0u8; 12];
-    if !cur.proc.aspace.lock().read_bytes(base, &mut rd) {
+    if crate::uar::copy_from_user(base, &mut rd) != 0 {
         return -1;
     }
     let magic = u32::from_le_bytes([rd[0], rd[1], rd[2], rd[3]]);
@@ -281,7 +281,7 @@ pub fn post(handle: u64, opcode: u32, buf: u64, len: u64) -> i64 {
     };
     // stage the payload in kernel memory first (the source may be reused)
     let mut payload = vec![0u8; len as usize];
-    if !cur.proc.aspace.lock().read_bytes(buf, &mut payload) {
+    if crate::uar::copy_from_user(buf, &mut payload) != 0 {
         return -1;
     }
     post_bytes(qid, opcode, &payload)

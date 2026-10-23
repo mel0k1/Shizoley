@@ -1627,7 +1627,7 @@ pub fn vcpu_run(handle: u64, out_buf: u64) -> i64 {
     // host→guest control half: must be read while the caller's address
     // space is still live (the launch switches to kernel cr3)
     let mut ctl = [0u8; EXIT_BUF_BYTES - 160];
-    let have_ctl = cur.proc.aspace.lock().read_bytes(out_buf + 160, &mut ctl);
+    let have_ctl = crate::uar::copy_from_user(out_buf + 160, &mut ctl) == 0;
 
     // park the active vmcs and point host rsp at this guest's exit stack
     if !vmptrld(g.vmcs.start_address().as_u64()) {
@@ -1730,7 +1730,7 @@ pub fn vcpu_run(handle: u64, out_buf: u64) -> i64 {
         serial_println!("[vmx] launch/resume failed: err {} vmfail {}", err, ierr);
         return -1;
     }
-    if !cur.proc.aspace.lock().write_bytes(out_buf, &buf) {
+    if crate::uar::copy_to_user(out_buf, &buf) != 0 {
         serial_println!("[vmx] bad out buffer");
         return -1;
     }
