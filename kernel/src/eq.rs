@@ -169,25 +169,6 @@ pub fn setup(base: u64, size: u64) -> i64 {
     if size < EQ_HDR + nchunks as u64 * chunk_size as u64 {
         return -1;
     }
-    // one queue per memory region: refuse overlap with the caller's other
-    // queues so two heads can never fight over the same bytes
-    {
-        let reg = EQS.lock();
-        for (_, e) in reg.iter() {
-            if e.owner.id != cur.proc.id {
-                continue;
-            }
-            if base < e.base + e.size && e.base < base + size {
-                serial_println!(
-                    "[eq] setup refused: range {:#x}..{:#x} overlaps queue {}",
-                    base,
-                    base + size,
-                    find_qid(&reg, e)
-                );
-                return -1;
-            }
-        }
-    }
     let proc = &cur.proc;
     // doorbell + seqs + error channel + cons_off + all chunk words start at zero
     if !wr32(proc, base, 12, 0)
@@ -216,7 +197,23 @@ pub fn setup(base: u64, size: u64) -> i64 {
         drivers: Mutex::new(Vec::new()),
         producers: Mutex::new(Vec::new()),
     });
+    // overlap check and registration under one lock section: two setups
+    // with interleaved ranges must never both pass the check
     let mut reg = EQS.lock();
+    for (_, e) in reg.iter() {
+        if e.owner.id != cur.proc.id {
+            continue;
+        }
+        if base < e.base + e.size && e.base < base + size {
+            serial_println!(
+                "[eq] setup refused: range {:#x}..{:#x} overlaps queue {}",
+                base,
+                base + size,
+                find_qid(&reg, e)
+            );
+            return -1;
+        }
+    }
     let mut nid = NEXT_QID.lock();
     let qid = *nid;
     *nid += 1;
@@ -508,14 +505,29 @@ pub fn wait(handle: u64) -> i64 {
         None => return -1,
     };
     interrupts::without_interrupts(|| {
+        // an alert cancels the wait even when data is pending
         let bits = rd32(&eq.owner, eq.base, 12).unwrap_or(0);
-        if bits & (NOTIFY_EVENT | NOTIFY_ERROR) != 0 {
-            return 1i64;
-        }
         if bits & NOTIFY_ALERT != 0 {
             // consume the alert: one wait, one cancellation
             let _ = wr32(&eq.owner, eq.base, 12, bits & !NOTIFY_ALERT);
             return 2;
+        }
+        // the precise "more work" predicate: a chunk opened beyond the
+        // consumer, or unread bytes in the open chunk. the EVENT bit is
+        // advisory (the consumer clears it), so it must never gate sleep
+        // on its own — a cleared bit with pending data would hang forever
+        let prod = rd64(&eq.owner, eq.base, 16).unwrap_or(0);
+        let cons = rd64(&eq.owner, eq.base, 24).unwrap_or(0);
+        let mut pending = prod > cons;
+        if !pending && prod == cons {
+            let idx = cons % eq.nchunks as u64;
+            let off = EQ_HDR + idx * eq.chunk_size as u64;
+            let prog = rd32(&eq.owner, eq.base, off + 4).unwrap_or(0) & !EQ_FULL;
+            let cons_off = rd64(&eq.owner, eq.base, 40).unwrap_or(0);
+            pending = cons_off < prog as u64;
+        }
+        if pending || bits & (NOTIFY_EVENT | NOTIFY_ERROR) != 0 {
+            return 1i64;
         }
         {
             let t = cur.inner();

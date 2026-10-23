@@ -146,6 +146,10 @@ u32 eq_drive(long handle, void* base, void (*cb)(const EqEvent&)) {
         st64(h + 40, off);
         break;
     }
+    // the EVENT bit is advisory: the kernel's eq_wait checks the real
+    // pending state (seqs + open-chunk progress), so clearing it here is
+    // safe and lets the next wait actually sleep instead of busy-spinning
+    st32(h + 12, ld32(h + 12) & ~EQ_NOTIFY_EVENT);
     return processed;
 }
 
