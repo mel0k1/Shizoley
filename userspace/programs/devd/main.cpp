@@ -1,33 +1,26 @@
-// devd — the driver-vm round trip: the nic goes into the guest's iommu
-// domain, its bar0 is mapped into the guest ept identity as uc (emt 0,
-// the guest pat can never make it cacheable) and a long-mode guest reads
-// the e1000 STATUS register straight from mmio. a non-zero status handed
-// back through rsi on a vmcall proves the whole path: ept uc leaf, guest
-// 4k pte with pcd, real device registers. under tcg (no vmx) it reports
-// and exits cleanly.
+// devd — the driver-vm round: the nic goes into the guest's iommu domain,
+// its bar0 is mapped into the guest ept identity as uc (emt 0, the guest
+// pat can never make it cacheable) and the guest runs a REAL e1000 tx
+// driver (guest.c): it programs the tx ring in guest ram (gpa addresses —
+// the nic's dma is translated by the vt-d domain that mirrors the guest
+// ept), kicks one descriptor and polls the dd bit the nic dma-writes
+// back. results come over vmcall: 2 = the status read, 3 = the tx report
+// (dd | tdh<<8 | icr<<16). under tcg (no vmx) it reports and exits.
 #include <shizoley/io.hpp>
 #include <shizoley/syscall.hpp>
 #include <shizoley/types.hpp>
+
+#include <guest_blob.h>
 
 using namespace shz;
 
 namespace {
 
-// mov eax,0xfebc0000; mov esi,[eax]; mov eax,2; mov edx,8; vmcall; hlt; ud2
-const unsigned char guest_blob[] = {
-    0xB8, 0x00, 0x00, 0xBC, 0xFE, // mov eax, 0xFEBC0000
-    0x8B, 0x30,                   // mov esi, [rax]    (e1000 STATUS)
-    0xB8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2        (hypercall: gpr echo)
-    0xBA, 0x08, 0x00, 0x00, 0x00, // mov edx, 8
-    0x0F, 0x01, 0xC1,             // vmcall
-    0xF4,                         // hlt
-    0x0F, 0x0B,                   // ud2
-};
-
 // guest phys layout (64 kib of guest ram):
 //   0x1000 pml4  0x2000 pdpt  0x3000 pd (identity 2 MiB leaves for ram)
 //   0x4000 pdpt for pml4[3]   0x5000 pd for the bar's 1 gib region
 //   0x6000+ pt frames for the bar window   0x8000 gdt   0x9000 code
+//   0xA000 tx ring (nic dma target)        0xB000 tx payload
 constexpr u64 GPA_PML4 = 0x1000;
 constexpr u64 GPA_PDPT = 0x2000;
 constexpr u64 GPA_PD = 0x3000;
@@ -35,8 +28,7 @@ constexpr u64 GPA_PDPT3 = 0x4000;
 constexpr u64 GPA_PD3 = 0x5000;
 constexpr u64 GPA_PT0 = 0x6000;
 constexpr u64 GPA_GDT = 0x8000;
-constexpr u64 GPA_CODE = 0x9000;
-constexpr u64 ENTRY_RIP = GPA_CODE;
+constexpr u64 ENTRY_RIP = 0x9000; // guest.c is linked with -Ttext=0x9000
 constexpr u64 ENTRY_RSP = 0xF000;
 
 constexpr u64 SID_E1000 = 0x0010; // 00:02.0 on the reference qemu command line
@@ -109,7 +101,7 @@ int main() {
     win64[GPA_GDT / 8 + 1] = 0x00AF9A000000FFFFull;
     win64[GPA_GDT / 8 + 2] = 0x00CF92000000FFFFull;
     for (u64 i = 0; i < sizeof(guest_blob); ++i) {
-        win[GPA_CODE + i] = guest_blob[i];
+        win[ENTRY_RIP + i] = guest_blob[i];
     }
 
     if (guest_mode(g, 1) != 0) {
@@ -127,6 +119,7 @@ int main() {
 
     long reason = -1;
     bool ok = false;
+    bool tx_ok = false;
     for (int i = 0; i < 1000; ++i) {
         reason = vcpu_run(g, &ve);
         if (reason < 0) {
@@ -140,19 +133,30 @@ int main() {
         if (reason == static_cast<long>(VmxExit::vmcall)) {
             u64 rax = ve.out[4];
             u64 rsi = ve.out[8];
-            if (rax != 2) {
+            u64 rdx = ve.out[10];
+            if (rax == 2) {
+                print("[devd] bar0 status = ");
+                puthex(rsi);
+                println("");
+                ok = rsi != 0; // real mmio: device id, link and duplex bits
+            } else if (rax == 3) {
+                u64 dd = rsi & 1;
+                u64 tdh = (rsi >> 8) & 0xFF;
+                u64 icr = (rsi >> 16) & 0xFFFF;
+                println("[devd] tx: dd ", dd, " tdh ", tdh, " icr ", icr,
+                        " len ", rdx);
+                tx_ok = dd != 0 && tdh == 1;
+                println("[devd] driver vm: nic dma'd the guest ring ",
+                        tx_ok ? "(dd set, tdh advanced)" : "(no completion)");
+            } else {
                 println("[devd] bogus hypercall rax ", rax);
                 break;
             }
-            print("[devd] bar0 status = ");
-            puthex(rsi);
-            println("");
-            ok = rsi != 0; // real mmio: device id, link and duplex bits
             ve.flags = 0;
             continue;
         }
         if (reason == static_cast<long>(VmxExit::ept_violation)) {
-            println("[devd] ept violation on the bar access (no uc map?)");
+            println("[devd] ept violation (no uc map or ring outside ram?)");
             break;
         }
         if (reason == static_cast<long>(VmxExit::ept_misconfig)) {
@@ -173,10 +177,13 @@ int main() {
     if (ok) {
         println("[devd] mmio round ok: uc bar read from the guest");
     }
+    if (tx_ok) {
+        println("[devd] driver vm ok: tx through the guest's own ring");
+    }
     guest_device_detach(g, SID_E1000);
     guest_destroy(g);
     println("[devd] device detached, guest destroyed");
-    return ok ? 0 : 1;
+    return (ok && tx_ok) ? 0 : 1;
 }
 
 } // namespace shz

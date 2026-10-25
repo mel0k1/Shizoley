@@ -81,17 +81,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("[heartbeat] {}", i);
             }
         });
-        // kernel thread: the device-assignment round — nic dma through a
-        // domain: mapped frames complete, unmapped ones fault
-        sched::spawn_kernel("dma", dma::smoke);
-        match user::spawn_process("init") {
-            Some(pid) => {
-                serial_println!("[paparaci] init queued (pid {}), scheduler loop", pid);
-            }
-            None => {
-                serial_println!("[paparaci] initrd: 'init' not found or broken");
-                println!("[paparaci] initrd: 'init' not found or broken");
-            }
+    });
+    // the device-assignment round runs to completion BEFORE any user
+    // process exists: devd in ring 3 builds the driver vm on the same nic,
+    // and both sides rewriting the device's context entry would race
+    dma::smoke();
+    // spawns atomic vs the timer so the schedule is deterministic
+    x86_64::instructions::interrupts::without_interrupts(|| match user::spawn_process("init") {
+        Some(pid) => {
+            serial_println!("[paparaci] init queued (pid {}), scheduler loop", pid);
+        }
+        None => {
+            serial_println!("[paparaci] initrd: 'init' not found or broken");
+            println!("[paparaci] initrd: 'init' not found or broken");
         }
     });
 
