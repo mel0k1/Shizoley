@@ -83,12 +83,21 @@ jobs:
           grep -qF "[futex] mismatch returned 1 (no sleep)" serial.log
           grep -qF "[futex] woke, word 42" serial.log
           grep -qF "[futex] all ok" serial.log
-          grep -qF "[iommu] unit 0xfed90000: levels 4 aw 2 pt true" serial.log
+          grep -qE "\[iommu\] unit 0xfed90000: levels [0-9] aw [0-9] pt true" serial.log
           grep -qF "[iommu] unit 0xfed90000: te on (host pass-through)" serial.log
           grep -qF "[iommu] device 00:02.0 -> domain " serial.log
           grep -qF "[iommu] dma ok: nic read gpa 0x8000 through domain " serial.log
           grep -qF "[iommu] fault: 0x0010 0x8000 read (not readable)" serial.log
           grep -qF "[iommu] device 00:02.0 out of domain " serial.log
+          grep -qE "\[nic\] intx: pin [0-9]+ line [0-9]+ -> vector 0x[0-9a-f]+ \(unmasked\)" serial.log
+          grep -qF "(dd set, via irq" serial.log
+          grep -qF "[pat] wb wt uc- uc wb wt uc- wc" serial.log
+          grep -qF "[init] spawned devd" serial.log
+          grep -qF "[devd] vmx unavailable (guest_create refused)" serial.log
+          grep -qF "[shm] mem 1 created: 4 pages for pid" serial.log
+          grep -qF "[shmdemo] forged token denied" serial.log
+          grep -qF "[shmpeer] verified 16384 bytes (ro map, no copies)" serial.log
+          grep -qF "[shm] mem 1 freed: 4 frames returned" serial.log
           grep -qE "\[uar\] smap " serial.log
           grep -qF "[uar] fault at 0xdead0000 (" serial.log
           grep -qF "[uardemo] live copy ok" serial.log

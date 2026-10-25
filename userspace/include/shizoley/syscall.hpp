@@ -51,6 +51,7 @@ enum class Sys : u64 {
     shm_map = 37,      // (handle, va) -> 0 | -1; map the frames rw or ro by
                        // the caller's rights (SHM_RIGHT_R/W)
     shm_unmap = 38,    // (handle) -> 0 | -1; take this mapping down
+    nic_vec = 39,      // () -> host vector of the nic's intx line (0 = none)
 };
 
 // ps(28) record, filled by the kernel (name is NUL-padded)
@@ -143,6 +144,7 @@ long futex_wake(u32* uaddr, u64 n);
 long shm_create(u64 npages);
 long shm_map(long handle, u64 va);
 long shm_unmap(long handle);
+long nic_vec();
 
 inline long syscall(Sys nr) {
     u64 ret = static_cast<u64>(nr);

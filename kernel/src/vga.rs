@@ -1,4 +1,5 @@
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::{Lazy, Mutex};
 use volatile::Volatile;
 
@@ -52,11 +53,26 @@ struct Buffer {
 pub struct Writer {
     column: usize,
     color_code: ColorCode,
-    buffer: &'static mut Buffer,
+}
+
+// the text buffer lives at the physical vga address: identity-mapped while
+// the boot pml4 is active, remapped to a higher-half page once memory is
+// up — user cr3s carry only the kernel's upper half, so an identity vga
+// pointer would fault on the first print after a process switch
+static VGA_ADDR: AtomicU64 = AtomicU64::new(0xb8000);
+
+pub fn remap_high() {
+    let va = crate::memory::map_mmio(0xB8000, 1);
+    VGA_ADDR.store(va.as_u64(), Ordering::Relaxed);
+}
+
+fn buffer() -> &'static mut Buffer {
+    unsafe { &mut *(VGA_ADDR.load(Ordering::Relaxed) as *mut Buffer) }
 }
 
 impl Writer {
     pub fn write_byte(&mut self, byte: u8) {
+        let buffer = buffer();
         match byte {
             b'\n' => self.new_line(),
             byte => {
@@ -65,7 +81,7 @@ impl Writer {
                 }
                 let row = BUFFER_HEIGHT - 1;
                 let col = self.column;
-                self.buffer.chars[row][col].write(ScreenChar {
+                buffer.chars[row][col].write(ScreenChar {
                     ascii: byte,
                     color_code: self.color_code,
                 });
@@ -82,7 +98,7 @@ impl Writer {
 
     fn new_line(&mut self) {
         for row in 1..BUFFER_HEIGHT {
-            let (head, tail) = self.buffer.chars.split_at_mut(row);
+            let (head, tail) = buffer().chars.split_at_mut(row);
             let src = &tail[0];
             let dst = &mut head[row - 1];
             for (dst_cell, src_cell) in dst.iter_mut().zip(src.iter()) {
@@ -98,7 +114,7 @@ impl Writer {
             ascii: b' ',
             color_code: self.color_code,
         };
-        for cell in self.buffer.chars[row].iter_mut() {
+        for cell in buffer().chars[row].iter_mut() {
             cell.write(blank);
         }
     }
@@ -115,7 +131,6 @@ pub static WRITER: Lazy<Mutex<Writer>> = Lazy::new(|| {
     Mutex::new(Writer {
         column: 0,
         color_code: ColorCode::new(Color::LightGreen, Color::Black),
-        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
     })
 });
 

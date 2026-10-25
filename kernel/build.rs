@@ -84,8 +84,20 @@ fn main() {
             panic!("kernel build: guest image of '{name}' failed");
         }
         let gbin = out.join(format!("guest_{name}.bin"));
+        // an explicit layout: empty .data/.bss (some gccs emit them even
+        // when unused) would otherwise pull the default script's data
+        // segment in and stretch the raw blob out to megabytes
+        let gld = out.join("guest.ld");
+        fs::write(
+            &gld,
+            "ENTRY(guest_main)\nSECTIONS\n{\n    . = 0x9000;\n    .text : { *(.text*) }\n    .rodata : { *(.rodata*) }\n    .data : { *(.data*) }\n    .bss : { *(.bss*) }\n    /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }\n}\n",
+        )
+        .expect("kernel build: guest ld script write failed");
         let status = Command::new("ld")
-            .args(["-m", "elf_x86_64", "-Ttext=0x9000", "--oformat", "binary"])
+            .args(["-m", "elf_x86_64", "-T"])
+            .arg(&gld)
+            .arg("--oformat")
+            .arg("binary")
             .arg(&gobj)
             .arg("-o")
             .arg(&gbin)

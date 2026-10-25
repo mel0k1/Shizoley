@@ -203,8 +203,9 @@ pub struct Vcpu {
     pub pi_desc: u64,        // +320: posted-interrupt descriptor phys (0 = off)
     pub vapic: u64,          // +328: virtual-apic page phys
     pub pi_routed: [u64; 4], // +336: host vectors routed into the guest
+    pub pending_irq: u8,     // +368: routed vector awaiting entry injection
 }
-const _: () = assert!(core::mem::size_of::<Vcpu>() == 368);
+const _: () = assert!(core::mem::size_of::<Vcpu>() == 376);
 
 #[repr(C, align(16))]
 struct ExitStack([u8; 4096]);
@@ -411,26 +412,37 @@ extern "C" fn vmx_after_exit(vcpu: *mut Vcpu) -> u64 {
             // ack'd by the cpu (exit ctl bit 15): eoi and keep counters
             let info = vmread(VM_EXIT_INTR_INFO);
             let vector = (info & 0xFF) as u8;
-            crate::interrupts::dispatch_in_root(vector);
-            // p4: a routed vector is posted into the guest's descriptor
-            // instead of being left to ring 3; re-entry runs the
-            // PIR->vIRR sync and virtual-interrupt delivery injects it
-            // while the guest runs (out[3] carries the posted vector)
+            let ours = crate::interrupts::dispatch_in_root(vector);
+            // a routed vector reaches the guest either through the posted
+            // descriptor (apicv: re-entry runs the PIR->vIRR sync and
+            // virtual-interrupt delivery injects it while the guest runs)
+            // or, without apicv, parked in pending_irq and injected at the
+            // next entry through the vm-entry interruption field (out[3]
+            // carries the vector either way)
             let v = vector as usize;
-            if vcpu.pi_desc != 0 && vcpu.pi_routed[v / 64] >> (v % 64) & 1 != 0 {
-                let vapic = memory::phys_to_virt(x86_64::PhysAddr::new(vcpu.vapic));
-                unsafe {
-                    // kernel-managed virtual EOI, same as the entry sync:
-                    // the real-mode guest cannot clear its own vISR bit
-                    let isr = vapic
-                        .as_mut_ptr::<u32>()
-                        .add((VAPIC_ISR as usize) / 4 + v / 32);
-                    isr.write_volatile(isr.read_volatile() & !(1 << (v % 32)));
+            if vcpu.pi_routed[v / 64] >> (v % 64) & 1 != 0 {
+                // the pic only saw the inta cycle: without this eoi the
+                // isr bit sticks and the line goes silent forever
+                if !ours && (32..48).contains(&vector) {
+                    crate::interrupts::eoi_pic(vector);
                 }
-                let desc = memory::phys_to_virt(x86_64::PhysAddr::new(vcpu.pi_desc));
-                unsafe {
-                    let pir = desc.as_mut_ptr::<u32>().add(v / 32);
-                    pir.write_volatile(pir.read_volatile() | 1 << (v % 32));
+                if vcpu.pi_desc != 0 {
+                    let vapic = memory::phys_to_virt(x86_64::PhysAddr::new(vcpu.vapic));
+                    unsafe {
+                        // kernel-managed virtual EOI, same as the entry sync:
+                        // the real-mode guest cannot clear its own vISR bit
+                        let isr = vapic
+                            .as_mut_ptr::<u32>()
+                            .add((VAPIC_ISR as usize) / 4 + v / 32);
+                        isr.write_volatile(isr.read_volatile() & !(1 << (v % 32)));
+                    }
+                    let desc = memory::phys_to_virt(x86_64::PhysAddr::new(vcpu.pi_desc));
+                    unsafe {
+                        let pir = desc.as_mut_ptr::<u32>().add(v / 32);
+                        pir.write_volatile(pir.read_volatile() | 1 << (v % 32));
+                    }
+                } else {
+                    vcpu.pending_irq = vector;
                 }
                 vcpu.out[0] = reason;
                 vcpu.out[1] = vmread(GUEST_RIP);
@@ -449,6 +461,16 @@ extern "C" fn vmx_after_exit(vcpu: *mut Vcpu) -> u64 {
                 vcpu.out[3] = 0;
                 vcpu.out[4..20].copy_from_slice(&vcpu.gprs);
                 return 1;
+            }
+            // an unclaimed pic line must still be retired: a stuck isr bit
+            // masks every lower-priority line including the slave cascade;
+            // level intx also needs the source quieted or it re-fires at
+            // once — the nic's icr read is the deassert
+            if !ours && (32..48).contains(&vector) {
+                if vector as u64 == crate::dma::nic_vec() {
+                    crate::dma::nic_quiet();
+                }
+                crate::interrupts::eoi_pic(vector);
             }
             0
         }
@@ -1246,6 +1268,7 @@ pub fn guest_create(pages: u64) -> i64 {
         pi_desc: pi_desc_phys,
         vapic: virtual_apic.start_address().as_u64(),
         pi_routed: [0; 4],
+        pending_irq: 0,
     };
     let exit_stack = Box::new(ExitStack([0; 4096]));
     if let Some(f) = pi_desc {
@@ -1655,8 +1678,10 @@ pub fn vcpu_run(handle: u64, out_buf: u64) -> i64 {
     }
 
     // apply the ring-3 requests: entry state, gpr overrides, then injection
+    let mut inj_requested = false;
     if have_ctl {
         let flags = u64::from_le_bytes(ctl[(OFF_IN_FLAGS * 8 - 160)..][..8].try_into().unwrap());
+        inj_requested = flags & 2 != 0;
         if flags & 4 != 0 {
             // long-mode entry point: rip/rsp/cr3 point at images the monitor
             // preloaded into guest ram; cr3 must be inside the guest
@@ -1699,6 +1724,19 @@ pub fn vcpu_run(handle: u64, out_buf: u64) -> i64 {
         } else {
             vmwrite(VM_ENTRY_INTR_INFO, 0);
         }
+    }
+
+    // a routed host irq without apicv rides pending_irq: inject it here
+    // when the guest can take it (if=1, no sti/movss shadow), else defer
+    // to the next entry; a ring-3 injection in flight has priority
+    if g.vcpu.pending_irq != 0
+        && !inj_requested
+        && vmread(GUEST_INTERRUPTIBILITY) & 3 == 0
+        && vmread(GUEST_RFLAGS) & 0x200 != 0
+    {
+        vmwrite(VM_ENTRY_INTR_INFO, 0x8000_0000 | g.vcpu.pending_irq as u64);
+        vmwrite(VM_ENTRY_INSTRUCTION_LEN, 0);
+        g.vcpu.pending_irq = 0;
     }
 
     // run with kernel cr3: the stub and handler live in the higher half
@@ -2090,17 +2128,14 @@ pub fn guest_mmio_map(handle: u64, sid: u64, bar: u64) -> i64 {
     size as i64
 }
 
-// p4: route host irq `vector` into the guest's posted-interrupt
-// descriptor: on the next ext-int exit with that vector the kernel posts
-// it instead of reporting it to ring 3, and virtual-interrupt delivery
-// injects it into the guest without further exits. vector 0 clears every
-// routing. needs apicv (pin bit 7 + vid allowed); refused elsewhere.
+// p4: route host irq `vector` into the guest: on the next ext-int exit
+// with that vector the kernel either posts it into the posted-interrupt
+// descriptor (apicv present: virtual-interrupt delivery injects it while
+// the guest runs) or parks it for injection on the next entry (no apicv,
+// e.g. nested under kvm — the classic vm-entry interruption path).
+// vector 0 clears every routing.
 pub fn guest_pi(handle: u64, vector: u64) -> i64 {
     if !vmx_ready() || vector > 255 {
-        return -1;
-    }
-    if !PI_ARMED.load(Ordering::Relaxed) {
-        serial_println!("[vmx] guest_pi: posted interrupts unavailable (no apicv/vid)");
         return -1;
     }
     let cur = match crate::sched::current() {
@@ -2120,12 +2155,20 @@ pub fn guest_pi(handle: u64, vector: u64) -> i64 {
         return 0;
     }
     g.pi_routed[(vector >> 6) as usize] |= 1 << (vector & 63);
-    serial_println!(
-        "[vmx] guest {}: host vector {:#x} -> posted interrupts (nv {:#x})",
-        g.id,
-        vector,
-        PI_VECTOR
-    );
+    if PI_ARMED.load(Ordering::Relaxed) {
+        serial_println!(
+            "[vmx] guest {}: host vector {:#x} -> posted interrupts (nv {:#x})",
+            g.id,
+            vector,
+            PI_VECTOR
+        );
+    } else {
+        serial_println!(
+            "[vmx] guest {}: host vector {:#x} -> entry injection (no apicv/vid)",
+            g.id,
+            vector
+        );
+    }
     0
 }
 

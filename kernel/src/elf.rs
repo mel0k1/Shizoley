@@ -232,17 +232,21 @@ fn map_segment(
         let frame: PhysFrame<Size4KiB> = memory::alloc_frame().ok_or(ElfError::OutOfMemory)?;
         let page_start = page.start_address().as_u64();
         let page_end = page_start + 4096;
-        let fresh = aspace.map_user_page(page, frame, flags).map_err(|e| {
-            let _ = e;
-            ElfError::Mapping
-        })?;
+        // a fresh address space cannot have this page mapped yet: an
+        // "already mapped" here means a stale entry survived into the
+        // process — mapping would ship a page that is not ours, so refuse
+        if !aspace
+            .map_user_page(page, frame, flags)
+            .map_err(|_| ElfError::Mapping)?
+        {
+            memory::dealloc_frame(frame);
+            return Err(ElfError::Mapping);
+        }
 
         let frame = aspace.translate_page(page).ok_or(ElfError::Mapping)?;
         let dst = memory::phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
         unsafe {
-            if fresh {
-                core::ptr::write_bytes(dst, 0, 4096);
-            }
+            core::ptr::write_bytes(dst, 0, 4096);
             // file-backed part
             let fs = page_start.max(p_vaddr);
             let fe = page_end.min(p_vaddr + p_filesz);

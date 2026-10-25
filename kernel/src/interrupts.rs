@@ -51,6 +51,32 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_handler);
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_handler);
+    // the pic lines a pci intx device can land on (the nic's line): the
+    // handler must quiet the device first (pci intx is level-triggered —
+    // an eoi with the source still asserted re-fires instantly), then eoi
+    macro_rules! intx_stub {
+        ($v:literal, $name:ident) => {
+            extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
+                crate::dma::nic_intx($v);
+                unsafe { PICS.lock().notify_end_of_interrupt($v) };
+            }
+            idt[$v].set_handler_fn($name);
+        };
+    }
+    intx_stub!(34, intx34);
+    intx_stub!(35, intx35);
+    intx_stub!(36, intx36);
+    intx_stub!(37, intx37);
+    intx_stub!(38, intx38);
+    intx_stub!(39, intx39);
+    intx_stub!(40, intx40);
+    intx_stub!(41, intx41);
+    intx_stub!(42, intx42);
+    intx_stub!(43, intx43);
+    intx_stub!(44, intx44);
+    intx_stub!(45, intx45);
+    intx_stub!(46, intx46);
+    intx_stub!(47, intx47);
     // vmx posted-interrupt notification vector: the cpu consumes this
     // vector itself while a guest runs (it never reaches the host idt in
     // that case); in vmx-root it is a silent stub so a stray notification
@@ -218,6 +244,30 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8())
     };
+}
+
+// specific eoi for a pic-routed vector handled outside the normal idt
+// path (vmx-root exit handling): keeps the isr bit from jamming the line
+pub fn eoi_pic(vector: u8) {
+    unsafe { PICS.lock().notify_end_of_interrupt(vector) };
+}
+
+// unmask one pic line: the nic's intx must reach the cpu
+pub fn unmask_pic_line(line: u8) {
+    unsafe {
+        if line < 8 {
+            let mut p: Port<u8> = Port::new(0x21);
+            let m = p.read();
+            p.write(m & !(1 << line));
+        } else {
+            let mut s: Port<u8> = Port::new(0xA1);
+            let ms = s.read();
+            s.write(ms & !(1 << (line - 8)));
+            let mut m: Port<u8> = Port::new(0x21);
+            let mm = m.read();
+            m.write(mm & !(1 << 2));
+        }
+    }
 }
 
 // irq taken while the cpu runs a guest (vmx root operation): the vmx exit

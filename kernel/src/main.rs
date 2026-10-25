@@ -42,6 +42,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     allocator::init(&mut mapper).expect("heap init failed");
     uar::init();
     memory::init_pat();
+    vga::remap_high();
     serial_println!(
         "[paparaci] heap up, {} frames in use",
         memory::frames_used()

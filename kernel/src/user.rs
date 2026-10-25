@@ -7,8 +7,8 @@ use x86_64::VirtAddr;
 use crate::serial_println;
 use crate::{elf, gdt, initrd, ipc, memory, sched, task};
 
-pub const USER_STACK_BASE: u64 = 0x0050_0000;
-pub const USER_STACK_TOP: u64 = 0x0060_0000;
+pub const USER_STACK_BASE: u64 = 0x1810_0000;
+pub const USER_STACK_TOP: u64 = 0x1820_0000;
 
 // every process sees the initrd read-only here: services (fsd) walk it from
 // ring 3; the frames are shared with the kernel image, no copies
@@ -28,19 +28,21 @@ fn map_zeroed_range(
     let last = Page::containing_address(VirtAddr::new(top - 1));
     for page in Page::range_inclusive(first, last) {
         let frame = memory::alloc_frame().ok_or("no frames")?;
-        let fresh = match aspace.map_user_page(page, frame, flags) {
-            Ok(f) => f,
+        // fresh process space: an existing mapping here is a bug, not a
+        // caller convenience — refuse instead of shipping foreign content
+        let mapped = match aspace.map_user_page(page, frame, flags) {
+            Ok(v) => v,
             Err(_) => {
                 memory::dealloc_frame(frame);
                 return Err("map");
             }
         };
-        if fresh {
-            let dst = memory::phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
-            unsafe { core::ptr::write_bytes(dst, 0, 4096) };
-        } else {
+        if !mapped {
             memory::dealloc_frame(frame);
+            return Err("map");
         }
+        let dst = memory::phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
+        unsafe { core::ptr::write_bytes(dst, 0, 4096) };
     }
     let _ = what;
     Ok(())

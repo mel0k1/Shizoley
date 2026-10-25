@@ -1,10 +1,13 @@
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use x86_64::instructions::port::Port;
 use x86_64::PhysAddr;
 
 // pci config probe + the device-assignment smoke: an e1000 tx ring lives
 // in an iommu domain's address space, so the nic's dma (descriptor fetch
 // and payload read) goes through the second-level tables — mapped frames
-// complete, unmapped ones land in the fault log
+// complete, unmapped ones land in the fault log. tx completion is observed
+// through the nic's intx line (the same vector devd later routes into the
+// guest), not by polling
 
 const CFG_ADDR: u16 = 0xCF8;
 const CFG_DATA: u16 = 0xCFC;
@@ -98,6 +101,9 @@ fn mmio_bar(sid: u16) -> Option<u64> {
 
 // e1000 (82540em) registers used here
 const CTRL: usize = 0x0000;
+const ICR: usize = 0x00C0; // interrupt cause read (write 1 = clear)
+const IMS: usize = 0x00D0; // interrupt mask set
+const IMC: usize = 0x00D8; // interrupt mask clear
 const TDBAL: usize = 0x3800;
 const TDBAH: usize = 0x3804;
 const TDLEN: usize = 0x3808;
@@ -113,6 +119,44 @@ impl E1000 {
     // r is a byte offset from the spec, registers are 32-bit there
     fn wr(&self, r: usize, v: u32) {
         unsafe { core::ptr::write_volatile((self.regs + r) as *mut u32, v) }
+    }
+}
+
+// the nic's intx line: discovered by the smoke (interrupt line register
+// through the ich9 pirq), then the same host vector is what devd routes
+// into the guest with guest_pi — one discovery, two consumers
+static NIC_LINE: AtomicU8 = AtomicU8::new(0);
+static NIC_REGS: AtomicUsize = AtomicUsize::new(0);
+static NIC_WAITING: AtomicBool = AtomicBool::new(false);
+static NIC_IRQ: AtomicBool = AtomicBool::new(false);
+
+pub fn nic_vec() -> u64 {
+    match NIC_LINE.load(Ordering::Relaxed) {
+        0 => 0,
+        l => 32 + l as u64,
+    }
+}
+
+// read icr: on the e1000 a read clears every cause and deasserts inta —
+// the mandatory first half of a level-triggered intx service
+pub fn nic_quiet() {
+    let regs = NIC_REGS.load(Ordering::Relaxed);
+    if regs != 0 {
+        unsafe {
+            core::ptr::read_volatile((regs + ICR) as *mut u32);
+        }
+    }
+}
+
+// idt path for pic vectors 34..47: quiet the nic (deassert inta), then
+// the caller eoIs; a waiter (the smoke) latches the vector as completion
+pub fn nic_intx(vector: u8) {
+    if vector != 32 + NIC_LINE.load(Ordering::Relaxed) {
+        return;
+    }
+    nic_quiet();
+    if NIC_WAITING.load(Ordering::Relaxed) {
+        NIC_IRQ.store(true, Ordering::Relaxed);
     }
 }
 
@@ -170,7 +214,28 @@ pub fn smoke() {
         return;
     };
     let regs = crate::memory::map_mmio(bar, 32).as_u64() as usize;
+    NIC_REGS.store(regs, Ordering::Relaxed);
     let nic = E1000 { regs };
+    // intx: the line register (0x3c) carries what firmware routed for
+    // inta# (pin 0x3d); without a route we program the ich9 pirq and the
+    // device ourselves — qemu's e1000 has no msi cap, intx is the only line
+    let cfg34 = cfg_read(sid, 0x3C);
+    let pin = ((cfg34 >> 8) & 0x07) as u8;
+    let mut line = (cfg34 & 0xFF) as u8;
+    if line > 15 {
+        line = 10;
+        let pirq = (pin.saturating_sub(1).wrapping_add((sid >> 3) as u8 & 0x1F)) & 3;
+        cfg_write(0x00F8, 0x60 + pirq, line as u32);
+        cfg_write(sid, 0x3C, line as u32);
+    }
+    NIC_LINE.store(line, Ordering::Relaxed);
+    crate::interrupts::unmask_pic_line(line);
+    crate::serial_println!(
+        "[nic] intx: pin {} line {} -> vector {:#x} (unmasked)",
+        pin,
+        line,
+        32 + line
+    );
     let Some(ring) = crate::memory::alloc_frame() else {
         return;
     };
@@ -224,14 +289,36 @@ pub fn smoke() {
             cmd: 0x0B,
         },
     );
+    // completion via interrupt: txdw (icr bit 0) rides the intx line to
+    // the pic, the idt stub latches it here — dd is only the evidence
+    nic.wr(IMC, 0xFFFF_FFFF);
+    nic.wr(ICR, 0xFFFF_FFFF);
+    nic.wr(IMS, 1); // txdw
+    NIC_WAITING.store(true, Ordering::Relaxed);
     nic.wr(TDT, 1);
-    let done = spin(2_000_000, || desc_done(ring.start_address(), 0));
+    let irq = spin(3_000_000, || NIC_IRQ.load(Ordering::Relaxed));
+    let mut done = irq && desc_done(ring.start_address(), 0);
+    if !done {
+        done = spin(2_000_000, || desc_done(ring.start_address(), 0));
+    }
+    NIC_WAITING.store(false, Ordering::Relaxed);
+    nic.wr(IMC, 0xFFFF_FFFF);
     if done {
-        crate::serial_println!(
-            "[iommu] dma ok: nic read gpa {:#x} through domain {} (dd set)",
-            BUF_GPA,
-            dom.id
-        );
+        if irq {
+            crate::serial_println!(
+                "[iommu] dma ok: nic read gpa {:#x} through domain {} (dd set, via irq vec {:#x})",
+                BUF_GPA,
+                dom.id,
+                32 + line
+            );
+        } else {
+            crate::serial_println!("[nic] intx missing — completion polled");
+            crate::serial_println!(
+                "[iommu] dma ok: nic read gpa {:#x} through domain {} (dd set, via poll)",
+                BUF_GPA,
+                dom.id
+            );
+        }
     } else {
         crate::serial_println!("[iommu] dma incomplete: no dd from the nic");
     }

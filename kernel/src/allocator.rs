@@ -6,7 +6,9 @@ use x86_64::VirtAddr;
 
 use crate::memory;
 
-pub const HEAP_START: u64 = 0o_5555_5555_0000;
+// higher half (pml4 slot 500): the kernel's own mappings must survive the
+// cr3 switch into user processes, whose low half starts empty
+pub const HEAP_START: u64 = 0xFFFF_FA00_0000_0000;
 pub const HEAP_SIZE: u64 = 1024 * 1024;
 
 pub struct BumpAllocator {

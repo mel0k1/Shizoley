@@ -146,4 +146,8 @@ long shm_unmap(long handle) {
     return syscall(Sys::shm_unmap, static_cast<u64>(handle));
 }
 
+long nic_vec() {
+    return syscall(Sys::nic_vec);
+}
+
 }

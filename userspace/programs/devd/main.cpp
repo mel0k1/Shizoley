@@ -3,9 +3,11 @@
 // pat can never make it cacheable) and the guest runs a REAL e1000 tx
 // driver (guest.c): it programs the tx ring in guest ram (gpa addresses —
 // the nic's dma is translated by the vt-d domain that mirrors the guest
-// ept), kicks one descriptor and polls the dd bit the nic dma-writes
-// back. results come over vmcall: 2 = the status read, 3 = the tx report
-// (dd | tdh<<8 | icr<<16). under tcg (no vmx) it reports and exits.
+// ept), kicks one descriptor and waits for the tx-completion interrupt —
+// the nic's host intx vector is routed into the guest (guest_pi, 27) and
+// the kernel posts it (pir on apicv, entry injection without). results
+// come over vmcall: 2 = the status read, 3 = the tx report (irq | dd<<8 |
+// tdh<<16 | icr<<24). under tcg (no vmx) it reports and exits.
 #include <shizoley/io.hpp>
 #include <shizoley/syscall.hpp>
 #include <shizoley/types.hpp>
@@ -30,6 +32,7 @@ constexpr u64 GPA_PT0 = 0x6000;
 constexpr u64 GPA_GDT = 0x8000;
 constexpr u64 ENTRY_RIP = 0x9000; // guest.c is linked with -Ttext=0x9000
 constexpr u64 ENTRY_RSP = 0xF000;
+constexpr u64 GPA_VEC = 0xC008;   // nic host vector handed to the guest
 
 constexpr u64 SID_E1000 = 0x0010; // 00:02.0 on the reference qemu command line
 
@@ -73,6 +76,18 @@ int main() {
 
     volatile u8* win = reinterpret_cast<volatile u8*>(GUEST_WINDOW);
     volatile u64* win64 = reinterpret_cast<volatile u64*>(GUEST_WINDOW);
+
+    // the nic's host intx vector (discovered by the kernel smoke) is what
+    // the guest waits on: route it and hand the number over in guest ram
+    long vec = nic_vec();
+    if (vec > 0 && guest_pi(g, static_cast<u64>(vec)) == 0) {
+        win64[GPA_VEC / 8] = static_cast<u64>(vec);
+        println("[devd] nic irq 0x", static_cast<u64>(vec),
+                " -> guest (routed)");
+    } else {
+        vec = 0;
+        println("[devd] no nic irq vector — guest will poll dd");
+    }
 
     // identity ram: 4 mib through 2 mib leaves
     win64[GPA_PML4 / 8] = GPA_PDPT | 0x03;
@@ -120,6 +135,7 @@ int main() {
     long reason = -1;
     bool ok = false;
     bool tx_ok = false;
+    u64 posted = 0;
     for (int i = 0; i < 1000; ++i) {
         reason = vcpu_run(g, &ve);
         if (reason < 0) {
@@ -128,26 +144,33 @@ int main() {
         }
         if (reason == static_cast<long>(VmxExit::ext_int) ||
             reason == static_cast<long>(VmxExit::preempt_timer)) {
+            if (reason == static_cast<long>(VmxExit::ext_int) && ve.out[3] != 0) {
+                posted++;
+            }
             continue;
         }
         if (reason == static_cast<long>(VmxExit::vmcall)) {
             u64 rax = ve.out[4];
             u64 rsi = ve.out[8];
-            u64 rdx = ve.out[10];
             if (rax == 2) {
                 print("[devd] bar0 status = ");
                 puthex(rsi);
                 println("");
                 ok = rsi != 0; // real mmio: device id, link and duplex bits
             } else if (rax == 3) {
-                u64 dd = rsi & 1;
-                u64 tdh = (rsi >> 8) & 0xFF;
-                u64 icr = (rsi >> 16) & 0xFFFF;
-                println("[devd] tx: dd ", dd, " tdh ", tdh, " icr ", icr,
-                        " len ", rdx);
-                tx_ok = dd != 0 && tdh == 1;
+                u64 irq = rsi & 0xFF;
+                u64 dd = (rsi >> 8) & 1;
+                u64 tdh = (rsi >> 16) & 0xFF;
+                u64 icr = (rsi >> 24) & 0xFFFF;
+                println("[devd] tx: irq ", irq, " dd ", dd, " tdh ", tdh,
+                        " icr ", icr);
+                tx_ok = irq != 0 && dd != 0 && tdh == 1;
                 println("[devd] driver vm: nic dma'd the guest ring ",
                         tx_ok ? "(dd set, tdh advanced)" : "(no completion)");
+                if (irq != 0) {
+                    println("[devd] completion by interrupt: ", posted,
+                            " exit(s) posted");
+                }
             } else {
                 println("[devd] bogus hypercall rax ", rax);
                 break;

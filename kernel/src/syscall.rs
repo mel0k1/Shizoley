@@ -300,6 +300,9 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         37 => crate::memobj::map(a1, a2) as u64,
         // 38: shm_unmap(handle) -> 0 | -1; take this process's mapping down
         38 => crate::memobj::unmap(a1) as u64,
+        // 39: nic_vec() -> host vector of the nic's intx line (0 = none);
+        //     devd routes it into the guest with guest_pi (27)
+        39 => crate::dma::nic_vec(),
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);
