@@ -292,6 +292,14 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         // 35: guest_mmio(handle, sid, bar) -> bar size | -1; identity uc map
         //     of a pci memory bar into the guest ept + iommu mirror (GMAP)
         35 => crate::vmx::guest_mmio_map(a1, a2, a3) as u64,
+        // 36: shm_create(npages) -> root capability token | -1; kernel-owned
+        //     memory object (managarm-style), dies with its owner
+        36 => crate::memobj::create(a1) as u64,
+        // 37: shm_map(handle, va) -> 0 | -1; map the frames here, rw or ro
+        //     by the caller's rights (MMAP_R/MMAP_W)
+        37 => crate::memobj::map(a1, a2) as u64,
+        // 38: shm_unmap(handle) -> 0 | -1; take this process's mapping down
+        38 => crate::memobj::unmap(a1) as u64,
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);

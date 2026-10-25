@@ -67,4 +67,17 @@ ck "[iommu] dma ok: nic read gpa 0x8000 through domain "
 ck "[iommu] fault: 0x0010 0x8000 read (not readable)"
 ck "[iommu] device 00:02.0 out of domain "
 
+ck "[shm] mem 1 created: 4 pages for pid"
+ck "[shmdemo] forged token denied"
+ck "[shmpeer] verified 16384 bytes (ro map, no copies)"
+ck "[shmdemo] share ok (pid "
+ck "[shm] mem 1 freed: 4 frames returned"
+P1=$(sed -n 's/.*pid [0-9]* maps mem 1 at 0x10000000 phys 0x\([0-9a-f]*\).*/\1/p' "$LOG" | head -1)
+P2=$(sed -n 's/.*pid [0-9]* maps mem 1 at 0x11000000 phys 0x\([0-9a-f]*\).*/\1/p' "$LOG" | head -1)
+if [ -n "$P1" ] && [ "$P1" = "$P2" ]; then
+  echo "OK   zero-copy share (same phys frame 0x$P1)"
+else
+  echo "MISS zero-copy share (phys 0x$P1 vs 0x$P2)"; FAIL=1
+fi
+
 exit $FAIL

@@ -18,6 +18,7 @@ mod initrd;
 mod interrupts;
 mod iommu;
 mod ipc;
+mod memobj;
 mod memory;
 mod sched;
 mod serial;

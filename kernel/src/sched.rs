@@ -262,6 +262,7 @@ fn maybe_destroy_process(proc: &Arc<Process>) {
     crate::ipc::unregister(proc.id);
     crate::vmx::close_process(proc);
     crate::eq::close_process(proc.id);
+    crate::memobj::close_process(proc);
     crate::caps::drop_process(proc.id);
     crate::futex::drop_process(proc.id);
     let freed = proc.aspace.lock().teardown();

@@ -108,6 +108,11 @@ int main() {
     long uar = spawn("uardemo", 7);
     println("[init] spawned uardemo (", static_cast<u64>(uar), ")");
 
+    // managarm memory objects: kernel-owned frames shared zero-copy with a
+    // peer through a delegated read-only capability
+    long shm = spawn("shmdemo", 7);
+    println("[init] spawned shmdemo (", static_cast<u64>(shm), ")");
+
     // services in ring 3: fsd owns the initrd, rtcd owns the cmos ports
     long fsd = spawn("fsd", 3);
     long rtcd = spawn("rtcd", 4);

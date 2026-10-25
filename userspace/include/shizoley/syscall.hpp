@@ -46,6 +46,11 @@ enum class Sys : u64 {
                               // until attached elsewhere (GDEV)
     guest_mmio = 35,   // (handle, sid, bar) -> bar size | -1; identity uc map
                        // of a pci memory bar into the guest ept (GMAP)
+    shm_create = 36,   // (npages) -> root capability token | -1; kernel-owned
+                       // memory object, dies with its owner
+    shm_map = 37,      // (handle, va) -> 0 | -1; map the frames rw or ro by
+                       // the caller's rights (SHM_RIGHT_R/W)
+    shm_unmap = 38,    // (handle) -> 0 | -1; take this mapping down
 };
 
 // ps(28) record, filled by the kernel (name is NUL-padded)
@@ -100,6 +105,10 @@ constexpr u64 vexit_exception(u64 vector) {
     return 0x80000000u | (3u << 8) | (1u << 11) | vector;
 }
 
+// memory object rights (kernel caps.rs MMAP_R/MMAP_W)
+constexpr u64 SHM_RIGHT_R = 1;
+constexpr u64 SHM_RIGHT_W = 2;
+
 [[noreturn]] void exit(long code);
 
 long spawn(const char* name, u64 len);
@@ -130,6 +139,10 @@ long tsleep(u64 ms);
 // the word still equals expected (else 1, linux -EAGAIN shape)
 long futex_wait(u32* uaddr, u32 expected);
 long futex_wake(u32* uaddr, u64 n);
+
+long shm_create(u64 npages);
+long shm_map(long handle, u64 va);
+long shm_unmap(long handle);
 
 inline long syscall(Sys nr) {
     u64 ret = static_cast<u64>(nr);

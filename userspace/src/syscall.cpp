@@ -134,4 +134,16 @@ long futex_wake(u32* uaddr, u64 n) {
     return syscall(Sys::futex_wake, reinterpret_cast<u64>(uaddr), n);
 }
 
+long shm_create(u64 npages) {
+    return syscall(Sys::shm_create, npages);
+}
+
+long shm_map(long handle, u64 va) {
+    return syscall(Sys::shm_map, static_cast<u64>(handle), va);
+}
+
+long shm_unmap(long handle) {
+    return syscall(Sys::shm_unmap, static_cast<u64>(handle));
+}
+
 }

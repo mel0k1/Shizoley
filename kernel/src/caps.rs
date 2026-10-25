@@ -27,6 +27,7 @@ use spin::Mutex;
 pub const K_EQ: u32 = 1; // event queue
 pub const K_GUEST: u32 = 2; // vm guest (vmcs + ept + ram window)
 pub const K_GIFT: u32 = 3; // zero-copy page gift
+pub const K_MEM: u32 = 4; // memory object (kernel-owned shareable frames)
 
 // event queue rights
 pub const QPOST: u32 = 1; // eq_post into the queue
@@ -49,6 +50,11 @@ pub const GDEV: u32 = 64; // guest_device_attach/detach (iommu domain)
 pub const ZMAP: u32 = 1; // eq_zmap
 pub const ZDONE: u32 = 2; // eq_zdone
 
+// memory object rights
+pub const MMAP_R: u32 = 1; // shm_map read-only
+pub const MMAP_W: u32 = 2; // shm_map read-write
+pub const MGRANT: u32 = 4; // may re-grant subsets of its own rights
+
 // valid right bits per kind: grant refuses anything outside the mask,
 // so a child can never carry nonsense bits that outlive a kind change
 fn rights_mask(kind: u32) -> u32 {
@@ -56,6 +62,7 @@ fn rights_mask(kind: u32) -> u32 {
         K_EQ => QPOST | QWAIT | QKICK | QLISTEN | QSIGNAL | QGRANT,
         K_GUEST => GRUN | GMAP | GMODE | GPI | GDESTROY | GGRANT | GDEV,
         K_GIFT => ZMAP | ZDONE,
+        K_MEM => MMAP_R | MMAP_W | MGRANT,
         _ => 0,
     }
 }
@@ -79,6 +86,9 @@ impl Obj {
     }
     pub fn gift(id: u64) -> Obj {
         Obj { kind: K_GIFT, id }
+    }
+    pub fn mem(id: u64) -> Obj {
+        Obj { kind: K_MEM, id }
     }
 }
 
@@ -175,6 +185,7 @@ pub fn grant(token: u64, caller_pid: u64, target_pid: u64, bits: u32) -> Result<
     let grant_bit = match parent.obj.kind {
         K_EQ => QGRANT,
         K_GUEST => GGRANT,
+        K_MEM => MGRANT,
         _ => 0,
     };
     if grant_bit == 0 || parent.bits & grant_bit == 0 || bits & !parent.bits != 0 {
