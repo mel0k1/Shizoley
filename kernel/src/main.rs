@@ -40,6 +40,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     let mut mapper = memory::init(boot_info);
     allocator::init(&mut mapper).expect("heap init failed");
     uar::init();
+    memory::init_pat();
     serial_println!(
         "[paparaci] heap up, {} frames in use",
         memory::frames_used()

@@ -58,15 +58,42 @@ pub fn find_device(vendor: u16, device: u16) -> Option<u16> {
     None
 }
 
+// memory bar `index` of a pci function: (base, size), size probed the
+// standard way (write ~0, read the mask back, restore). io-space and
+// unimplemented bars come back as None
+pub fn pci_mem_bar(sid: u16, index: usize) -> Option<(u64, u64)> {
+    if index > 5 {
+        return None;
+    }
+    let off = 0x10 + index as u8 * 4;
+    let low = cfg_read(sid, off);
+    if low == 0 || low == 0xFFFF_FFFF || low & 1 != 0 || low & 0x6 == 0x2 {
+        return None;
+    }
+    let high = if low & 0x6 == 0x4 {
+        cfg_read(sid, off + 4)
+    } else {
+        0
+    };
+    cfg_write(sid, off, 0xFFFF_FFFF);
+    let mask = cfg_read(sid, off);
+    cfg_write(sid, off, low);
+    if mask == 0 || mask == 0xFFFF_FFFF {
+        return None;
+    }
+    let size = (!(mask & !0xF)).wrapping_add(1);
+    if size == 0 {
+        return None;
+    }
+    Some((
+        ((low & 0xFFFF_FFF0) as u64) | ((high as u64) << 32),
+        size as u64,
+    ))
+}
+
 // first mmio bar (32-bit) of a function
 fn mmio_bar(sid: u16) -> Option<u64> {
-    for i in 0u8..6 {
-        let v = cfg_read(sid, 0x10 + i * 4);
-        if v & 1 == 0 && v != 0 {
-            return Some((v & 0xFFFF_FFF0) as u64);
-        }
-    }
-    None
+    (0..6).find_map(|i| pci_mem_bar(sid, i).map(|(base, _)| base))
 }
 
 // e1000 (82540em) registers used here

@@ -1,10 +1,13 @@
 #!/bin/bash
-# tcg smoke for paparaci v0.15.0: device assignment (iommu domain dma)
+# tcg smoke for paparaci: full boot scenario (uar, caps, futex, iommu, guests)
 set -u
+export LD_LIBRARY_PATH=/home/z/my-project/.tools/usr/lib/x86_64-linux-gnu
+QEMU=/home/z/my-project/.tools/bin/qemu-system-x86_64
+QLIB=/home/z/my-project/.tools/usr/share/qemu
 IMG=/home/z/my-project/shizoley/kernel/target/x86_64-paparaci/debug/bootimage-paparaci.bin
 LOG=/home/z/my-project/shizoley/scripts/serial.log
 rm -f "$LOG"
-timeout 150 /home/z/my-project/.tools/bin/qemu-system-x86_64 \
+timeout 150 "$QEMU" -L "$QLIB" \
   -machine q35 -device intel-iommu,intremap=off \
   -device e1000,netdev=n0 -netdev user,id=n0 \
   -drive format=raw,file="$IMG" \
@@ -27,6 +30,9 @@ ck "ello] wait denied (no WAIT right): per-op caps ok"
 cke "\[eq\] zcopy: 8192 bytes via handle [0-9]+: pattern ok"
 ck "[eq] zcopy: gift 1 consumed (2 pages freed)"
 ck "[gdemo64] vmx unavailable (guest_create refused)"
+ck "[init] spawned devd"
+ck "[devd] vmx unavailable (guest_create refused)"
+ck "[pat] wb wt uc- uc wb wt uc- wc"
 ck "process 'init' (1) finished"
 ck "[vmx]"
 ck "[console] up: kernel sink attached"

@@ -44,6 +44,8 @@ enum class Sys : u64 {
                               // guest's iommu domain: bus<<8 | dev<<3 | fn (GDEV)
     guest_device_detach = 34, // (handle, sid) -> 0 | -1; device dma faults
                               // until attached elsewhere (GDEV)
+    guest_mmio = 35,   // (handle, sid, bar) -> bar size | -1; identity uc map
+                       // of a pci memory bar into the guest ept (GMAP)
 };
 
 // ps(28) record, filled by the kernel (name is NUL-padded)
@@ -113,6 +115,9 @@ long vcpu_run(long handle, VcpuExit* ve);
 long guest_destroy(long handle);
 long guest_mode(long handle, u64 mode);
 long guest_pi(long handle, u64 vector);
+long guest_device_attach(long handle, u64 sid);
+long guest_device_detach(long handle, u64 sid);
+long guest_mmio(long handle, u64 sid, u64 bar);
 long eq_alert(long qid);
 long ps(PsEntry* buf, u64 max);
 u64 ticks();

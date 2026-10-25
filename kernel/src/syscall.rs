@@ -289,6 +289,9 @@ extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
         // 34: guest_device_detach(handle, sid) -> 0 | -1; the device's dma
         //     faults until it is attached elsewhere (GDEV)
         34 => crate::vmx::guest_device_detach(a1, a2) as u64,
+        // 35: guest_mmio(handle, sid, bar) -> bar size | -1; identity uc map
+        //     of a pci memory bar into the guest ept + iommu mirror (GMAP)
+        35 => crate::vmx::guest_mmio_map(a1, a2, a3) as u64,
         _ => {
             println!("[paparaci] bad syscall {}", nr);
             serial_println!("[paparaci] bad syscall {}", nr);

@@ -971,6 +971,9 @@ const EPT_TABLE: u64 = EPT_R | EPT_W | EPT_X;
 const EPT_LEAF: u64 = EPT_R | EPT_W | EPT_X | EPT_WB;
 const EPT_PS_2M: u64 = 1 << 7;
 const EPT_LEAF_2M: u64 = EPT_LEAF | EPT_PS_2M;
+// emt bits 5:3 = 0 = uc: guest bar accesses stay uncached however the
+// guest programs its own pte pat (effective type is the weaker of the two)
+const EPT_MMIO: u64 = EPT_R | EPT_W;
 const TWO_MIB: u64 = 2 * 1024 * 1024;
 
 // guest phys window inside the creator's address space
@@ -1905,6 +1908,186 @@ pub fn guest_map(handle: u64, count: u64) -> i64 {
         old_len + count
     );
     (old_len + count) as i64
+}
+
+fn ept_read(f: PhysFrame<Size4KiB>, idx: usize) -> u64 {
+    unsafe {
+        core::ptr::read_volatile(
+            memory::phys_to_virt(f.start_address())
+                .as_ptr::<u64>()
+                .add(idx),
+        )
+    }
+}
+
+// the table frame an ept entry points at (entry value -> phys frame)
+fn frame_of(e: u64) -> PhysFrame<Size4KiB> {
+    PhysFrame::containing_address(x86_64::PhysAddr::new(e & !0xFFF))
+}
+
+fn ept_write(f: PhysFrame<Size4KiB>, idx: usize, v: u64) {
+    unsafe {
+        core::ptr::write_volatile(
+            memory::phys_to_virt(f.start_address())
+                .as_mut_ptr::<u64>()
+                .add(idx),
+            v,
+        )
+    }
+}
+
+// map memory bar `bar` of an attached pci device into the guest ept
+// identity (gpa = hpa) with emt = uc, mirrored into the iommu domain, so
+// the guest driver talks to the device through mmio like on real metal.
+// returns the bar size | -1 (GMAP; device must be in the guest's domain)
+pub fn guest_mmio_map(handle: u64, sid: u64, bar: u64) -> i64 {
+    if !vmx_ready() || sid > 0xFFFF || sid == 0 || bar > 5 {
+        return -1;
+    }
+    let cur = match crate::sched::current() {
+        Some(c) => c,
+        None => return -1,
+    };
+    let Some(obj) = caps::lookup(handle, cur.proc.id, caps::K_GUEST, caps::GMAP) else {
+        return -1;
+    };
+    let Some((base, size)) = crate::dma::pci_mem_bar(sid as u16, bar as usize) else {
+        serial_println!(
+            "[vmx] guest {}: bar {} of {:02x}:{:02x}.{} not a memory bar",
+            obj.id,
+            bar,
+            sid >> 8,
+            (sid >> 3) & 0x1F,
+            sid & 7
+        );
+        return -1;
+    };
+    if base + size > 1 << 39 || size.div_ceil(0x1000) > 512 {
+        serial_println!(
+            "[vmx] guest {}: bar {} too big ({} pages)",
+            obj.id,
+            bar,
+            size.div_ceil(0x1000)
+        );
+        return -1;
+    }
+    let pages = size.div_ceil(0x1000);
+    let mut guests = GUESTS.lock();
+    let Some(g) = guests.iter_mut().find(|g| g.id == obj.id) else {
+        return -1;
+    };
+    // the bar belongs to a device this guest owns: no domain, no map
+    if !g.domain.as_ref().is_some_and(|d| d.holds(sid as u16)) {
+        return -1;
+    }
+
+    // pass 1 (read-only): which mid tables are missing, in walk order, so
+    // every frame is allocated before the first ept write and a failed
+    // alloc never leaves a half-wired walk behind
+    let mut misses: Vec<u8> = Vec::new();
+    let mut last: (usize, usize, usize) = (usize::MAX, 0, 0);
+    for i in 0..pages {
+        let gpa = base + i * 0x1000;
+        let i4 = ((gpa >> 39) & 511) as usize;
+        let i3 = ((gpa >> 30) & 511) as usize;
+        let i2 = ((gpa >> 21) & 511) as usize;
+        let key = (i4, i3, i2);
+        if key == last {
+            continue;
+        }
+        last = key;
+        let e4 = ept_read(g.tables[0], i4);
+        if e4 & 1 == 0 {
+            misses.push(0);
+            misses.push(1);
+            misses.push(2);
+            continue;
+        }
+        let e3 = ept_read(frame_of(e4), i3);
+        if e3 & 1 == 0 {
+            misses.push(1);
+            misses.push(2);
+            continue;
+        }
+        let e2 = ept_read(frame_of(e3), i2);
+        if e2 & 1 == 0 {
+            misses.push(2);
+        }
+    }
+    let mut fresh: Vec<PhysFrame<Size4KiB>> = Vec::new();
+    for _ in 0..misses.len() {
+        match memory::alloc_frame() {
+            Some(f) => {
+                unsafe { zero_frame(f) };
+                fresh.push(f);
+            }
+            None => {
+                for f in &fresh {
+                    memory::dealloc_frame(*f);
+                }
+                return -1;
+            }
+        }
+    }
+
+    // pass 2: walk again, wire the fresh tables in the same order and
+    // fill the uc leaves
+    for i in 0..pages {
+        let gpa = base + i * 0x1000;
+        let i4 = ((gpa >> 39) & 511) as usize;
+        let i3 = ((gpa >> 30) & 511) as usize;
+        let i2 = ((gpa >> 21) & 511) as usize;
+        let i1 = ((gpa >> 12) & 511) as usize;
+        let e4 = ept_read(g.tables[0], i4);
+        let (pdpt_f, e3) = if e4 & 1 == 0 {
+            let f = fresh.remove(0);
+            g.tables.push(f);
+            ept_write(g.tables[0], i4, f.start_address().as_u64() | EPT_TABLE);
+            (f, f.start_address().as_u64())
+        } else {
+            (frame_of(e4), e4)
+        };
+        let (pd_f, e2) = if e3 & 1 == 0 {
+            let f = fresh.remove(0);
+            g.tables.push(f);
+            ept_write(pdpt_f, i3, f.start_address().as_u64() | EPT_TABLE);
+            (f, f.start_address().as_u64())
+        } else {
+            (frame_of(e3), e3)
+        };
+        let pt_f = if e2 & 1 == 0 {
+            let f = fresh.remove(0);
+            g.tables.push(f);
+            ept_write(pd_f, i2, f.start_address().as_u64() | EPT_TABLE);
+            f
+        } else {
+            frame_of(e2)
+        };
+        ept_write(pt_f, i1, gpa | EPT_MMIO);
+    }
+
+    let eptp = g.tables[0].start_address().as_u64();
+    if let Some(d) = g.domain.as_mut() {
+        for i in 0..pages {
+            if !d.map(base + i * 0x1000, x86_64::PhysAddr::new(base + i * 0x1000)) {
+                serial_println!("[iommu] guest {}: bar mirror failed at page {}", obj.id, i);
+                break;
+            }
+        }
+    }
+    drop(guests);
+    invept_all(eptp);
+    serial_println!(
+        "[vmx] guest {} mmio: bar {} of {:02x}:{:02x}.{} at gpa {:#x}, {} pages, uc",
+        obj.id,
+        bar,
+        sid >> 8,
+        (sid >> 3) & 0x1F,
+        sid & 7,
+        base,
+        pages
+    );
+    size as i64
 }
 
 // p4: route host irq `vector` into the guest's posted-interrupt

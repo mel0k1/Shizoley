@@ -57,6 +57,18 @@ long guest_mode(long handle, u64 mode) {
     return syscall(Sys::guest_mode, static_cast<u64>(handle), mode);
 }
 
+long guest_device_attach(long handle, u64 sid) {
+    return syscall(Sys::guest_device_attach, static_cast<u64>(handle), sid);
+}
+
+long guest_device_detach(long handle, u64 sid) {
+    return syscall(Sys::guest_device_detach, static_cast<u64>(handle), sid);
+}
+
+long guest_mmio(long handle, u64 sid, u64 bar) {
+    return syscall(Sys::guest_mmio, static_cast<u64>(handle), sid, bar);
+}
+
 long guest_pi(long handle, u64 vector) {
     return syscall(Sys::guest_pi, static_cast<u64>(handle), vector);
 }

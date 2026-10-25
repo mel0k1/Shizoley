@@ -126,6 +126,10 @@ int main() {
     long gd64 = spawn("gdemo64", 7);
     println("[init] spawned gdemo64 (", static_cast<u64>(gd64), ")");
 
+    // the driver-vm round: nic in the guest's iommu domain, bar0 as uc
+    long dd = spawn("devd", 4);
+    println("[init] spawned devd (", static_cast<u64>(dd), ")");
+
     // recv returns the sender pid; messages carry their own NUL
     request(fsd, "motd", 4, buf, sizeof(buf));
     buf[127] = '\0';

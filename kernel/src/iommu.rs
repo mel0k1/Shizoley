@@ -584,6 +584,11 @@ impl Domain {
         true
     }
 
+    // is the device in this domain right now
+    pub fn holds(&self, sid: u16) -> bool {
+        self.devices.iter().any(|(_, s)| *s == sid)
+    }
+
     pub fn detach(&mut self, sid: u16) -> bool {
         let Some(pos) = self.devices.iter().position(|(_, s)| *s == sid) else {
             return false;

@@ -149,6 +149,16 @@ pub fn init(boot_info: &'static BootInfo) -> OffsetPageTable<'static> {
     mapper
 }
 
+// program ia32_pat explicitly (linux layout): wb wt uc- uc wb wt uc- wc.
+// pa2 is what map_mmio's NO_CACHE (pcd=1) lands on — uncached device
+// access regardless of firmware defaults; pa7 = wc reserved for a future
+// framebuffer map
+pub fn init_pat() {
+    use x86_64::registers::model_specific::Msr;
+    unsafe { Msr::new(0x277).write(0x0107_0406_0007_0406) };
+    serial_log("[pat] wb wt uc- uc wb wt uc- wc");
+}
+
 fn init_bitmap(map: &MemoryMap, phys_offset: u64) {
     // usable span covered by the bitmap
     let mut min_frame = u64::MAX;

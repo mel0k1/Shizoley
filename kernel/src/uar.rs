@@ -170,6 +170,7 @@ paparaci_uar_to_end:
 
     .section .bss, "aw", @nobits
     .globl SMAP_OK
+    .p2align 3
 SMAP_OK:
     .quad 0
     "#,
