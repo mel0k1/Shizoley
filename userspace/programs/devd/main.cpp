@@ -5,13 +5,16 @@
 // is translated by the vt-d domain that mirrors the guest ept), a tx
 // completion by interrupt (the nic's host intx vector routed in via
 // guest_pi, posted as pir on apicv or entry-injected without), then the
-// rx side: a tiny network stack that answers arp and pings the gateway
-// back (icmp echo over qemu's user-net), all interrupt-driven — the
-// monitor only wakes the idle guest with a nudge vector. results come
-// over vmcall: 2 = the status read, 3 = the tx report (irq | dd<<8 |
-// tdh<<16 | icr<<24), 4 = ready with the mac, 5 = link status, 6 = an rx
-// packet report, 7 = the arp answer, 8 = the ping echo. under tcg (no
-// vmx) it reports and exits.
+// rx side: a tiny network stack that answers arp, pings the gateway back
+// (icmp echo over qemu's user-net) and echoes udp datagrams that arrive
+// for its service port 4242, all interrupt-driven — the monitor only
+// wakes the idle guest with a nudge vector. results come over vmcall:
+// 2 = the status read, 3 = the tx report (irq | dd<<8 | tdh<<16 |
+// icr<<24), 4 = ready with the mac, 5 = link status, 6 = an rx packet
+// report, 7 = the arp answer, 8 = the ping echo, 9 = the udp echo. after
+// the ping lands the monitor holds the guest for an extra window so a
+// udp datagram sent to the hostfwd port can complete the round. under
+// tcg (no vmx) it reports and exits.
 #include <shizoley/io.hpp>
 #include <shizoley/syscall.hpp>
 #include <shizoley/types.hpp>
@@ -151,6 +154,8 @@ int main() {
     bool ready = false;
     bool arp_ok = false;
     bool ping_ok = false;
+    bool udp_ok = false;
+    bool udp_window = false;
     u64 posted = 0;
     u64 start = ticks();
     u64 deadline = start + 600; // 6 s budget at 100 hz
@@ -227,11 +232,27 @@ int main() {
             } else if (rax == 8) {
                 ping_ok = true;
                 println("[devd] ping ok: echo reply seq ", rsi & 0xFFFF);
+            } else if (rax == 9) {
+                udp_ok = true;
+                u32 ip = static_cast<u32>(rdx >> 32);
+                println("[devd] udp echo: ", rsi, " bytes from ",
+                        static_cast<u64>((ip >> 24) & 0xFF), ".",
+                        static_cast<u64>((ip >> 16) & 0xFF), ".",
+                        static_cast<u64>((ip >> 8) & 0xFF), ".",
+                        static_cast<u64>(ip & 0xFF), ":",
+                        static_cast<u64>(rdx & 0xFFFF));
             } else {
                 println("[devd] bogus hypercall rax ", rax);
                 break;
             }
-            if (ping_ok) {
+            if (ping_ok && !udp_window) {
+                // keep the guest alive a little longer so a udp datagram
+                // sent to the hostfwd port can complete the round trip
+                udp_window = true;
+                deadline = ticks() + 300;
+            }
+            if ((ping_ok && udp_ok) ||
+                (udp_window && ticks() > deadline)) {
                 break;
             }
             continue;
@@ -271,6 +292,11 @@ int main() {
     } else if (ready) {
         println("[devd] rx incomplete: arp=", static_cast<u64>(arp_ok ? 1 : 0),
                 " ping=", static_cast<u64>(ping_ok ? 1 : 0));
+    }
+    if (udp_ok) {
+        println("[devd] udp ok: echo answered on port 4242");
+    } else if (udp_window) {
+        println("[devd] udp: no datagram in the window (nothing sent to 4242?)");
     }
     guest_device_detach(g, SID_E1000);
     guest_destroy(g);

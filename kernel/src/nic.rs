@@ -2,10 +2,13 @@ use x86_64::PhysAddr;
 
 // host-side rx smoke: the same descriptor math and packet layout the
 // driver-vm guest uses, driven from the kernel right after the dma/intx
-// smoke (which leaves the device released). the round trip against qemu's
+// smoke (which leaves the device released). the round trips against qemu's
 // user-net stack:
-//   arp request (who has 10.0.2.2) -> arp reply -> icmp echo -> echo reply.
-// ims is armed so the reply rides the nic's intx line (the same pic
+//   arp request (who has 10.0.2.2) -> arp reply -> icmp echo -> echo reply;
+//   dhcp discover as udp 68 -> 67 broadcast -> offer (slirp's built-in
+//   server, no external resolver involved) — the udp half of the stack,
+//   proven end to end without any host-side sender.
+// ims is armed so the replies ride the nic's intx line (the same pic
 // vector the dma smoke discovered), and icr is written back after every
 // drain — a level line nobody clears re-fires after each eoi. under tcg
 // this is the only full network proof that can run at all; the guest half
@@ -46,6 +49,7 @@ const RXBUF_SIZE: usize = 2048;
 // for one of the backend's identities)
 const OUR_IP: [u8; 4] = [10, 0, 2, 99];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
+const DHCP_XID: [u8; 4] = [0x53, 0x48, 0x5A, 0x01]; // "shz" + 1
 
 struct Regs(usize);
 
@@ -201,12 +205,12 @@ impl Ring {
 
 fn free_frames(
     ring: x86_64::structures::paging::PhysFrame,
-    rxbuf: x86_64::structures::paging::PhysFrame,
-    txbuf: x86_64::structures::paging::PhysFrame,
+    bufs: &[x86_64::structures::paging::PhysFrame],
 ) {
     crate::memory::dealloc_frame(ring);
-    crate::memory::dealloc_frame(rxbuf);
-    crate::memory::dealloc_frame(txbuf);
+    for f in bufs {
+        crate::memory::dealloc_frame(*f);
+    }
 }
 
 fn tx_arp_request(regs: &Regs, txring: PhysAddr, txbuf: PhysAddr, slot: usize, mac: &[u8; 6]) {
@@ -264,15 +268,56 @@ fn tx_icmp_echo(
     regs.wr(TDT, (slot + 1) as u32);
 }
 
-// drain filled descriptors; returns (arp_reply_seen, icmp_echo_reply_seen)
+// dhcp discover as a udp datagram: 68 -> 67 broadcast, src 0.0.0.0. the
+// udp checksum is left zero — ipv4 lets a sender skip it, slirp honors
+// that, and the reply is the offer from qemu's built-in server
+fn tx_dhcp_discover(regs: &Regs, txring: PhysAddr, txbuf: PhysAddr, slot: usize, mac: &[u8; 6]) {
+    let mut f = [0u8; 286];
+    let ip = 14usize;
+    let up = ip + 20usize;
+    let b = up + 8usize;
+    f[0..6].copy_from_slice(&[0xFF; 6]);
+    f[6..12].copy_from_slice(mac);
+    f[12..14].copy_from_slice(&[0x08, 0x00]);
+    f[ip] = 0x45;
+    f[ip + 2..ip + 4].copy_from_slice(&272u16.to_be_bytes());
+    f[ip + 4..ip + 6].copy_from_slice(&3u16.to_be_bytes()); // id
+    f[ip + 8] = 64; // ttl
+    f[ip + 9] = 17; // udp
+    f[ip + 16..ip + 20].copy_from_slice(&[255, 255, 255, 255]);
+    let c = checksum(&f[ip..ip + 20]);
+    f[ip + 10..ip + 12].copy_from_slice(&c.to_be_bytes());
+    f[up..up + 2].copy_from_slice(&68u16.to_be_bytes());
+    f[up + 2..up + 4].copy_from_slice(&67u16.to_be_bytes());
+    f[up + 4..up + 6].copy_from_slice(&252u16.to_be_bytes());
+    f[b] = 1; // bootrequest
+    f[b + 1] = 1; // htype: ethernet
+    f[b + 2] = 6; // hlen: mac
+    f[b + 4..b + 8].copy_from_slice(&DHCP_XID);
+    f[b + 10..b + 12].copy_from_slice(&0x8000u16.to_be_bytes()); // broadcast
+    f[b + 28..b + 34].copy_from_slice(mac); // chaddr
+    f[b + 236..b + 240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+    f[b + 240] = 53; // dhcp message type
+    f[b + 241] = 1;
+    f[b + 242] = 1; // discover
+    f[b + 243] = 255;
+    let gpa = TXBUF_GPA + (slot * RXBUF_SIZE) as u64;
+    poke(txbuf, slot * RXBUF_SIZE, &f);
+    tx_post(txring, slot, gpa, f.len());
+    regs.wr(TDT, (slot + 1) as u32);
+}
+
+// drain filled descriptors; returns (arp_reply_seen, icmp_echo_reply_seen,
+// dhcp offer address)
 fn drain(
     regs: &Regs,
     st: &mut Ring,
     rxring: PhysAddr,
     rxbuf: PhysAddr,
     gw_mac: &mut [u8; 6],
-) -> (bool, bool) {
+) -> (bool, bool, Option<[u8; 4]>) {
     let (mut arp_ok, mut icmp_ok) = (false, false);
+    let mut udp = None;
     let mut guard = 0;
     while guard < NDESC {
         guard += 1;
@@ -281,7 +326,7 @@ fn drain(
         }
         let len = rx_len(rxring, st.cursor) as usize;
         if (34..=RXBUF_SIZE).contains(&len) {
-            let mut pkt = [0u8; 80];
+            let mut pkt = [0u8; 512];
             let take = len.min(pkt.len());
             peek(rxbuf, st.cursor * RXBUF_SIZE, &mut pkt[..take]);
             let etype = ((pkt[12] as u16) << 8) | pkt[13] as u16;
@@ -289,15 +334,48 @@ fn drain(
                 gw_mac.copy_from_slice(&pkt[22..28]);
                 arp_ok = true;
             }
-            if etype == 0x0800 && len >= 14 + 20 + 8 && pkt[14 + 9] == 1 && pkt[14 + 20] == 0 {
-                icmp_ok = true;
+            if etype == 0x0800 && len >= 14 + 20 + 8 {
+                let ihl = ((pkt[14] & 0xF) * 4) as usize;
+                if pkt[14 + 9] == 1 && pkt[14 + 20] == 0 {
+                    icmp_ok = true;
+                }
+                if pkt[14 + 9] == 17 && ihl >= 20 && len >= 14 + ihl + 8 + 4 {
+                    let b = 14 + ihl + 8; // bootp payload
+                    let sport = ((pkt[14 + ihl] as u16) << 8) | pkt[14 + ihl + 1] as u16;
+                    let dport = ((pkt[14 + ihl + 2] as u16) << 8) | pkt[14 + ihl + 3] as u16;
+                    let reply = b + 240 <= take
+                        && sport == 67
+                        && dport == 68
+                        && pkt[b] == 2
+                        && pkt[b + 4..b + 8] == DHCP_XID
+                        && pkt[b + 236..b + 240] == [0x63, 0x82, 0x53, 0x63];
+                    if reply {
+                        let mut i = b + 240;
+                        while i + 1 < take {
+                            let code = pkt[i];
+                            if code == 0 {
+                                i += 1;
+                                continue;
+                            }
+                            if code == 255 {
+                                break;
+                            }
+                            let l = pkt[i + 1] as usize;
+                            if code == 53 && l == 1 && pkt[i + 2] == 2 {
+                                udp = Some([pkt[b + 16], pkt[b + 17], pkt[b + 18], pkt[b + 19]]);
+                                break;
+                            }
+                            i += 2 + l;
+                        }
+                    }
+                }
             }
         }
         rx_clear(rxring, st.cursor);
         regs.wr(RDT, st.cursor as u32);
         st.cursor = (st.cursor + 1) % NDESC;
     }
-    (arp_ok, icmp_ok)
+    (arp_ok, icmp_ok, udp)
 }
 
 pub fn smoke() {
@@ -308,19 +386,23 @@ pub fn smoke() {
     let Some(bar) = mmio_bar(sid) else {
         return;
     };
-    let (Some(ring), Some(rxbuf), Some(txbuf)) = (
-        crate::memory::alloc_frame(),
-        crate::memory::alloc_frame(),
-        crate::memory::alloc_frame(),
-    ) else {
+    let Some(ring) = crate::memory::alloc_frame() else {
+        return;
+    };
+    // buffers live in four physically consecutive frames: rx slots 0..4 in
+    // the first pair, tx slots 0..4 in the second — slot 2 pokes and dmas
+    // past a single frame's 4096-byte end, so singles would corrupt the
+    // page that happens to follow
+    let Some(bufs) = crate::memory::alloc_frames_aligned(4, 0x1000) else {
+        crate::memory::dealloc_frame(ring);
         return;
     };
     let regs_virt = crate::memory::map_mmio(bar, 32);
     let regs = Regs(regs_virt.as_u64() as usize);
     let rxring = ring.start_address();
     let txring = ring.start_address() + 0x100u64;
-    let rxbuf_p = rxbuf.start_address();
-    let txbuf_p = txbuf.start_address();
+    let rxbuf_p = bufs[0].start_address();
+    let txbuf_p = bufs[2].start_address();
 
     // mac from the device's reset value; ral/rah must be armed with the
     // valid bit (31): without it the unicast filter drops every reply
@@ -339,7 +421,7 @@ pub fn smoke() {
         Some(d) => d,
         None => {
             crate::serial_println!("[nic] no domain — rx smoke skipped");
-            free_frames(ring, rxbuf, txbuf);
+            free_frames(ring, &bufs);
             return;
         }
     };
@@ -352,7 +434,7 @@ pub fn smoke() {
     if !ok {
         crate::serial_println!("[nic] setup failed — rx smoke skipped");
         drop(dom);
-        free_frames(ring, rxbuf, txbuf);
+        free_frames(ring, &bufs);
         return;
     }
     enable_device(sid);
@@ -400,6 +482,9 @@ pub fn smoke() {
     let mut arp_seen = false;
     let mut ping_ok = false;
     let mut ping_sent = false;
+    let mut dhcp_sent = false;
+    let mut dhcp_start = 0u64;
+    let mut udp_offer: Option<[u8; 4]> = None;
 
     tx_arp_request(&regs, txring, txbuf_p, 0, &mac);
     let _ = tx_done(txring, 0);
@@ -410,7 +495,7 @@ pub fn smoke() {
         if icr != 0 {
             regs.wr(ICR, icr); // deassert intx: level lines re-fire after eoi
         }
-        let (a, p) = drain(&regs, &mut ring_state, rxring, rxbuf_p, &mut gw_mac);
+        let (a, p, u) = drain(&regs, &mut ring_state, rxring, rxbuf_p, &mut gw_mac);
         if a && !arp_seen {
             crate::serial_println!(
                 "[nic] arp reply: {}.{}.{}.{} at {}",
@@ -426,15 +511,44 @@ pub fn smoke() {
         }
         arp_seen |= a;
         ping_ok |= p;
+        if let Some(ip) = u {
+            if udp_offer.is_none() {
+                udp_offer = Some(ip);
+                crate::serial_println!(
+                    "[nic] udp: dhcp offer for {}.{}.{}.{} (xid 0x53485a01)",
+                    ip[0],
+                    ip[1],
+                    ip[2],
+                    ip[3]
+                );
+            }
+        }
+        if ping_ok && !dhcp_sent {
+            tx_dhcp_discover(&regs, txring, txbuf_p, 2, &mac);
+            let _ = tx_done(txring, 2);
+            dhcp_sent = true;
+            dhcp_start = crate::interrupts::tick_count();
+        }
         // the ping reply may sit in qemu's rx flush queue for up to a
-        // second after the last rctl write — do not give up before that
-        if ping_ok || (ping_sent && crate::interrupts::tick_count() > start + 150) {
+        // second after the last rctl write — do not give up before that;
+        // once the discover is out, the offer gets the same slack
+        let quiet_after = if dhcp_sent {
+            dhcp_start + 150
+        } else {
+            start + 150
+        };
+        if udp_offer.is_some()
+            || (ping_ok && dhcp_sent && crate::interrupts::tick_count() > quiet_after)
+            || (!ping_ok && ping_sent && crate::interrupts::tick_count() > start + 150)
+        {
             break;
         }
     }
-    let _ = ping_sent;
     if arp_seen && ping_ok {
         crate::serial_println!("[nic] rx ok: arp + icmp echo round trip (host smoke)");
+        if udp_offer.is_some() {
+            crate::serial_println!("[nic] udp ok: dhcp discover -> offer round trip");
+        }
     } else if !arp_seen {
         crate::serial_println!("[nic] arp got no reply (no netdev or link down)");
     } else {
@@ -447,6 +561,6 @@ pub fn smoke() {
     regs.wr(TCTL, 0);
     regs.wr(ICR, 0xFFFF_FFFF);
     drop(dom);
-    free_frames(ring, rxbuf, txbuf);
+    free_frames(ring, &bufs);
     crate::serial_println!("[nic] down: device released");
 }

@@ -6,13 +6,14 @@
 // interrupts: the monitor routes the nic's host vector into the guest
 // (guest_pi), the kernel posts it (pir on apicv, entry injection without),
 // and the idt handler here drains the rx ring. the stack is small but
-// real: arp replies for our address and icmp echo answers to the gateway
-// (qemu's user-net reflects pings to 10.0.2.2), so a complete
-// request -> reply round trip happens without any host code. the results
-// travel to the monitor over vmcall: nr 2 = the status read, nr 3 = the
-// tx report (irq | dd<<8 | tdh<<16 | icr<<24), nr 4 = ready with the mac,
-// nr 5 = link status, nr 6 = an rx packet report, nr 7 = the arp answer,
-// nr 8 = the ping echo.
+// real: arp replies for our address, icmp echo answers to the gateway
+// (qemu's user-net reflects pings to 10.0.2.2), and a udp echo service on
+// port 4242 — a complete request -> reply round trip happens without any
+// host code. the results travel to the monitor over vmcall: nr 2 = the
+// status read, nr 3 = the tx report (irq | dd<<8 | tdh<<16 | icr<<24),
+// nr 4 = ready with the mac, nr 5 = link status, nr 6 = an rx packet
+// report, nr 7 = the arp answer, nr 8 = the ping echo, nr 9 = the udp
+// echo (rsi = payload bytes, rdx = sender ip<<32 | sender port).
 typedef unsigned long u64;
 typedef unsigned int u32;
 typedef unsigned short u16;
@@ -54,6 +55,7 @@ typedef unsigned char u8;
 
 #define OUR_IP 0x6302000AUL /* 10.0.2.99, wire order */
 #define GW_IP 0x0202000AUL  /* 10.0.2.2, wire order */
+#define ECHO_PORT 4242      /* the udp echo service */
 
 static inline u64 hyper3(u64 nr, u64 a1, u64 a2) {
     u64 r;
@@ -94,6 +96,7 @@ __asm__(".text\n"
 static u32 irq_count; /* in .bss: the flat blob stays small */
 static u32 rx_cursor; /* next descriptor to consume = (rdt + 1) % nrx */
 static u32 tx_slot;
+static u16 ip_id;
 static u64 our_mac;
 static u64 gw_mac;
 
@@ -132,9 +135,8 @@ static void put32(volatile u8 *p, u32 v) {
     p[3] = (u8)v;
 }
 
-/* internet checksum over a wire-order span */
-static u16 cksum(volatile const u8 *p, u32 n) {
-    u32 sum = 0;
+/* internet checksum accumulation over a wire-order span */
+static u32 sum_add(volatile const u8 *p, u32 n, u32 sum) {
     u32 i = 0;
     while (i + 1 < n) {
         sum += ((u32)p[i] << 8) | p[i + 1];
@@ -143,10 +145,33 @@ static u16 cksum(volatile const u8 *p, u32 n) {
     if (i < n) {
         sum += (u32)p[i] << 8;
     }
+    return sum;
+}
+
+static u16 finish_sum(u32 sum) {
     while (sum > 0xFFFF) {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     return (u16)~sum;
+}
+
+static u16 cksum(volatile const u8 *p, u32 n) {
+    return finish_sum(sum_add(p, n, 0));
+}
+
+/* udp checksum: pseudo-header (src, dst, zero, proto, len) + datagram;
+ * a computed zero must go out as 0xFFFF (0 means "not computed") */
+static u16 udp_cksum(volatile const u8 *u, u16 ulen, u32 src, u32 dst) {
+    u8 ph[12];
+    put32(ph, src);
+    put32(ph + 4, dst);
+    ph[8] = 0;
+    ph[9] = 17;
+    put16(ph + 10, ulen);
+    u32 sum = sum_add(ph, 12, 0);
+    sum = sum_add(u, ulen, sum);
+    u16 c = finish_sum(sum);
+    return c ? c : 0xFFFF;
 }
 
 /* post the tx buffer at the cursor and wait for the writeback */
@@ -248,6 +273,50 @@ static void do_icmp(volatile const u8 *pkt, u16 len) {
     hyper(8, be16(ic + 6), 0);
 }
 
+/* echo a udp datagram addressed to our service port back to its sender */
+static void do_udp(volatile const u8 *pkt, u16 len) {
+    u32 ihl = (u32)(pkt[14] & 0xF) * 4;
+    if (pkt[23] != 17 || ihl < 20 || len < 14 + ihl + 8) {
+        return;
+    }
+    volatile const u8 *u = pkt + 14 + ihl;
+    u16 ulen = be16(u + 4);
+    u16 sport = be16(u);
+    u16 dport = be16(u + 2);
+    if (dport != ECHO_PORT || ulen < 8 || ulen > BUFSZ ||
+        14u + ihl + ulen > (u32)len) {
+        return;
+    }
+    u32 dst_ip = be32(pkt + 26); /* the sender's address, wire order */
+    volatile u8 *r = (volatile u8 *)(TXBUF + (u64)tx_slot * BUFSZ);
+    for (u32 i = 0; i < 14u + 20u + ulen; ++i) {
+        r[i] = 0;
+    }
+    for (int i = 0; i < 6; ++i) {
+        r[i] = pkt[6 + i]; /* dst = sender mac */
+        r[6 + i] = ((volatile const u8 *)&our_mac)[i];
+    }
+    put16(r + 12, 0x0800);
+    r[14] = 0x45;
+    put16(r + 16, (u16)(20 + ulen));
+    put16(r + 18, ip_id++);
+    r[22] = 64; /* ttl */
+    r[23] = 17; /* udp */
+    put32(r + 26, OUR_IP);
+    put32(r + 30, dst_ip);
+    put16(r + 24, cksum(r + 14, 20));
+    volatile u8 *ru = r + 34;
+    for (u16 i = 0; i < ulen; ++i) {
+        ru[i] = u[i];
+    }
+    put16(ru, dport);     /* our source port = the service port */
+    put16(ru + 2, sport); /* reply to the sender's port */
+    put16(ru + 4, ulen);
+    put16(ru + 6, udp_cksum(ru, ulen, OUR_IP, dst_ip));
+    tx_send((u16)(34 + ulen));
+    hyper(9, ulen - 8, ((u64)dst_ip << 32) | sport);
+}
+
 static void handle_pkt(volatile u8 *pkt, u16 len) {
     u16 et = be16(pkt + 12);
     u32 src = et == 0x0806 ? be32(pkt + 28) : be32(pkt + 26);
@@ -255,7 +324,11 @@ static void handle_pkt(volatile u8 *pkt, u16 len) {
     if (et == 0x0806) {
         do_arp(pkt);
     } else if (et == 0x0800) {
-        do_icmp(pkt, len);
+        if (pkt[23] == 17) {
+            do_udp(pkt, len);
+        } else {
+            do_icmp(pkt, len);
+        }
     }
 }
 

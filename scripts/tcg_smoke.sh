@@ -85,6 +85,9 @@ fi
 ck "[nic] mac 52:54:00:12:34:56"
 ck "[nic] arp reply: 10.0.2.2 at 52:55:0a:00:02:02"
 ck "[nic] rx ok: arp + icmp echo round trip (host smoke)"
+# v0.22.0: the udp half — dhcp discover -> offer against slirp's server
+ck "[nic] udp: dhcp offer for 10.0.2.15"
+ck "[nic] udp ok: dhcp discover -> offer round trip"
 ck "[nic] down: device released"
 
 exit $FAIL
