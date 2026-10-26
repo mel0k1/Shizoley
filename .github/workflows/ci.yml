@@ -90,6 +90,10 @@ jobs:
           grep -qF "[iommu] fault: 0x0010 0x8000 read (not readable)" serial.log
           grep -qF "[iommu] device 00:02.0 out of domain " serial.log
           grep -qE "\[nic\] intx: pin [0-9]+ line [0-9]+ -> vector 0x[0-9a-f]+ \(unmasked\)" serial.log
+          grep -qF "[nic] mac 52:54:00:12:34:56" serial.log
+          grep -qF "[nic] arp reply: 10.0.2.2 at 52:55:0a:00:02:02" serial.log
+          grep -qF "[nic] rx ok: arp + icmp echo round trip (host smoke)" serial.log
+          grep -qF "[nic] down: device released" serial.log
           grep -qF "(dd set, via irq" serial.log
           grep -qF "[pat] wb wt uc- uc wb wt uc- wc" serial.log
           grep -qF "[init] spawned devd" serial.log

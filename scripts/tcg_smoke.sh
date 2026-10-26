@@ -81,4 +81,10 @@ else
   echo "MISS zero-copy share (phys 0x$P1 vs 0x$P2)"; FAIL=1
 fi
 
+# v0.21.0: host rx smoke — arp + icmp echo round trip on the intx path
+ck "[nic] mac 52:54:00:12:34:56"
+ck "[nic] arp reply: 10.0.2.2 at 52:55:0a:00:02:02"
+ck "[nic] rx ok: arp + icmp echo round trip (host smoke)"
+ck "[nic] down: device released"
+
 exit $FAIL

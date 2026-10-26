@@ -1,13 +1,17 @@
 // devd — the driver-vm round: the nic goes into the guest's iommu domain,
 // its bar0 is mapped into the guest ept identity as uc (emt 0, the guest
-// pat can never make it cacheable) and the guest runs a REAL e1000 tx
-// driver (guest.c): it programs the tx ring in guest ram (gpa addresses —
-// the nic's dma is translated by the vt-d domain that mirrors the guest
-// ept), kicks one descriptor and waits for the tx-completion interrupt —
-// the nic's host intx vector is routed into the guest (guest_pi, 27) and
-// the kernel posts it (pir on apicv, entry injection without). results
-// come over vmcall: 2 = the status read, 3 = the tx report (irq | dd<<8 |
-// tdh<<16 | icr<<24). under tcg (no vmx) it reports and exits.
+// pat can never make it cacheable) and the guest runs a REAL e1000 driver
+// (guest.c): tx and rx rings in guest ram (gpa addresses — the nic's dma
+// is translated by the vt-d domain that mirrors the guest ept), a tx
+// completion by interrupt (the nic's host intx vector routed in via
+// guest_pi, posted as pir on apicv or entry-injected without), then the
+// rx side: a tiny network stack that answers arp and pings the gateway
+// back (icmp echo over qemu's user-net), all interrupt-driven — the
+// monitor only wakes the idle guest with a nudge vector. results come
+// over vmcall: 2 = the status read, 3 = the tx report (irq | dd<<8 |
+// tdh<<16 | icr<<24), 4 = ready with the mac, 5 = link status, 6 = an rx
+// packet report, 7 = the arp answer, 8 = the ping echo. under tcg (no
+// vmx) it reports and exits.
 #include <shizoley/io.hpp>
 #include <shizoley/syscall.hpp>
 #include <shizoley/types.hpp>
@@ -18,11 +22,13 @@ using namespace shz;
 
 namespace {
 
-// guest phys layout (64 kib of guest ram):
+// guest phys layout (224 kib of guest ram: 16 base pages + 40 grown):
 //   0x1000 pml4  0x2000 pdpt  0x3000 pd (identity 2 MiB leaves for ram)
 //   0x4000 pdpt for pml4[3]   0x5000 pd for the bar's 1 gib region
-//   0x6000+ pt frames for the bar window   0x8000 gdt   0x9000 code
-//   0xA000 tx ring (nic dma target)        0xB000 tx payload
+//   0x6000+ pt frames for the bar window   0x7000 guest idt  0x8000 gdt
+//   0x9000 code   0xC008 nic host vector handed to the guest
+//   0x10000 rx ring (64x16)  0x11000 rx buffers (64x2048)
+//   0x32000 tx ring (4x16)   0x33000 tx payload
 constexpr u64 GPA_PML4 = 0x1000;
 constexpr u64 GPA_PDPT = 0x2000;
 constexpr u64 GPA_PD = 0x3000;
@@ -33,8 +39,10 @@ constexpr u64 GPA_GDT = 0x8000;
 constexpr u64 ENTRY_RIP = 0x9000; // guest.c is linked with -Ttext=0x9000
 constexpr u64 ENTRY_RSP = 0xF000;
 constexpr u64 GPA_VEC = 0xC008;   // nic host vector handed to the guest
+constexpr u64 GROW_PAGES = 40;    // guest ram: 16 + 40 = 224 kib
 
 constexpr u64 SID_E1000 = 0x0010; // 00:02.0 on the reference qemu command line
+constexpr u64 NUDGE_VECTOR = 0x22; // the monitor's wake vector (see guest.c)
 
 void puthex(u64 v) {
     static const char digits[] = "0123456789abcdef";
@@ -57,6 +65,11 @@ int main() {
     if (g < 0) {
         println("[devd] vmx unavailable (guest_create refused)");
         return 0;
+    }
+    if (guest_map(g, GROW_PAGES) < 0) {
+        println("[devd] guest_map refused");
+        guest_destroy(g);
+        return 1;
     }
     if (guest_device_attach(g, SID_E1000) != 0) {
         println("[devd] device 00:02.0 attach refused");
@@ -135,11 +148,26 @@ int main() {
     long reason = -1;
     bool ok = false;
     bool tx_ok = false;
+    bool ready = false;
+    bool arp_ok = false;
+    bool ping_ok = false;
     u64 posted = 0;
-    for (int i = 0; i < 1000; ++i) {
+    u64 start = ticks();
+    u64 deadline = start + 600; // 6 s budget at 100 hz
+    for (;;) {
         reason = vcpu_run(g, &ve);
         if (reason < 0) {
+            // vm-entry refuses events while the guest sits in an sti
+            // shadow: drop the injection, the next nudge picks up
+            if (ve.flags & EXIT_INJECT) {
+                ve.flags = 0;
+                continue;
+            }
             println("[devd] vcpu_run failed");
+            break;
+        }
+        if (ticks() > deadline) {
+            println("[devd] budget exhausted");
             break;
         }
         if (reason == static_cast<long>(VmxExit::ext_int) ||
@@ -147,11 +175,14 @@ int main() {
             if (reason == static_cast<long>(VmxExit::ext_int) && ve.out[3] != 0) {
                 posted++;
             }
+            ve.flags = 0;
             continue;
         }
         if (reason == static_cast<long>(VmxExit::vmcall)) {
             u64 rax = ve.out[4];
+            u64 rdx = ve.out[7];
             u64 rsi = ve.out[8];
+            ve.flags = 0;
             if (rax == 2) {
                 print("[devd] bar0 status = ");
                 puthex(rsi);
@@ -171,11 +202,38 @@ int main() {
                     println("[devd] completion by interrupt: ", posted,
                             " exit(s) posted");
                 }
+            } else if (rax == 4) {
+                ready = true;
+                print("[devd] guest live: mac ");
+                puthex(rsi);
+                print(" ");
+                puthex(rdx & 0xFFFF);
+                println("");
+            } else if (rax == 5) {
+                print("[devd] link status = ");
+                puthex(rsi);
+                println("");
+            } else if (rax == 6) {
+                print("[devd] rx: len=");
+                print(rsi);
+                print(" type=");
+                puthex(rdx >> 32);
+                print(" peer=");
+                puthex(rdx & 0xFFFFFFFF);
+                println("");
+            } else if (rax == 7) {
+                arp_ok = true;
+                println("[devd] arp answered for our address");
+            } else if (rax == 8) {
+                ping_ok = true;
+                println("[devd] ping ok: echo reply seq ", rsi & 0xFFFF);
             } else {
                 println("[devd] bogus hypercall rax ", rax);
                 break;
             }
-            ve.flags = 0;
+            if (ping_ok) {
+                break;
+            }
             continue;
         }
         if (reason == static_cast<long>(VmxExit::ept_violation)) {
@@ -191,7 +249,12 @@ int main() {
             break;
         }
         if (reason == static_cast<long>(VmxExit::hlt)) {
-            break;
+            // idle: wake the guest with the nudge so packets that landed
+            // while it slept are drained, then pace the loop
+            ve.flags = EXIT_INJECT;
+            ve.inject = vexit_extint(NUDGE_VECTOR);
+            tsleep(30);
+            continue;
         }
         println("[devd] unexpected exit ", static_cast<u64>(reason));
         break;
@@ -203,10 +266,16 @@ int main() {
     if (tx_ok) {
         println("[devd] driver vm ok: tx through the guest's own ring");
     }
+    if (ready && arp_ok && ping_ok) {
+        println("[devd] rx path ok: irq-driven arp + icmp echo in the guest");
+    } else if (ready) {
+        println("[devd] rx incomplete: arp=", static_cast<u64>(arp_ok ? 1 : 0),
+                " ping=", static_cast<u64>(ping_ok ? 1 : 0));
+    }
     guest_device_detach(g, SID_E1000);
     guest_destroy(g);
     println("[devd] device detached, guest destroyed");
-    return (ok && tx_ok) ? 0 : 1;
+    return (ok && tx_ok && ready && arp_ok && ping_ok) ? 0 : 1;
 }
 
 } // namespace shz

@@ -32,7 +32,7 @@ fn cfg_write(sid: u16, off: u8, v: u32) {
 
 // memory + bus master: without the master bit the device's dma reads
 // never leave the pci stub and never reach the iommu
-fn enable_device(sid: u16) {
+pub fn enable_device(sid: u16) {
     let cmd = cfg_read(sid, 0x04);
     cfg_write(sid, 0x04, cmd | 0x6);
 }
@@ -95,7 +95,7 @@ pub fn pci_mem_bar(sid: u16, index: usize) -> Option<(u64, u64)> {
 }
 
 // first mmio bar (32-bit) of a function
-fn mmio_bar(sid: u16) -> Option<u64> {
+pub fn mmio_bar(sid: u16) -> Option<u64> {
     (0..6).find_map(|i| pci_mem_bar(sid, i).map(|(base, _)| base))
 }
 

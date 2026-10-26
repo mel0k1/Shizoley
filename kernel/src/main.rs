@@ -20,6 +20,7 @@ mod iommu;
 mod ipc;
 mod memobj;
 mod memory;
+mod nic;
 mod sched;
 mod serial;
 mod syscall;
@@ -87,6 +88,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // process exists: devd in ring 3 builds the driver vm on the same nic,
     // and both sides rewriting the device's context entry would race
     dma::smoke();
+    // host rx smoke: arp + icmp echo round trip with the same ring and
+    // buffer layout the guest driver uses — the tcg-verifiable half of
+    // the rx path; the guest half (devd) needs a vmx host
+    crate::nic::smoke();
     // spawns atomic vs the timer so the schedule is deterministic
     x86_64::instructions::interrupts::without_interrupts(|| match user::spawn_process("init") {
         Some(pid) => {
