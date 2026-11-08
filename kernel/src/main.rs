@@ -25,6 +25,7 @@ mod sched;
 mod serial;
 mod syscall;
 mod task;
+mod tcp;
 mod uar;
 mod user;
 mod vga;

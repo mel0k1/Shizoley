@@ -9,7 +9,7 @@ LOG=/home/z/my-project/shizoley/scripts/serial.log
 rm -f "$LOG"
 timeout 150 "$QEMU" -L "$QLIB" \
   -machine q35 -device intel-iommu,intremap=off \
-  -device e1000,netdev=n0 -netdev user,id=n0 \
+  -device e1000,netdev=n0 -netdev user,id=n0,hostfwd=udp:127.0.0.1:4242-10.0.2.99:4242,guestfwd=tcp:10.0.2.100:7-cmd:cat \
   -drive format=raw,file="$IMG" \
   -display none -serial file:"$LOG" -no-reboot -no-shutdown
 rc=$?
@@ -88,6 +88,15 @@ ck "[nic] rx ok: arp + icmp echo round trip (host smoke)"
 # v0.22.0: the udp half — dhcp discover -> offer against slirp's server
 ck "[nic] udp: dhcp offer for 10.0.2.15"
 ck "[nic] udp ok: dhcp discover -> offer round trip"
+
+# v0.23.0: the tcp half — full client round against the user-net echo
+# (guestfwd cmd:cat), rto retransmits proven by the injected bad checksums
+ck "[nic] tcp connect ok (mss "
+ck "[nic] tcp acked 4096 bytes"
+ck "[nic] tcp rtx: syn 1 data 1 fin 0"
+ck "[nic] tcp echo ok: 4096 bytes"
+ck "[nic] tcp closed ok (rtx syn 1 data 1 fin 0)"
+ck "[nic] tcp ok: connect+data+echo+close (host smoke)"
 ck "[nic] down: device released"
 
 exit $FAIL

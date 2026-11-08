@@ -17,7 +17,7 @@ run:
 # the guest's udp echo on 4242 is reachable through hostfwd:
 #   echo hello | nc -u -w1 127.0.0.1 4242
 run-kvm:
-        qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -device intel-iommu,intremap=off -device e1000,netdev=n0 -netdev user,id=n0,hostfwd=udp:127.0.0.1:4242-10.0.2.99:4242 -drive format=raw,file=kernel/target/x86_64-paparaci/debug/bootimage-paparaci.bin -serial stdio
+        qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -device intel-iommu,intremap=off -device e1000,netdev=n0 -netdev user,id=n0,hostfwd=udp:127.0.0.1:4242-10.0.2.99:4242,guestfwd=tcp:10.0.2.100:7-cmd:cat -drive format=raw,file=kernel/target/x86_64-paparaci/debug/bootimage-paparaci.bin -serial stdio
 
 lint:
         cargo clippy --manifest-path kernel/Cargo.toml -- -D warnings

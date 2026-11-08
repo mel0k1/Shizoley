@@ -15,6 +15,8 @@ use x86_64::PhysAddr;
 // of the same path runs in devd on a vmx host.
 
 use crate::dma::{enable_device, find_device, mmio_bar};
+use crate::tcp::{Conn, OUR_IP, SERVER_IP};
+use alloc::boxed::Box;
 
 const ICR: usize = 0x00C0;
 const IMS: usize = 0x00D0;
@@ -41,13 +43,11 @@ const NDESC: usize = 8;
 const RXRING_GPA: u64 = 0x4000;
 const TXRING_GPA: u64 = 0x4100;
 const RXBUF_GPA: u64 = 0x8000;
-const TXBUF_GPA: u64 = 0xA000;
+const TXBUF_GPA: u64 = 0xC000;
 const RXBUF_SIZE: usize = 2048;
 
-// the slirp corner of qemu user-net (10.0.2.99 as our own address: outside
-// the set slirp itself answers for, so the arp sender is never mistaken
-// for one of the backend's identities)
-const OUR_IP: [u8; 4] = [10, 0, 2, 99];
+// the slirp corner of qemu user-net (our address lives in tcp.rs next to
+// the server address so the ip wrap and the checksums share one source)
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
 const DHCP_XID: [u8; 4] = [0x53, 0x48, 0x5A, 0x01]; // "shz" + 1
 
@@ -378,6 +378,177 @@ fn drain(
     (arp_ok, icmp_ok, udp)
 }
 
+// rx slot -> frame math for the tcp round: rx slots 0..8 live in frames
+// 0..3 of the aligned run, tx slots 0..4 in frames 4..5
+fn pool_peek(bufs: &[x86_64::structures::paging::PhysFrame], slot: usize, out: &mut [u8]) {
+    let base = bufs[slot / 2].start_address();
+    let off = (slot % 2) * RXBUF_SIZE;
+    peek(base, off, out);
+}
+
+fn pool_poke(bufs: &[x86_64::structures::paging::PhysFrame], slot: usize, data: &[u8]) {
+    let base = bufs[4 + slot / 2].start_address();
+    let off = (slot % 2) * RXBUF_SIZE;
+    poke(base, off, data);
+}
+
+// ip/eth wrap for a ready-made tcp segment, then post + writeback wait.
+// icr is cleared here too: the level line would storm while this wait
+// hlt-loops and the regular drain has not run yet
+fn tcp_tx(
+    regs: &Regs,
+    txring: PhysAddr,
+    bufs: &[x86_64::structures::paging::PhysFrame],
+    slot: &mut usize,
+    segdata: &[u8],
+    mac: &[u8; 6],
+    gw_mac: &[u8; 6],
+) {
+    let mut f = [0u8; 1536];
+    let total = 34 + segdata.len();
+    f[0..6].copy_from_slice(gw_mac);
+    f[6..12].copy_from_slice(mac);
+    f[12..14].copy_from_slice(&[0x08, 0x00]);
+    f[14] = 0x45;
+    f[16..18].copy_from_slice(&((total as u16) - 14).to_be_bytes());
+    f[18..20].copy_from_slice(&7u16.to_be_bytes());
+    f[22] = 64;
+    f[23] = 6;
+    f[26..30].copy_from_slice(&OUR_IP);
+    f[30..34].copy_from_slice(&SERVER_IP);
+    let c = checksum(&f[14..34]);
+    f[24..26].copy_from_slice(&c.to_be_bytes());
+    f[34..total].copy_from_slice(segdata);
+    let gpa = TXBUF_GPA + (*slot * RXBUF_SIZE) as u64;
+    pool_poke(bufs, *slot, &f[..total]);
+    tx_post(txring, *slot, gpa, total);
+    regs.wr(TDT, (*slot + 1) as u32);
+    let icr = regs.rd(ICR);
+    if icr != 0 {
+        regs.wr(ICR, icr);
+    }
+    let _ = tx_done(txring, *slot);
+    *slot = (*slot + 1) % 4;
+}
+
+// the tcp half of the host smoke: a full client round against qemu's
+// user-net echo (guestfwd cmd:cat on 10.0.2.100:7) — syn with a bad
+// checksum once, data with a bad checksum once, rto retransmissions with
+// backoff save the round, echo bytes verified, fin/fwait/timewait/close.
+// this is the tcg-verifiable twin of the guest's own tcp client (devd)
+#[allow(clippy::too_many_arguments)]
+fn tcp_round(
+    regs: &Regs,
+    st: &mut Ring,
+    rxring: PhysAddr,
+    txring: PhysAddr,
+    bufs: &[x86_64::structures::paging::PhysFrame],
+    mac: &[u8; 6],
+    gw_mac: &[u8; 6],
+) {
+    let mut conn = Box::new(Conn::new(crate::interrupts::tick_count() as u32));
+    let mut seg = [0u8; 1536];
+    let mut slot = 0usize;
+    // fresh tx ring state: tdh/tdt back to 0 so slot + 1 never touches the
+    // ring size, and stale writebacks out of every descriptor
+    regs.wr(TDH, 0);
+    regs.wr(TDT, 0);
+    for i in 0..NDESC {
+        unsafe {
+            core::ptr::write_volatile(
+                crate::memory::phys_to_virt(txring)
+                    .as_mut_ptr::<u8>()
+                    .add(i * 16 + 12),
+                0,
+            );
+        }
+    }
+    let n = conn.connect_seg(&mut seg);
+    tcp_tx(regs, txring, bufs, &mut slot, &seg[..n], mac, gw_mac);
+    let start = crate::interrupts::tick_count() as u32;
+    let deadline = start + 600;
+    let mut pkt = [0u8; RXBUF_SIZE];
+    loop {
+        x86_64::instructions::interrupts::enable_and_hlt();
+        let icr = regs.rd(ICR);
+        if icr != 0 {
+            regs.wr(ICR, icr);
+        }
+        let now = crate::interrupts::tick_count() as u32;
+        let mut guard = 0;
+        while guard < NDESC {
+            guard += 1;
+            if rx_status(rxring, st.cursor) & 1 == 0 {
+                break;
+            }
+            let len = rx_len(rxring, st.cursor) as usize;
+            if (54..=RXBUF_SIZE).contains(&len) {
+                pool_peek(bufs, st.cursor, &mut pkt[..len]);
+                if let Some(r) = conn.input(&pkt[..len], now, &mut seg) {
+                    tcp_tx(regs, txring, bufs, &mut slot, &seg[..r], mac, gw_mac);
+                }
+            }
+            rx_clear(rxring, st.cursor);
+            regs.wr(RDT, st.cursor as u32);
+            st.cursor = (st.cursor + 1) % NDESC;
+        }
+        if let Some(n) = conn.pump(&mut seg) {
+            tcp_tx(regs, txring, bufs, &mut slot, &seg[..n], mac, gw_mac);
+        }
+        if conn.wants_close() {
+            let n = conn.close_seg(now, &mut seg);
+            tcp_tx(regs, txring, bufs, &mut slot, &seg[..n], mac, gw_mac);
+        }
+        if conn.rto_due(now) && !conn.done() {
+            match conn.retransmit(now, &mut seg) {
+                Some(n) => tcp_tx(regs, txring, bufs, &mut slot, &seg[..n], mac, gw_mac),
+                None => break,
+            }
+        }
+        conn.tick(now);
+        if conn.done() || now > deadline {
+            break;
+        }
+    }
+
+    if conn.established_seen {
+        crate::serial_println!("[nic] tcp connect ok (mss {})", conn.mss());
+    }
+    if conn.acked_seen {
+        crate::serial_println!("[nic] tcp acked {} bytes", crate::tcp::SEND_TOTAL);
+    }
+    crate::serial_println!(
+        "[nic] tcp rtx: syn {} data {} fin {}",
+        conn.rtx_syn,
+        conn.rtx_data,
+        conn.rtx_fin
+    );
+    if conn.echo_ok {
+        crate::serial_println!("[nic] tcp echo ok: {} bytes", conn.echo_bytes);
+    } else {
+        crate::serial_println!(
+            "[nic] tcp echo mismatch at {} of {}",
+            conn.echo_at,
+            conn.echo_bytes
+        );
+    }
+    if conn.clean() {
+        crate::serial_println!(
+            "[nic] tcp closed ok (rtx syn {} data {} fin {})",
+            conn.rtx_syn,
+            conn.rtx_data,
+            conn.rtx_fin
+        );
+        crate::serial_println!("[nic] tcp ok: connect+data+echo+close (host smoke)");
+    } else {
+        crate::serial_println!(
+            "[nic] tcp failed: err {} state seen {}",
+            conn.err,
+            conn.established_seen
+        );
+    }
+}
+
 pub fn smoke() {
     // the dma/intx smoke ran first, inline, and released the device
     let Some(sid) = find_device(0x8086, 0x100E) else {
@@ -389,11 +560,11 @@ pub fn smoke() {
     let Some(ring) = crate::memory::alloc_frame() else {
         return;
     };
-    // buffers live in four physically consecutive frames: rx slots 0..4 in
-    // the first pair, tx slots 0..4 in the second — slot 2 pokes and dmas
-    // past a single frame's 4096-byte end, so singles would corrupt the
-    // page that happens to follow
-    let Some(bufs) = crate::memory::alloc_frames_aligned(4, 0x1000) else {
+    // buffers live in six physically consecutive frames: rx slots 0..8 in
+    // the first four, tx slots 0..4 in the last two — slots 2..7 poke and
+    // dma past a single frame's 4096-byte end, so singles would corrupt
+    // the page that happens to follow
+    let Some(bufs) = crate::memory::alloc_frames_aligned(6, 0x1000) else {
         crate::memory::dealloc_frame(ring);
         return;
     };
@@ -402,7 +573,7 @@ pub fn smoke() {
     let rxring = ring.start_address();
     let txring = ring.start_address() + 0x100u64;
     let rxbuf_p = bufs[0].start_address();
-    let txbuf_p = bufs[2].start_address();
+    let txbuf_p = bufs[4].start_address();
 
     // mac from the device's reset value; ral/rah must be armed with the
     // valid bit (31): without it the unicast filter drops every reply
@@ -426,10 +597,18 @@ pub fn smoke() {
         }
     };
     let ok = dom.map(RXRING_GPA, rxring)
-        && dom.map(RXBUF_GPA, rxbuf_p)
-        && dom.map(RXBUF_GPA + 0x1000, rxbuf_p + 0x1000u64)
-        && dom.map(TXBUF_GPA, txbuf_p)
-        && dom.map(TXBUF_GPA + 0x1000, txbuf_p + 0x1000u64)
+        && (0..4usize).all(|i| {
+            dom.map(
+                RXBUF_GPA + (i as u64) * 0x1000,
+                rxbuf_p + (i as u64) * 0x1000,
+            )
+        })
+        && (0..2usize).all(|j| {
+            dom.map(
+                TXBUF_GPA + (j as u64) * 0x1000,
+                txbuf_p + (j as u64) * 0x1000,
+            )
+        })
         && dom.attach(sid);
     if !ok {
         crate::serial_println!("[nic] setup failed — rx smoke skipped");
@@ -450,11 +629,7 @@ pub fn smoke() {
         );
     }
     for i in 0..NDESC {
-        let gpa = if i < 4 {
-            RXBUF_GPA + (i * RXBUF_SIZE) as u64
-        } else {
-            TXBUF_GPA + ((i - 4) * RXBUF_SIZE) as u64
-        };
+        let gpa = RXBUF_GPA + (i * RXBUF_SIZE) as u64;
         let p = crate::memory::phys_to_virt(rxring).as_mut_ptr::<u64>();
         unsafe {
             core::ptr::write_volatile(p.add(i * 2), gpa);
@@ -482,6 +657,7 @@ pub fn smoke() {
     let mut arp_seen = false;
     let mut ping_ok = false;
     let mut ping_sent = false;
+    let mut ping_at = 0u64;
     let mut dhcp_sent = false;
     let mut dhcp_start = 0u64;
     let mut udp_offer: Option<[u8; 4]> = None;
@@ -508,6 +684,7 @@ pub fn smoke() {
             tx_icmp_echo(&regs, txring, txbuf_p, 1, &mac, &gw_mac);
             let _ = tx_done(txring, 1);
             ping_sent = true;
+            ping_at = crate::interrupts::tick_count();
         }
         arp_seen |= a;
         ping_ok |= p;
@@ -535,11 +712,11 @@ pub fn smoke() {
         let quiet_after = if dhcp_sent {
             dhcp_start + 150
         } else {
-            start + 150
+            ping_at + 200
         };
         if udp_offer.is_some()
             || (ping_ok && dhcp_sent && crate::interrupts::tick_count() > quiet_after)
-            || (!ping_ok && ping_sent && crate::interrupts::tick_count() > start + 150)
+            || (!ping_ok && ping_sent && crate::interrupts::tick_count() > ping_at + 200)
         {
             break;
         }
@@ -553,6 +730,12 @@ pub fn smoke() {
         crate::serial_println!("[nic] arp got no reply (no netdev or link down)");
     } else {
         crate::serial_println!("[nic] arp ok, icmp echo got no reply");
+    }
+    // v0.23.0: the tcp half — a full client round against the user-net
+    // echo (guestfwd cmd:cat), the tcg-verifiable twin of the guest's own
+    // tcp client in devd
+    if arp_seen && ping_ok {
+        tcp_round(&regs, &mut ring_state, rxring, txring, &bufs, &mac, &gw_mac);
     }
     // leave the nic quiet, then the device free for the next owner (devd):
     // translations must leave the domain before the frames go back

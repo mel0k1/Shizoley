@@ -25,13 +25,15 @@ using namespace shz;
 
 namespace {
 
-// guest phys layout (224 kib of guest ram: 16 base pages + 40 grown):
+// guest phys layout (240 kib of guest ram: 16 base pages + 44 grown):
 //   0x1000 pml4  0x2000 pdpt  0x3000 pd (identity 2 MiB leaves for ram)
 //   0x4000 pdpt for pml4[3]   0x5000 pd for the bar's 1 gib region
 //   0x6000+ pt frames for the bar window   0x7000 guest idt  0x8000 gdt
 //   0x9000 code   0xC008 nic host vector handed to the guest
 //   0x10000 rx ring (64x16)  0x11000 rx buffers (64x2048)
 //   0x32000 tx ring (4x16)   0x33000 tx payload
+//   0x36000 tcp send queue   0x37000 tcp recv buffer
+//   0x38000 isr->main packet queue (4x2048)
 constexpr u64 GPA_PML4 = 0x1000;
 constexpr u64 GPA_PDPT = 0x2000;
 constexpr u64 GPA_PD = 0x3000;
@@ -42,7 +44,7 @@ constexpr u64 GPA_GDT = 0x8000;
 constexpr u64 ENTRY_RIP = 0x9000; // guest.c is linked with -Ttext=0x9000
 constexpr u64 ENTRY_RSP = 0xF000;
 constexpr u64 GPA_VEC = 0xC008;   // nic host vector handed to the guest
-constexpr u64 GROW_PAGES = 40;    // guest ram: 16 + 40 = 224 kib
+constexpr u64 GROW_PAGES = 44;    // guest ram: 16 + 44 = 240 kib
 
 constexpr u64 SID_E1000 = 0x0010; // 00:02.0 on the reference qemu command line
 constexpr u64 NUDGE_VECTOR = 0x22; // the monitor's wake vector (see guest.c)
@@ -156,9 +158,13 @@ int main() {
     bool ping_ok = false;
     bool udp_ok = false;
     bool udp_window = false;
+    bool tcp_conn = false;
+    bool tcp_ack = false;
+    bool tcp_echo = false;
+    bool tcp_closed = false;
     u64 posted = 0;
     u64 start = ticks();
-    u64 deadline = start + 600; // 6 s budget at 100 hz
+    u64 deadline = start + 1500; // 15 s budget at 100 hz (tcp rto rounds)
     for (;;) {
         reason = vcpu_run(g, &ve);
         if (reason < 0) {
@@ -241,6 +247,39 @@ int main() {
                         static_cast<u64>((ip >> 8) & 0xFF), ".",
                         static_cast<u64>(ip & 0xFF), ":",
                         static_cast<u64>(rdx & 0xFFFF));
+            } else if (rax == 10) {
+                if (rsi == 1) {
+                    tcp_conn = true;
+                    println("[devd] tcp connect ok (mss ", rdx, ")");
+                } else {
+                    println("[devd] tcp connect failed: ",
+                            rdx == 1 ? "rst" : "timeout");
+                }
+            } else if (rax == 11) {
+                tcp_ack = true;
+                println("[devd] tcp acked ", rsi, " bytes");
+            } else if (rax == 12) {
+                println("[devd] tcp rto: phase ", rsi, " retransmitted");
+            } else if (rax == 13) {
+                if (rdx == 1) {
+                    tcp_echo = true;
+                    println("[devd] tcp echo ok: ", rsi, " bytes");
+                } else {
+                    println("[devd] tcp echo mismatch at ", rdx - 2, " of ",
+                            rsi);
+                }
+            } else if (rax == 14) {
+                u64 srtx = (rdx >> 16) & 0xFF;
+                u64 drtx = (rdx >> 8) & 0xFF;
+                u64 frtx = rdx & 0xFF;
+                tcp_closed = true;
+                if (rsi == 1) {
+                    println("[devd] tcp closed ok (rtx syn ", srtx, " data ",
+                            drtx, " fin ", frtx, ")");
+                } else {
+                    println("[devd] tcp closed bad (rtx syn ", srtx,
+                            " data ", drtx, " fin ", frtx, ")");
+                }
             } else {
                 println("[devd] bogus hypercall rax ", rax);
                 break;
@@ -251,7 +290,13 @@ int main() {
                 udp_window = true;
                 deadline = ticks() + 300;
             }
-            if ((ping_ok && udp_ok) ||
+            if (tcp_closed && !udp_window) {
+                // the udp echo service stays live for a manual hostfwd
+                // datagram after the tcp round has closed
+                udp_window = true;
+                deadline = ticks() + 300;
+            }
+            if ((tcp_closed && udp_ok) ||
                 (udp_window && ticks() > deadline)) {
                 break;
             }
@@ -288,9 +333,9 @@ int main() {
         println("[devd] driver vm ok: tx through the guest's own ring");
     }
     if (ready && arp_ok && ping_ok) {
-        println("[devd] rx path ok: irq-driven arp + icmp echo in the guest");
+        println("[devd] net ok: arp + icmp echo, guest client round");
     } else if (ready) {
-        println("[devd] rx incomplete: arp=", static_cast<u64>(arp_ok ? 1 : 0),
+        println("[devd] net incomplete: arp=", static_cast<u64>(arp_ok ? 1 : 0),
                 " ping=", static_cast<u64>(ping_ok ? 1 : 0));
     }
     if (udp_ok) {
@@ -298,10 +343,20 @@ int main() {
     } else if (udp_window) {
         println("[devd] udp: no datagram in the window (nothing sent to 4242?)");
     }
+    if (tcp_conn && tcp_ack && tcp_echo && tcp_closed) {
+        println("[devd] tcp path ok: connect+data+echo+close in the guest");
+    } else if (tcp_conn) {
+        println("[devd] tcp incomplete: ack=", static_cast<u64>(tcp_ack ? 1 : 0),
+                " echo=", static_cast<u64>(tcp_echo ? 1 : 0),
+                " closed=", static_cast<u64>(tcp_closed ? 1 : 0));
+    }
     guest_device_detach(g, SID_E1000);
     guest_destroy(g);
     println("[devd] device detached, guest destroyed");
-    return (ok && tx_ok && ready && arp_ok && ping_ok) ? 0 : 1;
+    return (ok && tx_ok && ready && arp_ok && ping_ok && tcp_conn &&
+            tcp_ack && tcp_echo && tcp_closed)
+               ? 0
+               : 1;
 }
 
 } // namespace shz
